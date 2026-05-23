@@ -2,7 +2,7 @@
 
 This repository contains two C++17 implementations for the Unbounded Knapsack Problem (UKP):
 
-- `faithful`: a conservative implementation organized around the EDUK2 paper structure: preprocessing, bounds, core branch-and-bound instrumentation, sliced dynamic programming, and context-bound instrumentation.
+- `faithful`: a conservative and basic implementation organized around the EDUK2 paper structure
 - `optimized`: an engineering-oriented implementation using contiguous arrays and item-major unbounded DP for better cache locality.
 
 The code is intended as a research scaffold for replication and engineering experiments. It preserves the exact UKP objective and uses the same families of bounds and dominance tests discussed in Poirriez, Yanev and Andonov's EDUK2 work. The `faithful` solver is deliberately written in a more explicit style to make comparisons against the OCaml modules easier.
@@ -44,16 +44,6 @@ Comments beginning with `#` are ignored.
 ./build/ukp_bench
 ```
 
-## Notes for the TCC methodology
-
-Use the implementations in this order:
-
-1. Validate both solvers against `dense_dp_value` for small instances.
-2. Compare `faithful` and the OCaml implementation on generated instances.
-3. Compare `optimized` against `faithful` to isolate data-structure/cache effects.
-4. Compare both against the solution-dominance implementation.
-
-The current code is exact for the generated/tested integer UKP instances. For extremely large capacities, dense DP memory consumption can dominate; that limitation is intentional in this scaffold and should be measured explicitly.
 
 ## Updated optimized solver behavior
 
