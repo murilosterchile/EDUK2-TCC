@@ -47,7 +47,10 @@ add_library(ukp_common
 add_library(ukp_faithful src/faithful/faithful_solver.cpp)
 target_link_libraries(ukp_faithful ukp_common)
 
-add_library(ukp_optimized src/optimized/optimized_solver.cpp)
+add_library(ukp_optimized
+  src/optimized/optimized_solver.cpp
+  src/optimized/core_branch_and_bound.cpp
+)
 target_link_libraries(ukp_optimized ukp_common)
 
 add_executable(ukp_solve src/tools/ukp_solve.cpp)

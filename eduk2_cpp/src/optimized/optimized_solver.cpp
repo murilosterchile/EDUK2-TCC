@@ -1,6 +1,7 @@
 #include "ukp/optimized_solver.hpp"
 #include "ukp/bounds.hpp"
 #include "ukp/dominance.hpp"
+#include "core_branch_and_bound.hpp"
 
 #include <algorithm>
 #include <limits>
@@ -18,6 +19,8 @@
 
 namespace ukp::optimized {
 namespace {
+
+#if 0  // Moved to core_branch_and_bound.cpp; retained temporarily for reference.
 
 struct CoreBBResult {
     Profit profit = 0;
@@ -207,6 +210,12 @@ struct AdaptiveBBController {
         return false;
     }
 };
+
+#endif
+
+using detail::AdaptiveBBController;
+using detail::CoreBBResult;
+using detail::run_core_branch_and_bound;
 
 struct BoundSampler {
     const BoundContext& ctx;
@@ -1249,7 +1258,7 @@ SolverResult Solver::solve(const Instance& inst) {
             controller.probe_nodes = std::min<long long>(controller.max_nodes, 64);
         }
         const Profit before_probe = incumbent;
-        CoreBBResult probe = run_core_bb(items, inst.capacity, controller.probe_nodes,
+        CoreBBResult probe = run_core_branch_and_bound(items, inst.capacity, controller.probe_nodes,
                                          options_.core_size, incumbent,
                                          global_bound.upper, inst.items.size());
         result.stats.bb_nodes += probe.nodes;
@@ -1286,7 +1295,7 @@ SolverResult Solver::solve(const Instance& inst) {
                                        result.stats.after_preprocess_items)) {
             const long long remaining_nodes = controller.max_nodes - result.stats.bb_nodes;
             if (remaining_nodes > 0) {
-                CoreBBResult extended = run_core_bb(items, inst.capacity, remaining_nodes,
+                CoreBBResult extended = run_core_branch_and_bound(items, inst.capacity, remaining_nodes,
                                                     options_.core_size, incumbent,
                                                     global_bound.upper, inst.items.size());
                 result.stats.bb_nodes += extended.nodes;
