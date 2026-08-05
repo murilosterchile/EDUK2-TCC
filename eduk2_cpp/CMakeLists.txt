@@ -1,6 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 cmake_minimum_required(VERSION 3.16)
 project(eduk2_cpp LANGUAGES CXX)
+enable_testing()
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -44,7 +45,13 @@ add_library(ukp_common
   src/common/verify.cpp
 )
 
-add_library(ukp_faithful src/faithful/faithful_solver.cpp)
+add_library(ukp_faithful
+  src/faithful/faithful_solver.cpp
+  src/faithful/critical_sequence.cpp
+  src/faithful/incumbent.cpp
+  src/faithful/preprocessing.cpp
+  src/faithful/eduk2_bounds.cpp
+)
 target_link_libraries(ukp_faithful ukp_common)
 
 add_library(ukp_optimized
@@ -60,4 +67,11 @@ add_executable(ukp_bench src/tools/ukp_bench.cpp)
 target_link_libraries(ukp_bench ukp_faithful ukp_optimized ukp_common)
 
 add_executable(ukp_tests tests/test_main.cpp)
-target_link_libraries(ukp_tests ukp_faithful ukp_optimized ukp_common)
+target_link_libraries(ukp_tests ukp_faithful ukp_common)
+target_compile_definitions(ukp_tests PRIVATE UKP_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+add_test(NAME faithful_correctness COMMAND ukp_tests)
+
+add_executable(ukp_optimized_regression tests/test_optimized_regression.cpp)
+target_link_libraries(ukp_optimized_regression ukp_optimized ukp_common)
+target_compile_definitions(ukp_optimized_regression PRIVATE UKP_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+add_test(NAME optimized_regression COMMAND ukp_optimized_regression)

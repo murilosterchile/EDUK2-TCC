@@ -1587,6 +1587,20 @@ SolverResult Solver::solve(const Instance& inst) {
     long long dynamic_collective_removed = 0;
     long long period_last_contribution_hits = 0;
 
+    // The last-contribution observation is useful instrumentation, but it is
+    // not by itself a replacement certificate for a capacity-indexed DP.  In
+    // particular, an item that has not won a state in one slice can still be
+    // required as the predecessor of a later capacity.  Treating that
+    // observation as a global deletion caused exnsdbis10.ukp to lose a feasible
+    // solution of value 1,028,035 and return 1,028,030 instead.
+    //
+    // Keep the exact DP item set unchanged until a formal contextual
+    // dominance certificate is implemented.  Likewise, do not use the
+    // last-contribution observation to stop for periodicity.  The final c/2
+    // composition below remains exact with the complete reduced item set.
+    constexpr bool kEnableUncertifiedDynamicReduction = false;
+    constexpr bool kEnableUncertifiedPeriodStop = false;
+
     auto rebuild_compact_active_items = [&]() {
         std::vector<Item> compact;
         compact.reserve(dp_items.size());
@@ -1852,7 +1866,7 @@ SolverResult Solver::solve(const Instance& inst) {
                 }
             }
 
-            if (periodic_window > 0 &&
+            if (kEnableUncertifiedPeriodStop && periodic_window > 0 &&
                 y >= periodic_window &&
                 periodic_window_count == static_cast<long long>(periodic_window)) {
                 period_level = y;
@@ -1860,7 +1874,7 @@ SolverResult Solver::solve(const Instance& inst) {
                 break;
             }
 
-            if (best_w_period > 0 &&
+            if (kEnableUncertifiedPeriodStop && best_w_period > 0 &&
                 certified_residues == static_cast<long long>(best_w_period) &&
                 y >= periodic_window) {
                 period_level = y;
@@ -1876,7 +1890,7 @@ SolverResult Solver::solve(const Instance& inst) {
             if (it.id < 0 || static_cast<std::size_t>(it.id) >= active_by_id.size()) continue;
             const std::size_t id = static_cast<std::size_t>(it.id);
             if (!active_by_id[id]) continue;
-            if (threshold_dominated_dynamic(it, yb)) {
+            if (kEnableUncertifiedDynamicReduction && threshold_dominated_dynamic(it, yb)) {
                 active_by_id[id] = 0;
                 ++dynamic_collective_removed;
                 const std::size_t local = static_cast<std::size_t>(&it - dp_items.data());
@@ -1896,14 +1910,14 @@ SolverResult Solver::solve(const Instance& inst) {
 
         refresh_dynamic_item_counters();
 
-        if (period_by_last_contribution(yb)) {
+        if (kEnableUncertifiedPeriodStop && period_by_last_contribution(yb)) {
             ++period_last_contribution_hits;
             period_level = yb;
             computed_until = yb;
             break;
         }
 
-        if (active_items_final <= 1 && yb >= best_periodic.w) {
+        if (kEnableUncertifiedPeriodStop && active_items_final <= 1 && yb >= best_periodic.w) {
             period_level = yb;
             computed_until = yb;
             break;

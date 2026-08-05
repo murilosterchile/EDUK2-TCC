@@ -40,6 +40,19 @@ struct Stats {
     long long bound_calls = 0;
     long long periodicity_hits = 0;
     long long bb_nodes = 0;
+    long long items_removed_simple = 0;
+    long long items_removed_multiple = 0;
+    long long items_removed_modular = 0;
+    long long items_removed_bound = 0;
+    long long items_removed_threshold = 0;
+    long long points_generated = 0;
+    long long incumbent_improvements_bb = 0;
+    long long incumbent_improvements_dp = 0;
+    long long active_items_final = 0;
+    long long estimated_state_bytes = 0;
+    std::string bound_winner = "U3";
+    Weight periodicity_level = -1;
+    std::string stop_reason = "uninitialized";
 };
 
 struct SolverOptions {

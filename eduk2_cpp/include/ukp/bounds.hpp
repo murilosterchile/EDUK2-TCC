@@ -5,7 +5,7 @@
 
 namespace ukp {
 
-enum class BoundType { U3, V, Both };
+enum class BoundType { U3, V, TauStar, BestItemStar, Both };
 
 struct BoundValue {
     Profit upper = 0;
@@ -21,15 +21,21 @@ struct BoundContext {
     Item lightest_positive{};
     bool has_three = false;
     bool has_lightest_positive = false;
-    double alpha = 0.0;
+    // alpha is kept as an exact non-negative rational alpha_num/alpha_den.
+    Profit alpha_num = 0;
+    Weight alpha_den = 1;
     int psi = 1;
     Profit delta1 = 0;
     BoundType preferred = BoundType::Both;
+    bool tau_star_certified = false;
+    bool best_item_star_certified = false;
 };
 
 BoundContext make_bound_context(const std::vector<Item>& items);
 BoundValue compute_u3(const BoundContext& ctx, Weight c);
 BoundValue compute_v(const BoundContext& ctx, Weight c);
+BoundValue compute_tau_star(const BoundContext& ctx, Weight c);
+BoundValue compute_best_item_star(const BoundContext& ctx, Weight c);
 BoundValue compute_bound(const BoundContext& ctx, Weight c);
 
 }  // namespace ukp
