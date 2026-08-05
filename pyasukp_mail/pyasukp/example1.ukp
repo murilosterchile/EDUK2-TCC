@@ -1,0 +1,42 @@
+##
+##EXAMPLE1 used in the article
+
+n: 7
+
+c: 2900
+
+begin data 
+120	300
+245	580
+130	301
+260	601
+310	605
+194	322
+190	310
+end data 
+Saw ukp #The Result by PYAsUKP release:  pyasukp_1.0 of march 1 2005 Copyright Vincent Poirriez, LAMIH/ROI
+#For datas:  File: example1.ukp
+#The optimal value for the given capacity
+7202
+#The minimal capacity  for the optimal value
+2900
+Upper bound: 7220
+THE BOUND STOPPED THE COMPUTATION
+
+Period reached: false ; Remaining  undominated items: 1 ; Not collectively dominated items: 0 ;
+ Last capacity calculated: 0 ;
+ reduction capacity : 0
+
+	 index 	 nb 	 w 	 p
+sol: 
+	1	22	120	300
+	3	2	130	301
+
+Best_Item: 0 
+
+Total Time :    0.00000
+
+
+Time forward :    0.00000
+Time backtrack :    0.00000
+Nb critical points in sequence_result:                    1

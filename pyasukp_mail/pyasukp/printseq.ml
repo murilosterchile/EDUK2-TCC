@@ -1,0 +1,28 @@
+(***************************************************************************)
+(*                                  PYAsUKP                                *)
+(*    PYAsUKP: Yet Another solver (for the) Unbounded Knapsack Problem     *)
+(*           Vincent Poirriez with Nicola Yanev and Rumen Andonov          *)
+(*                          LAMIH-ROI UMR CNRS 8530                        *)
+(*  Copyright 1998-2005  Vincent Poirriez				   *)
+(* <vincent Dot poirriez At univ-valenciennes Dot fr>                      *)
+(*  This file is part of PYAsUKP.                                          *)
+(*									   *)
+(*  PYAsUKP is free software; you can redistribute it and/or modify        *)
+(*  it under the terms of the GNU General Public License as published by   *)
+(*    the Free Software Foundation; either version 2 of the License, or	   *)
+(*    (at your option) any later version.				   *)
+(*    PYAsUKP is distributed in the hope that it will be useful,	   *)
+(*    but WITHOUT ANY WARRANTY; without even the implied warranty of	   *)
+(*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the	   *)
+(*    GNU General Public License for more details.			   *)
+(*									   *)
+(*  You should have received a copy of the GNU General Public License	   *)
+(*  along with Foobar; if not, write to the Free Software		   *)
+(*  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA*)
+(***************************************************************************)
+(*$Id: printseq.ml,v 1.2 2005/02/28 10:39:35 poirriez Exp $*)
+
+open Sequences
+open Seq
+
+let f = print_seq

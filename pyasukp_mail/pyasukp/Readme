@@ -1,0 +1,83 @@
+(***************************************************************************)
+(*                                  PYAsUKP                                *)
+(*    PYAsUKP: Yet Another solver (for the) Unbounded Knapsack Problem     *)
+(*           Vincent Poirriez with Nicola Yanev and Rumen Andonov          *)
+(*                          LAMIH-ROI UMR CNRS 8530                        *)
+(*  Copyright 1998-2005  Vincent Poirriez				   *)
+(* <vincent Dot poirriez At univ-valenciennes Dot fr>                      *)
+(*  This file is part of PYAsUKP.                                          *)
+(*									   *)
+(*  PYAsUKP is free software; you can redistribute it and/or modify        *)
+(*  it under the terms of the GNU General Public License as published by   *)
+(*    the Free Software Foundation; either version 2 of the License, or	   *)
+(*    (at your option) any later version.				   *)
+(*    PYAsUKP is distributed in the hope that it will be useful,	   *)
+(*    but WITHOUT ANY WARRANTY; without even the implied warranty of	   *)
+(*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the	   *)
+(*    GNU General Public License for more details.			   *)
+(*									   *)
+(*  You should have received a copy of the GNU General Public License	   *)
+(*  along with Foobar; if not, write to the Free Software		   *)
+(*  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA*)
+(***************************************************************************)
+
+PYAsUKP: Yet Another solver (for the) Unbounded Knapsack Problem     
+
+Note: This library is currently under development.
+
+0. What is PYAsUKP ?
+
+This is a solver for the Unbounded Knapsack Problems. It combines
+branch and bound and dynamic programming approaches together with
+the use of tight bounds.
+Unbounded Knapsack Problems can be formulated as:
+ maximize the value sum(pi xi) for i in 1..n
+ subject to the constraintx sum(wi xi) <= c,
+ and xi positive integers.
+ 
+
+The current version address the cases when all pi wi and c
+are positive integers.
+
+1. In what language is written PYAsUKP?
+
+It is written in Objective Caml: http://caml.inria.fr 
+
+2. What does provide this library
+    Obviously, an ukp solver
+    but also: a data generator able to generate UKP data set according
+              to formulae founded in the literature
+
+3. How to use pyasukp?
+  3.a As a standalone program
+      Compile the native code version by make optt or the bytecode version
+      by make bct, this should produce respectively pyasukpt and pyasukpbct 
+
+      To obtain a light documentation 
+  3.b As an ocaml function called in your ocaml program
+
+  3.c As a C function.
+    While written in ocaml, and thanks to the ability of the ocaml system to
+    be interfaced with C, two C functions are provided:
+
+      	pyasukp(warray,parray,c,n,isol,nbsol,capsol,profsol,k) returns in
+	nbsol, capsol and profsol the result of the resolution of
+   	knapsack defined with the arrays of weights and profits warray, parray
+   	and the capacity c. The length of each array is (n+1).  
+	nbsol is an array of size k such that nbsol[i] is the number of item isol[i] 
+	to put in the knapsack to obtain the optimal solution capsol,profsol.
+
+	void  pyasukp(long * warray, long * parray, int n, int c, long ** isol,
+                   long ** nbsol, long * capsol, long * profsol, int * k)
+
+	pyasukp_from_file is to use if data are in the file filename instead
+        of arrays.
+
+	void  pyasukp_from_file(char * filename, long ** isol,
+        			long ** nbsol, long * capsol, long * profsol, int * k)
+
+     You have to link your programs with the library pyasukp.a and the ocaml nums library.
+
+     An example of use is given in the file main.c of the distribution. and below is
+     how I link it on my linux box:
+	gcc -o sukpc main.c pyasukp.a -lm -L/usr/lib/ocaml/3.08/ -lnums  -ldl

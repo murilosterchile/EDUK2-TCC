@@ -1,0 +1,412 @@
+analyselog.cmo :
+analyselog.cmx :
+astore.cmo :
+astore.cmx :
+badbold.cmo : \
+    wandp.cmo \
+    select.cmi \
+    globals.cmo \
+    dynefflist.cmo \
+    dominance.cmo \
+    datastructtype.cmo \
+    bounds.cmo
+badbold.cmx : \
+    wandp.cmx \
+    select.cmx \
+    globals.cmx \
+    dynefflist.cmx \
+    dominance.cmx \
+    datastructtype.cmx \
+    bounds.cmx
+bandbukp.cmo : \
+    wandp.cmo \
+    select.cmi \
+    globals.cmo \
+    dominance.cmo \
+    datastructtype.cmo \
+    bounds.cmo
+bandbukp.cmx : \
+    wandp.cmx \
+    select.cmx \
+    globals.cmx \
+    dominance.cmx \
+    datastructtype.cmx \
+    bounds.cmx
+bandbukp2.cmo : \
+    wandp.cmo \
+    select.cmi \
+    globals.cmo \
+    dynefflist.cmo \
+    dominance.cmo \
+    datastructtype.cmo \
+    bounds.cmo
+bandbukp2.cmx : \
+    wandp.cmx \
+    select.cmx \
+    globals.cmx \
+    dynefflist.cmx \
+    dominance.cmx \
+    datastructtype.cmx \
+    bounds.cmx
+bounds.cmo : \
+    wandp.cmo \
+    sequences.cmi \
+    globals.cmo \
+    datastructtype.cmo \
+    datastruct.cmi
+bounds.cmx : \
+    wandp.cmx \
+    sequences.cmx \
+    globals.cmx \
+    datastructtype.cmx \
+    datastruct.cmx
+chainlist.cmo : \
+    chainlist.cmi
+chainlist.cmx : \
+    chainlist.cmi
+chainlist.cmi :
+datagen.cmo : \
+    wandp.cmo \
+    eratosthen.cmo \
+    datagen.cmi
+datagen.cmx : \
+    wandp.cmx \
+    eratosthen.cmx \
+    datagen.cmi
+datagen.cmi : \
+    wandp.cmo
+datastruct.cmo : \
+    wandp.cmo \
+    sequences.cmi \
+    globals.cmo \
+    datastructtype.cmo \
+    chainlist.cmi \
+    astore.cmo \
+    datastruct.cmi
+datastruct.cmx : \
+    wandp.cmx \
+    sequences.cmx \
+    globals.cmx \
+    datastructtype.cmx \
+    chainlist.cmx \
+    astore.cmx \
+    datastruct.cmi
+datastruct.cmi : \
+    sequences.cmi \
+    datastructtype.cmo \
+    chainlist.cmi
+datastructtype.cmo : \
+    wandp.cmo \
+    sequences.cmi \
+    globals.cmo \
+    astore.cmo
+datastructtype.cmx : \
+    wandp.cmx \
+    sequences.cmx \
+    globals.cmx \
+    astore.cmx
+dominance.cmo : \
+    wandp.cmo
+dominance.cmx : \
+    wandp.cmx
+dynefflist.cmo :
+dynefflist.cmx :
+dynefflist0.cmo :
+dynefflist0.cmx :
+dynefflist1.cmo :
+dynefflist1.cmx :
+dynefflist2.cmo :
+dynefflist2.cmx :
+eduk.cmo : \
+    wandp.cmo \
+    slice.cmo \
+    sequences.cmi \
+    select.cmi \
+    prepro.cmo \
+    parsecl.cmo \
+    init.cmi \
+    globals.cmo \
+    dominance.cmo \
+    datastructtype.cmo \
+    datastruct.cmi \
+    chainlist.cmi \
+    bounds.cmo \
+    bandbukp2.cmo \
+    astore.cmo \
+    eduk.cmi
+eduk.cmx : \
+    wandp.cmx \
+    slice.cmx \
+    sequences.cmx \
+    select.cmx \
+    prepro.cmx \
+    parsecl.cmx \
+    init.cmx \
+    globals.cmx \
+    dominance.cmx \
+    datastructtype.cmx \
+    datastruct.cmx \
+    chainlist.cmx \
+    bounds.cmx \
+    bandbukp2.cmx \
+    astore.cmx \
+    eduk.cmi
+eduk.cmi : \
+    wandp.cmo \
+    datastructtype.cmo
+edukio.cmo : \
+    wandp.cmo \
+    edukio.cmi
+edukio.cmx : \
+    wandp.cmx \
+    edukio.cmi
+edukio.cmi : \
+    wandp.cmo
+eratosthen.cmo :
+eratosthen.cmx :
+export2c.cmo : \
+    edukio.cmi \
+    eduk.cmi
+export2c.cmx : \
+    edukio.cmx \
+    eduk.cmx
+globals.cmo : \
+    wandp.cmo
+globals.cmx : \
+    wandp.cmx
+init.cmo : \
+    wandp.cmo \
+    sequences.cmi \
+    select.cmi \
+    prepro.cmo \
+    parsecl.cmo \
+    globals.cmo \
+    dominance.cmo \
+    datastructtype.cmo \
+    datastruct.cmi \
+    chainlist.cmi \
+    bounds.cmo \
+    astore.cmo \
+    init.cmi
+init.cmx : \
+    wandp.cmx \
+    sequences.cmx \
+    select.cmx \
+    prepro.cmx \
+    parsecl.cmx \
+    globals.cmx \
+    dominance.cmx \
+    datastructtype.cmx \
+    datastruct.cmx \
+    chainlist.cmx \
+    bounds.cmx \
+    astore.cmx \
+    init.cmi
+init.cmi : \
+    wandp.cmo \
+    datastructtype.cmo \
+    chainlist.cmi
+inserttitle.cmo :
+inserttitle.cmx :
+load_all.cmo : \
+    wandp.cmo \
+    parsecl.cmo \
+    init.cmi \
+    globals.cmo \
+    edukio.cmi \
+    eduk.cmi \
+    datastructtype.cmo \
+    datastruct.cmi \
+    bounds.cmo
+load_all.cmx : \
+    wandp.cmx \
+    parsecl.cmx \
+    init.cmx \
+    globals.cmx \
+    edukio.cmx \
+    eduk.cmx \
+    datastructtype.cmx \
+    datastruct.cmx \
+    bounds.cmx
+mainedukt.cmo : \
+    wandp.cmo \
+    version.cmo \
+    timing.cmo \
+    sequences.cmi \
+    parsecl.cmo \
+    init.cmi \
+    globals.cmo \
+    eduk.cmi \
+    datastructtype.cmo \
+    datastruct.cmi \
+    chainlist.cmi \
+    bounds.cmo \
+    astore.cmo
+mainedukt.cmx : \
+    wandp.cmx \
+    version.cmx \
+    timing.cmx \
+    sequences.cmx \
+    parsecl.cmx \
+    init.cmx \
+    globals.cmx \
+    eduk.cmx \
+    datastructtype.cmx \
+    datastruct.cmx \
+    chainlist.cmx \
+    bounds.cmx \
+    astore.cmx
+mt.cmo : \
+    wandp.cmo \
+    init.cmi \
+    globals.cmo \
+    eduk.cmi \
+    datastruct.cmi \
+    datagen.cmi
+mt.cmx : \
+    wandp.cmx \
+    init.cmx \
+    globals.cmx \
+    eduk.cmx \
+    datastruct.cmx \
+    datagen.cmx
+newruns.cmo : \
+    wandp.cmo \
+    init.cmi \
+    globals.cmo \
+    edukio.cmi \
+    eduk.cmi \
+    datastruct.cmi \
+    datagen.cmi
+newruns.cmx : \
+    wandp.cmx \
+    init.cmx \
+    globals.cmx \
+    edukio.cmx \
+    eduk.cmx \
+    datastruct.cmx \
+    datagen.cmx
+parsecl.cmo : \
+    wandp.cmo \
+    globals.cmo \
+    edukio.cmi \
+    datagen.cmi
+parsecl.cmx : \
+    wandp.cmx \
+    globals.cmx \
+    edukio.cmx \
+    datagen.cmx
+prepro.cmo : \
+    wandp.cmo
+prepro.cmx : \
+    wandp.cmx
+printseq.cmo : \
+    sequences.cmi
+printseq.cmx : \
+    sequences.cmx
+prioqueue.cmo : \
+    wandp.cmo \
+    chainlist.cmi
+prioqueue.cmx : \
+    wandp.cmx \
+    chainlist.cmx
+readres.cmo :
+readres.cmx :
+redblacktree.cmo : \
+    wandp.cmo
+redblacktree.cmx : \
+    wandp.cmx
+repartvbound.cmo : \
+    init.cmi \
+    datagen.cmi \
+    bounds.cmo
+repartvbound.cmx : \
+    init.cmx \
+    datagen.cmx \
+    bounds.cmx
+runs.cmo : \
+    wandp.cmo \
+    timing.cmo \
+    parsecl.cmo \
+    init.cmi \
+    globals.cmo \
+    edukio.cmi \
+    eduk.cmi \
+    datastruct.cmi \
+    datagen.cmi \
+    bounds.cmo \
+    astore.cmo
+runs.cmx : \
+    wandp.cmx \
+    timing.cmx \
+    parsecl.cmx \
+    init.cmx \
+    globals.cmx \
+    edukio.cmx \
+    eduk.cmx \
+    datastruct.cmx \
+    datagen.cmx \
+    bounds.cmx \
+    astore.cmx
+runscap.cmo : \
+    wandp.cmo \
+    init.cmi \
+    globals.cmo \
+    edukio.cmi \
+    eduk.cmi \
+    datastruct.cmi \
+    datagen.cmi
+runscap.cmx : \
+    wandp.cmx \
+    init.cmx \
+    globals.cmx \
+    edukio.cmx \
+    eduk.cmx \
+    datastruct.cmx \
+    datagen.cmx
+select.cmo : \
+    wandp.cmo \
+    prepro.cmo \
+    select.cmi
+select.cmx : \
+    wandp.cmx \
+    prepro.cmx \
+    select.cmi
+select.cmi : \
+    wandp.cmo
+sequences.cmo : \
+    wandp.cmo \
+    sequences.cmi
+sequences.cmx : \
+    wandp.cmx \
+    sequences.cmi
+sequences.cmi : \
+    wandp.cmo
+slice.cmo : \
+    wandp.cmo \
+    sequences.cmi \
+    init.cmi \
+    datastructtype.cmo \
+    datastruct.cmi \
+    chainlist.cmi \
+    astore.cmo
+slice.cmx : \
+    wandp.cmx \
+    sequences.cmx \
+    init.cmx \
+    datastructtype.cmx \
+    datastruct.cmx \
+    chainlist.cmx \
+    astore.cmx
+timing.cmo :
+timing.cmx :
+version.cmo :
+version.cmx :
+wandp.cmo : \
+    wintpint.cmo
+wandp.cmx : \
+    wintpint.cmx
+wintpfloat.cmo :
+wintpfloat.cmx :
+wintpint.cmo :
+wintpint.cmx :
