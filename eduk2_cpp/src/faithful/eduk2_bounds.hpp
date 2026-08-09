@@ -11,6 +11,6 @@ struct BoundPhase {
     long long best_count = 0;
 };
 
-BoundPhase initialize_bounds(const std::vector<Item>& items, Weight capacity);
+BoundPhase initialize_bounds(const std::vector<Item>& items, Weight capacity, BoundPolicy policy);
 
 }  // namespace ukp::faithful::detail

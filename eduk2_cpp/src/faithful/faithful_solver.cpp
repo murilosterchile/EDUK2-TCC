@@ -75,7 +75,7 @@ EffectiveOptions effective_options(const SolverOptions& options) {
             options.use_modular_dominance, options.use_core_multiple_dominance};
 }
 
-void core_search(const std::vector<Item>& core, const BoundContext& bounds,
+void core_search(const std::vector<Item>& core, const BoundContext& bounds, BoundPolicy policy,
                  Weight capacity, Profit global_upper, long long node_limit,
                  std::size_t k, Weight used_weight, Profit used_profit,
                  std::vector<long long>& current, CoreSearchResult& result) {
@@ -96,10 +96,10 @@ void core_search(const std::vector<Item>& core, const BoundContext& bounds,
         const Weight next_weight = used_weight + safe_mul(count, item.w);
         const Profit next_profit = safe_add(used_profit, safe_mul(count, item.p));
         const Profit upper = safe_add(next_profit,
-            compute_bound(bounds, capacity - next_weight).upper);
+            compute_bound(bounds, capacity - next_weight, policy).upper);
         if (upper > result.profit) {
             current[static_cast<std::size_t>(item.id)] = count;
-            core_search(core, bounds, capacity, global_upper, node_limit, k + 1,
+            core_search(core, bounds, policy, capacity, global_upper, node_limit, k + 1,
                         next_weight, next_profit, current, result);
             current[static_cast<std::size_t>(item.id)] = 0;
         }
@@ -118,7 +118,7 @@ void core_search(const std::vector<Item>& core, const BoundContext& bounds,
     CoreSearchResult result;
     result.multiplicity.assign(original_count, 0);
     std::vector<long long> current(original_count, 0);
-    core_search(items, bounds, capacity, global_upper, std::max<long long>(0, node_limit),
+    core_search(items, bounds, BoundPolicy::BestCertified, capacity, global_upper, std::max<long long>(0, node_limit),
                 0, 0, 0, current, result);
     return result;
 }
@@ -130,6 +130,7 @@ void core_search(const std::vector<Item>& core, const BoundContext& bounds,
 struct CoreTraversal {
     const std::vector<Item>& items;
     const BoundContext& bounds;
+    BoundPolicy policy;
     Weight capacity;
     Profit global_upper;
     long long limit;
@@ -161,7 +162,7 @@ void complete(CoreTraversal& search, std::size_t item_index, Weight used_weight,
     for (long long count = remaining / item.w; count >= 0; --count) {
         const Weight next_weight = used_weight + safe_mul(count, item.w);
         const Profit next_profit = safe_add(used_profit, safe_mul(count, item.p));
-        const Profit residual_upper = compute_bound(search.bounds, search.capacity - next_weight).upper;
+        const Profit residual_upper = compute_bound(search.bounds, search.capacity - next_weight, search.policy).upper;
         if (safe_add(next_profit, residual_upper) > search.result.profit) {
             multiplicity[static_cast<std::size_t>(item.id)] = count;
             complete(search, item_index + 1, next_weight, next_profit, multiplicity);
@@ -191,7 +192,7 @@ void backtrack(CoreTraversal& search, std::vector<long long>& multiplicity) {
     complete(search, 0, 0, 0, multiplicity);
 }
 
-CoreSearchResult traverse_core(std::vector<Item> items, const BoundContext& bounds,
+CoreSearchResult traverse_core(std::vector<Item> items, const BoundContext& bounds, BoundPolicy policy,
                                Weight capacity, Profit global_upper, int requested_core,
                                long long limit, std::size_t original_count,
                                const EffectiveOptions& effective) {
@@ -245,7 +246,10 @@ CoreSearchResult traverse_core(std::vector<Item> items, const BoundContext& boun
             ++core_multiple_removed;
         }
     }
-    CoreTraversal search{filtered, bounds, capacity, global_upper, std::max<long long>(0, limit), {}, {}};
+    // Bounds in the core must describe its locally filtered items, while the
+    // global upper remains the global certificate used for closure.
+    BoundContext core_bounds = make_bound_context(filtered);
+    CoreTraversal search{filtered, core_bounds, policy, capacity, global_upper, std::max<long long>(0, limit), {}, {}};
     search.result.multiple_removed = core_multiple_removed;
     search.result.modular_removed = core_modular_removed;
     search.result.multiplicity.assign(original_count, 0);
@@ -266,29 +270,6 @@ Solution solution_from_best_item(const Instance& inst, const Item& best, long lo
         sol.multiplicity_by_id[static_cast<std::size_t>(best.id)] = count;
     }
     return sol;
-}
-
-[[maybe_unused]] std::vector<Item> reduce_variables_by_bound(const std::vector<Item>& items,
-                                                              const BoundContext& context,
-                                                              Weight capacity,
-                                                              Profit incumbent,
-                                                              long long& bound_calls) {
-    std::vector<Item> reduced;
-    reduced.reserve(items.size());
-    for (const Item& item : items) {
-        if (item.id == context.best.id) {
-            reduced.push_back(item);
-            continue;
-        }
-        const Weight remaining = capacity - item.w;
-        if (remaining < 0) continue;
-        const BoundValue bound = compute_bound(context, remaining);
-        ++bound_calls;
-        // MTU/EDUK2 variable reduction: if every solution containing item is
-        // no better than z, its multiplicity can be fixed to zero.
-        if (safe_add(item.p, bound.upper) > incumbent) reduced.push_back(item);
-    }
-    return reduced;
 }
 
 }  // namespace
@@ -321,7 +302,7 @@ SolverResult Solver::solve(const Instance& inst) {
     long long best_count = inst.capacity / ctx.best.w;
     Profit incumbent = safe_mul(best_count, ctx.best.p);
     if (options_.use_bounds) {
-        const detail::BoundPhase bound_phase = detail::initialize_bounds(items, inst.capacity);
+        const detail::BoundPhase bound_phase = detail::initialize_bounds(items, inst.capacity, options_.bound_policy);
         ctx = bound_phase.context;
         global_bound = bound_phase.global;
         best_count = bound_phase.best_count;
@@ -348,7 +329,7 @@ SolverResult Solver::solve(const Instance& inst) {
 
     if (options_.use_bounds) {
         items = detail::reduce_variables_by_bound(items, ctx, inst.capacity, incumbent,
-                                                  result.stats.bound_calls);
+                                                  result.stats.bound_calls, options_.bound_policy);
         result.stats.items_removed_bound = result.stats.after_preprocess_items - static_cast<long long>(items.size());
         std::sort(items.begin(), items.end(), better_ratio);
         ctx = make_bound_context(items);
@@ -356,7 +337,7 @@ SolverResult Solver::solve(const Instance& inst) {
     }
 
     if (options_.use_core_bb) {
-        CoreSearchResult core = traverse_core(items, ctx, inst.capacity,
+        CoreSearchResult core = traverse_core(items, ctx, options_.bound_policy, inst.capacity,
                                                global_bound.upper, options_.core_size,
                                                options_.bb_node_limit, inst.items.size(), effective);
         incumbent = std::max(incumbent, core.profit);
@@ -448,7 +429,7 @@ SolverResult Solver::solve(const Instance& inst) {
             ++current; // insertions have greater weight and must remain iterable.
             ++slice.states_entered;
             if (options_.use_bounds) {
-                const BoundValue residual = compute_bound(ctx, inst.capacity - state.weight);
+                const BoundValue residual = compute_bound(ctx, inst.capacity - state.weight, options_.bound_policy);
                 ++result.stats.bound_calls;
                 ++result.stats.contextual_bound_calls[bound_type_name(residual.type)];
                 slice.contextual_bound_used = bound_type_name(residual.type);
@@ -519,6 +500,14 @@ SolverResult Solver::solve(const Instance& inst) {
                 ++result.stats.items_removed_threshold;
                 ++slice.items_removed_threshold;
             }
+        }
+        // Threshold removal changes the actual residual instance.  Rebuild so
+        // q* certification and BestCertified selection never use stale items.
+        if (active_count != items.size()) {
+            std::vector<Item> active_items;
+            active_items.reserve(active_count);
+            for (std::size_t i = 0; i < items.size(); ++i) if (active[i]) active_items.push_back(items[i]);
+            ctx = make_bound_context(active_items);
         }
         slice.active_items_after = static_cast<long long>(active_count);
         result.stats.slices.push_back(std::move(slice));

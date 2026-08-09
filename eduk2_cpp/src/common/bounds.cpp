@@ -1,203 +1,210 @@
 #include "ukp/bounds.hpp"
-#include <cmath>
 
 namespace ukp {
-
 namespace {
-
-struct Rational {
-    Profit numerator = 0;
-    Weight denominator = 1;
-};
-
+struct Rational { Profit numerator = 0; Weight denominator = 1; };
 bool greater(const Rational& a, const Rational& b) {
     return static_cast<__int128>(a.numerator) * b.denominator >
            static_cast<__int128>(b.numerator) * a.denominator;
 }
-
-Profit floor_div(__int128 numerator, Weight denominator) {
-    if (denominator <= 0) throw std::invalid_argument("non-positive rational denominator");
-    const __int128 value = numerator / denominator;
-    if (value > std::numeric_limits<Profit>::max()) throw std::overflow_error("bound overflow");
-    return static_cast<Profit>(value);
+Profit floor_div(__int128 n, __int128 d) {
+    if (d <= 0) throw std::invalid_argument("non-positive rational denominator");
+    const __int128 v = n / d;
+    if (v > std::numeric_limits<Profit>::max() || v < std::numeric_limits<Profit>::min())
+        throw std::overflow_error("bound overflow");
+    return static_cast<Profit>(v);
 }
-
-// q_k* from the EDUK2 paper.  Items with no remainder modulo w_k do not
-// constrain q: after multiple-dominance preprocessing their numerator is <= 0.
 Rational q_star(const std::vector<Item>& items, const Item& base) {
     Rational best{0, 1};
     for (const Item& item : items) {
         if (item.id == base.id) continue;
         const Weight copies = item.w / base.w;
         const Weight remainder = item.w - copies * base.w;
-        const Profit numerator = item.p - safe_mul(copies, base.p);
-        if (remainder <= 0 || numerator <= 0) continue;
-        const Rational candidate{numerator, remainder};
+        const __int128 n = static_cast<__int128>(item.p) - static_cast<__int128>(copies) * base.p;
+        if (remainder <= 0 || n <= 0) continue;
+        if (n > std::numeric_limits<Profit>::max()) throw std::overflow_error("q* overflow");
+        Rational candidate{static_cast<Profit>(n), remainder};
         if (greater(candidate, best)) best = candidate;
     }
     return best;
 }
-
-BoundValue bound_from_q(const Item& base, Weight c, Rational q, BoundType type) {
-    const Weight copies = c / base.w;
-    const __int128 numerator = static_cast<__int128>(q.numerator) * c +
-        (static_cast<__int128>(base.p) * q.denominator -
-         static_cast<__int128>(q.numerator) * base.w) * copies;
-    return {floor_div(numerator, q.denominator), safe_mul(copies, base.p), type};
+BoundValue normalized_bound_from_q(const Item& normalized_base, const Item& original_base,
+                                   Weight c, Rational q, int psi, BoundType type) {
+    const Weight copies = c / normalized_base.w;
+    const __int128 normalized_upper = static_cast<__int128>(q.numerator) * c +
+        (static_cast<__int128>(normalized_base.p) * q.denominator -
+         static_cast<__int128>(q.numerator) * normalized_base.w) * copies;
+    // A normalized objective is psi times the original objective. Flooring is
+    // conservative because the original objective is integral.
+    return {floor_div(normalized_upper, static_cast<__int128>(q.denominator) * psi),
+            safe_mul(copies, original_base.p), type};
 }
-
-}  // namespace
-
-static Profit diff_profit_weight(const Item& it) {
-    return it.p - static_cast<Profit>(it.w);
+bool has_no_multiple_dominance(const std::vector<Item>& items) {
+    for (std::size_t i = 0; i < items.size(); ++i) for (std::size_t j = 0; j < items.size(); ++j) {
+        if (i == j || items[i].w > items[j].w) continue;
+        const Weight copies = items[j].w / items[i].w;
+        if (copies > 0 && static_cast<__int128>(copies) * items[i].p >= items[j].p) return false;
+    }
+    return true;
 }
+Profit diff(const Item& it) { return it.p - static_cast<Profit>(it.w); }
+BoundValue individual(const BoundContext& c, Weight cap, BoundType type) {
+    switch (type) {
+        case BoundType::U3: return compute_u3(c, cap);
+        case BoundType::V: return compute_v(c, cap);
+        case BoundType::TauStar: return compute_tau_star(c, cap);
+        case BoundType::BestItemStar: return compute_best_item_star(c, cap);
+        case BoundType::Both: break;
+    }
+    throw std::invalid_argument("invalid bound type");
+}
+BoundType policy_type(BoundPolicy p) {
+    switch (p) {
+        case BoundPolicy::U3: return BoundType::U3;
+        case BoundPolicy::V: return BoundType::V;
+        case BoundPolicy::TauStar: return BoundType::TauStar;
+        case BoundPolicy::BestItemStar: return BoundType::BestItemStar;
+        case BoundPolicy::BestCertified: return BoundType::Both;
+    }
+    return BoundType::U3;
+}
+} // namespace
 
 BoundContext make_bound_context(const std::vector<Item>& items) {
     if (items.empty()) throw std::invalid_argument("empty item set");
     BoundContext ctx;
+    ctx.items = items;
     ctx.ratio_items = items;
     std::sort(ctx.ratio_items.begin(), ctx.ratio_items.end(), better_ratio);
-    ctx.best = ctx.ratio_items[0];
+    ctx.best = ctx.ratio_items.front();
+    ctx.best_item_star_base = ctx.best;
     if (ctx.ratio_items.size() >= 2) ctx.second = ctx.ratio_items[1];
-    if (ctx.ratio_items.size() >= 3) {
-        ctx.third = ctx.ratio_items[2];
-        ctx.has_three = true;
-    }
+    if (ctx.ratio_items.size() >= 3) { ctx.third = ctx.ratio_items[2]; ctx.has_three = true; }
 
     bool found = false;
-    for (const auto& it : items) {
-        if (diff_profit_weight(it) > 0) {
-            if (!found || it.w < ctx.lightest_positive.w ||
-                (it.w == ctx.lightest_positive.w && it.id < ctx.lightest_positive.id)) {
-                ctx.lightest_positive = it;
-                found = true;
-            }
-        }
+    for (const Item& it : items) if (diff(it) > 0 && (!found || it.w < ctx.lightest_positive.w ||
+            (it.w == ctx.lightest_positive.w && it.id < ctx.lightest_positive.id))) {
+        ctx.lightest_positive = it; found = true;
     }
-    if (!found) {
-        ctx.lightest_positive = *std::min_element(items.begin(), items.end(),
-            [](const Item& a, const Item& b) {
-                if (a.w != b.w) return a.w < b.w;
-                return a.id < b.id;
-            });
-    }
+    // The paper uses the ratio-best item as item 1 when no p_i-w_i is positive.
+    ctx.tau_star_base = found ? ctx.lightest_positive : ctx.best;
+    ctx.lightest_positive = ctx.tau_star_base;
     ctx.has_lightest_positive = true;
+    ctx.psi = 1;
+    if (ctx.tau_star_base.p <= ctx.tau_star_base.w) {
+        const __int128 quotient = ctx.tau_star_base.w / ctx.tau_star_base.p;
+        if (quotient >= std::numeric_limits<int>::max()) throw std::overflow_error("psi overflow");
+        ctx.psi = static_cast<int>(quotient + 1);
+        ctx.tau_normalized = true;
+    }
+    ctx.delta1 = floor_div(static_cast<__int128>(ctx.psi) * ctx.tau_star_base.p - ctx.tau_star_base.w, 1);
+    ctx.normalized_ratio_items = items;
+    for (Item& it : ctx.normalized_ratio_items)
+        it.p = floor_div(static_cast<__int128>(it.p) * ctx.psi, 1);
+    std::sort(ctx.normalized_ratio_items.begin(), ctx.normalized_ratio_items.end(), better_ratio);
 
-    // Same normalization idea used in bounds.ml: choose psi so that psi*p_min - w_min > 0.
-    int psi = static_cast<int>(ctx.lightest_positive.w / std::max<Profit>(1, ctx.lightest_positive.p)) + 1;
-    while (static_cast<__int128>(psi) * ctx.lightest_positive.p <= ctx.lightest_positive.w) ++psi;
-    ctx.psi = std::max(1, psi);
-    ctx.delta1 = static_cast<Profit>(static_cast<__int128>(ctx.psi) * ctx.lightest_positive.p - ctx.lightest_positive.w);
-
-    Profit alpha_num = 0;
-    Weight alpha_den = 1;
-    if (ctx.delta1 > 0) {
-        for (const auto& it : items) {
-            if (it.id == ctx.lightest_positive.id) continue;
-            if (it.w < ctx.lightest_positive.w) continue;
-            Profit delta_i = static_cast<Profit>(static_cast<__int128>(ctx.psi) * it.p - it.w);
-            long long q = it.w / ctx.lightest_positive.w;
-            if (q <= 0) continue;
-            const Weight denominator = safe_mul(q, ctx.delta1);
-            if (static_cast<__int128>(delta_i) * alpha_den >
-                static_cast<__int128>(alpha_num) * denominator) {
-                alpha_num = delta_i;
-                alpha_den = denominator;
-            }
+    Profit alpha_num = 0; Weight alpha_den = 1;
+    for (const Item& it : ctx.normalized_ratio_items) {
+        if (it.id == ctx.tau_star_base.id || it.w < ctx.tau_star_base.w) continue;
+        const Profit delta = it.p - static_cast<Profit>(it.w);
+        const Weight copies = it.w / ctx.tau_star_base.w;
+        if (copies <= 0) continue;
+        const __int128 den = static_cast<__int128>(copies) * ctx.delta1;
+        if (static_cast<__int128>(delta) * alpha_den > static_cast<__int128>(alpha_num) * den) {
+            alpha_num = delta; alpha_den = floor_div(den, 1);
         }
     }
-    ctx.alpha_num = alpha_num;
-    ctx.alpha_den = alpha_den;
+    ctx.alpha_num = alpha_num; ctx.alpha_den = alpha_den;
     ctx.preferred = static_cast<__int128>(alpha_num) <= alpha_den ? BoundType::V : BoundType::Both;
-    // The q* bounds in the paper assume that no item is multiply dominated.
-    // Certify that condition before allowing either bound into the policy.
-    bool no_multiple_dominance = true;
-    for (std::size_t i = 0; i < items.size() && no_multiple_dominance; ++i) {
-        for (std::size_t j = 0; j < items.size(); ++j) {
-            if (i == j || items[i].w > items[j].w) continue;
-            const Weight copies = items[j].w / items[i].w;
-            if (copies > 0 && safe_mul(copies, items[i].p) >= items[j].p) {
-                no_multiple_dominance = false;
-                break;
-            }
-        }
-    }
-    ctx.tau_star_certified = no_multiple_dominance;
-    ctx.best_item_star_certified = no_multiple_dominance;
+    ctx.no_multiple_dominance = has_no_multiple_dominance(ctx.items);
     return ctx;
 }
 
-BoundValue compute_u3(const BoundContext& ctx, Weight c) {
-    if (!ctx.has_three) {
-        Profit upper = floor_mul_div(c, ctx.best.p, ctx.best.w);
-        Profit lower = safe_mul(c / ctx.best.w, ctx.best.p);
-        return {upper, lower, BoundType::U3};
+bool is_bound_applicable(const BoundContext& ctx, BoundType type) {
+    if (ctx.items.empty()) return false;
+    switch (type) {
+        case BoundType::U3: case BoundType::V: return ctx.best.w > 0;
+        case BoundType::TauStar: return ctx.tau_star_base.w > 0 && ctx.tau_star_base.p > 0;
+        case BoundType::BestItemStar: return ctx.best_item_star_base.w > 0 && ctx.best_item_star_base.p > 0;
+        case BoundType::Both: return false;
     }
-    const Item& b1 = ctx.best;
-    const Item& b2 = ctx.second;
-    const Item& b3 = ctx.third;
-
-    Weight cb = c % b1.w;
-    Weight x1 = c / b1.w;
-    Weight c2 = cb % b2.w;
-    Weight x2 = cb / b2.w;
-    Profit z = safe_add(safe_mul(x1, b1.p), safe_mul(x2, b2.p));
-
-    Profit u0 = safe_add(z, floor_mul_div(c2, b3.p, b3.w));
-    Weight k = (b2.w - c2 + b1.w - 1) / b1.w;
-    Weight extra_capacity = c2 + k * b1.w;
-    Profit ub1 = safe_add(z, floor_mul_div(extra_capacity, b2.p, b2.w));
-    ub1 = safe_add(ub1, -safe_mul(k, b1.p));
-
-    Weight x3 = c2 / b3.w;
-    Profit lower = safe_add(z, safe_mul(x3, b3.p));
-    return {std::max(u0, ub1), lower, BoundType::U3};
+    return false;
 }
-
-BoundValue compute_v(const BoundContext& ctx, Weight c) {
-    const Item& m = ctx.lightest_positive;
-    Weight xb = c / m.w;
-    Profit alpha_num = ctx.alpha_num;
-    Weight alpha_den = ctx.alpha_den;
-    if (static_cast<__int128>(alpha_num) < alpha_den) {
-        alpha_num = 1;
-        alpha_den = 1;
+bool is_bound_certified(const BoundContext& ctx, BoundType type) {
+    if (!is_bound_applicable(ctx, type)) return false;
+    if (type == BoundType::TauStar) {
+        // The q* expression is exposed for the published SAW calculation, but
+        // this context does not retain the SAW witness required to certify it.
+        // Do not use it for pruning until that witness is available.
+        return false;
     }
-    const __int128 numerator = static_cast<__int128>(c) * alpha_den * ctx.psi +
-        static_cast<__int128>(alpha_num) * xb * ctx.delta1;
-    const __int128 denominator = static_cast<__int128>(alpha_den) * ctx.psi;
-    if (numerator > static_cast<__int128>(std::numeric_limits<Profit>::max()) * denominator) {
-        throw std::overflow_error("V bound overflow");
-    }
-    Profit upper = static_cast<Profit>(numerator / denominator);
-    Profit lower = safe_mul(xb, m.p);
-    return {upper, lower, BoundType::V};
+    if (type == BoundType::BestItemStar) return ctx.no_multiple_dominance;
+    return true;
 }
-
-BoundValue compute_tau_star(const BoundContext& ctx, Weight c) {
-    const Item& base = ctx.lightest_positive;
-    Rational q = q_star(ctx.ratio_items, base);
-    // tau_1* = min(1, q_1*).
-    if (greater(q, Rational{1, 1})) q = {1, 1};
-    return bound_from_q(base, c, q, BoundType::TauStar);
-}
-
-BoundValue compute_best_item_star(const BoundContext& ctx, Weight c) {
-    return bound_from_q(ctx.best, c, q_star(ctx.ratio_items, ctx.best),
-                        BoundType::BestItemStar);
-}
-
-BoundValue compute_bound(const BoundContext& ctx, Weight c) {
-    if (c <= 0) return {0, 0, ctx.preferred};
-    BoundValue mt = compute_u3(ctx, c);
-    BoundValue v = compute_v(ctx, c);
-    BoundValue out = mt;
-    std::vector<BoundValue> candidates{v};
-    for (const BoundValue candidate : candidates) {
-        if (candidate.upper < out.upper) out = candidate;
-        out.lower = std::max(out.lower, candidate.lower);
-    }
+std::vector<BoundType> certified_bound_types(const BoundContext& ctx) {
+    std::vector<BoundType> out;
+    for (BoundType t : {BoundType::U3, BoundType::V, BoundType::TauStar, BoundType::BestItemStar})
+        if (is_bound_certified(ctx, t)) out.push_back(t);
     return out;
 }
 
-}  // namespace ukp
+BoundValue compute_u3(const BoundContext& ctx, Weight c) {
+    if (c <= 0) return {0, 0, BoundType::U3};
+    if (!ctx.has_three) return {floor_mul_div(c, ctx.best.p, ctx.best.w), safe_mul(c / ctx.best.w, ctx.best.p), BoundType::U3};
+    const Item& b1=ctx.best; const Item& b2=ctx.second; const Item& b3=ctx.third;
+    Weight cb=c%b1.w, x1=c/b1.w, c2=cb%b2.w, x2=cb/b2.w;
+    Profit z=safe_add(safe_mul(x1,b1.p),safe_mul(x2,b2.p));
+    Profit u0=safe_add(z,floor_mul_div(c2,b3.p,b3.w));
+    Weight k=(b2.w-c2+b1.w-1)/b1.w;
+    Profit ub1=safe_add(safe_add(z,floor_mul_div(c2+k*b1.w,b2.p,b2.w)),-safe_mul(k,b1.p));
+    return {std::max(u0,ub1),safe_add(z,safe_mul(c2/b3.w,b3.p)),BoundType::U3};
+}
+BoundValue compute_v(const BoundContext& ctx, Weight c) {
+    if (c <= 0) return {0, 0, BoundType::V};
+    const Item& m=ctx.tau_star_base; Weight xb=c/m.w;
+    Profit an=ctx.alpha_num; Weight ad=ctx.alpha_den;
+    if (static_cast<__int128>(an)<ad) { an=1; ad=1; }
+    const __int128 n=static_cast<__int128>(c)*ad*ctx.psi+static_cast<__int128>(an)*xb*ctx.delta1;
+    return {floor_div(n,static_cast<__int128>(ad)*ctx.psi),safe_mul(xb,m.p),BoundType::V};
+}
+BoundValue compute_tau_star(const BoundContext& ctx, Weight c) {
+    const Item normalized_base{ctx.tau_star_base.id,ctx.tau_star_base.w,
+        floor_div(static_cast<__int128>(ctx.tau_star_base.p)*ctx.psi,1)};
+    Rational q=q_star(ctx.normalized_ratio_items,normalized_base);
+    if (greater(q,{1,1})) q={1,1};
+    return normalized_bound_from_q(normalized_base,ctx.tau_star_base,c,q,ctx.psi,BoundType::TauStar);
+}
+BoundValue compute_best_item_star(const BoundContext& ctx, Weight c) {
+    const Item normalized_base{ctx.best_item_star_base.id,ctx.best_item_star_base.w,
+        floor_div(static_cast<__int128>(ctx.best_item_star_base.p)*ctx.psi,1)};
+    return normalized_bound_from_q(normalized_base,ctx.best_item_star_base,c,
+        q_star(ctx.normalized_ratio_items,normalized_base),ctx.psi,BoundType::BestItemStar);
+}
+BoundValue compute_bound(const BoundContext& ctx, Weight c, BoundPolicy policy) {
+    if (c <= 0) return {0,0,BoundType::U3};
+    const BoundType requested=policy_type(policy);
+    if (requested != BoundType::Both && is_bound_certified(ctx,requested)) return individual(ctx,c,requested);
+    // Forced q* policies that are not certified fall back to certified U3;
+    // the returned type always describes that fallback, never the request.
+    const auto eligible=certified_bound_types(ctx);
+    if (eligible.empty()) throw std::logic_error("no certified bound");
+    BoundValue out=individual(ctx,c,eligible.front());
+    if (requested != BoundType::Both) return out;
+    // Stable ordering in certified_bound_types is the documented tie break.
+    for (std::size_t i=1;i<eligible.size();++i) {
+        BoundValue candidate=individual(ctx,c,eligible[i]);
+        if (candidate.upper < out.upper) out=candidate;
+    }
+    return out;
+}
+BoundValue compute_bound(const BoundContext& ctx, Weight c) {
+    // Historical API semantics, retained for optimized solver compatibility:
+    // select between U3 and V only. Faithful always calls the policy overload.
+    if (c <= 0) return {0, 0, BoundType::U3};
+    BoundValue out = compute_u3(ctx, c);
+    BoundValue v = compute_v(ctx, c);
+    if (v.upper < out.upper) out = v;
+    out.lower = std::max(out.lower, v.lower);
+    return out;
+}
+} // namespace ukp

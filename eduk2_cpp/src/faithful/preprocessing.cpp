@@ -28,7 +28,7 @@ PreprocessResult preprocess_items(const Instance& instance, bool use_simple_domi
 std::vector<Item> reduce_variables_by_bound(const std::vector<Item>& items,
                                             const BoundContext& context,
                                             Weight capacity, Profit incumbent,
-                                            long long& bound_calls) {
+                                            long long& bound_calls, BoundPolicy policy) {
     std::vector<Item> reduced;
     reduced.reserve(items.size());
     for (const Item& item : items) {
@@ -38,7 +38,7 @@ std::vector<Item> reduce_variables_by_bound(const std::vector<Item>& items,
         }
         if (item.w > capacity) continue;
         ++bound_calls;
-        if (safe_add(item.p, compute_bound(context, capacity - item.w).upper) > incumbent) {
+        if (safe_add(item.p, compute_bound(context, capacity - item.w, policy).upper) > incumbent) {
             reduced.push_back(item);
         }
     }

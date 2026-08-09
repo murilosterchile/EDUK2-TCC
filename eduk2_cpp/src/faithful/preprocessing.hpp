@@ -14,6 +14,6 @@ PreprocessResult preprocess_items(const Instance& instance, bool use_simple_domi
 std::vector<Item> reduce_variables_by_bound(const std::vector<Item>& items,
                                             const BoundContext& context,
                                             Weight capacity, Profit incumbent,
-                                            long long& bound_calls);
+                                            long long& bound_calls, BoundPolicy policy);
 
 }  // namespace ukp::faithful::detail

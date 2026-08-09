@@ -12,7 +12,7 @@ int main(int argc, char** argv) {
     if (argc < 3) {
         std::cerr << "usage: ukp_solve <faithful|optimized> <instance-file> [--paper-faithful|--no-paper-faithful]"
                      " [--simple-dominance] [--core-remainder-ordering] [--modular-dominance]"
-                     " [--core-multiple-dominance]\n";
+                     " [--core-multiple-dominance] [--bound-policy=u3|v|tau-star|best-item-star|best-certified]\n";
         return 2;
     }
     std::string solver = argv[1];
@@ -26,6 +26,15 @@ int main(int argc, char** argv) {
         else if (arg == "--core-remainder-ordering") opt.use_core_remainder_ordering = true;
         else if (arg == "--modular-dominance") opt.use_modular_dominance = true;
         else if (arg == "--core-multiple-dominance") opt.use_core_multiple_dominance = true;
+        else if (arg.rfind("--bound-policy=", 0) == 0) {
+            const std::string value = arg.substr(15);
+            if (value == "u3") opt.bound_policy = BoundPolicy::U3;
+            else if (value == "v") opt.bound_policy = BoundPolicy::V;
+            else if (value == "tau-star") opt.bound_policy = BoundPolicy::TauStar;
+            else if (value == "best-item-star") opt.bound_policy = BoundPolicy::BestItemStar;
+            else if (value == "best-certified") opt.bound_policy = BoundPolicy::BestCertified;
+            else { std::cerr << "unknown bound policy: " << value << '\n'; return 2; }
+        }
         else { std::cerr << "unknown option: " << arg << '\n'; return 2; }
     }
     auto t0 = std::chrono::steady_clock::now();

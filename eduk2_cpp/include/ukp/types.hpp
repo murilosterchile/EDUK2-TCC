@@ -10,6 +10,9 @@
 
 namespace ukp {
 
+// Selection policy, deliberately distinct from BoundType (the formula used).
+enum class BoundPolicy { U3, V, TauStar, BestItemStar, BestCertified };
+
 using Weight = long long;
 using Profit = long long;
 
@@ -85,6 +88,7 @@ struct SolverOptions {
     bool use_core_bb = true;
     bool use_periodicity = true;
     bool trace = false;
+    BoundPolicy bound_policy = BoundPolicy::BestCertified;
     int core_size = -1;
     long long bb_node_limit = 10000;
     Weight slice_height = 0;
