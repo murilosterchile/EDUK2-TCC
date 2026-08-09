@@ -412,29 +412,61 @@ SolverResult Solver::solve(const Instance& inst) {
     bool half_capacity_extension_done = false;
     bool closed_by_bound = false;
 
+    // Most greedy completions do not improve the incumbent.  Keep one
+    // reconstruction buffer for the rare candidates that do, and remember the
+    // positions written so clearing it does not become another O(n) pass.
+    std::vector<long long> reconstruction_multiplicity;
+    std::vector<int> reconstruction_touched_ids;
+    reconstruction_touched_ids.reserve(items.size());
+
     auto consider_greedy_completion = [&](detail::PointId state_index) {
         const detail::State& state = sequence.state(state_index);
-        std::vector<long long> multiplicity(inst.items.size(), 0);
-        for (detail::PointId cursor = state_index; cursor != detail::no_point;
-             cursor = sequence.state(cursor).predecessor) {
-            const int item_id = sequence.state(cursor).item_id;
-            if (item_id < 0) break;
-            ++multiplicity[static_cast<std::size_t>(item_id)];
-        }
-
         Weight used_weight = state.weight;
         Profit candidate_profit = state.profit;
         for (const Item& item : items) {
             const long long copies = (inst.capacity - used_weight) / item.w;
             if (copies == 0) continue;
-            multiplicity[static_cast<std::size_t>(item.id)] += copies;
             used_weight += safe_mul(copies, item.w);
             candidate_profit = safe_add(candidate_profit, safe_mul(copies, item.p));
         }
-        if (incumbent_solution.consider(candidate_profit, used_weight, std::move(multiplicity))) {
+
+        // Keep this predicate in sync with Incumbent::consider.  In particular,
+        // a tied profit only wins when it uses more weight.
+        if (candidate_profit < incumbent_solution.profit ||
+            (candidate_profit == incumbent_solution.profit &&
+             used_weight <= incumbent_solution.weight)) {
+            return;
+        }
+
+        if (reconstruction_multiplicity.empty()) {
+            reconstruction_multiplicity.assign(inst.items.size(), 0);
+        }
+        for (detail::PointId cursor = state_index; cursor != detail::no_point;
+             cursor = sequence.state(cursor).predecessor) {
+            const int item_id = sequence.state(cursor).item_id;
+            if (item_id < 0) break;
+            long long& count = reconstruction_multiplicity[static_cast<std::size_t>(item_id)];
+            if (count == 0) reconstruction_touched_ids.push_back(item_id);
+            ++count;
+        }
+        Weight reconstruction_weight = state.weight;
+        for (const Item& item : items) {
+            const long long copies = (inst.capacity - reconstruction_weight) / item.w;
+            if (copies == 0) continue;
+            long long& count = reconstruction_multiplicity[static_cast<std::size_t>(item.id)];
+            if (count == 0) reconstruction_touched_ids.push_back(item.id);
+            count += copies;
+            reconstruction_weight += safe_mul(copies, item.w);
+        }
+
+        if (incumbent_solution.consider(candidate_profit, used_weight, reconstruction_multiplicity)) {
             incumbent = incumbent_solution.profit;
             ++result.stats.incumbent_improvements_dp;
         }
+        for (const int item_id : reconstruction_touched_ids) {
+            reconstruction_multiplicity[static_cast<std::size_t>(item_id)] = 0;
+        }
+        reconstruction_touched_ids.clear();
     };
 
     // Listing 1 mapping: build/process a slice; fathom its states with
