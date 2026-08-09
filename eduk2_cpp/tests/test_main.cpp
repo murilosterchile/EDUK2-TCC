@@ -161,6 +161,14 @@ void check_equal_profit_predecessor_order() {
             "equal-profit tie did not retain the first predecessor");
 }
 
+void check_faithful_unordered_valid_ids() {
+    // Item IDs are valid multiplicity indexes but deliberately do not follow
+    // input order.  This exercises final-trace reconstruction through the
+    // direct ID-to-weight lookup.
+    const Instance instance{63, {{2, 15, 17}, {0, 20, 30}, {1, 25, 40}}};
+    check_faithful(instance, dense_dp_value(instance), "unordered valid IDs");
+}
+
 void check_faithful_switches() {
     const Instance instance{63, {{0, 5, 10}, {1, 6, 9}, {2, 8, 15}, {3, 11, 20}}};
     const Profit oracle = dense_dp_value(instance);
@@ -403,6 +411,7 @@ int main() {
         check_faithful_core_selection();
         check_skip_point_sequence();
         check_equal_profit_predecessor_order();
+        check_faithful_unordered_valid_ids();
         std::cout << "faithful correctness suite passed\n";
         return 0;
     } catch (const std::exception& error) {

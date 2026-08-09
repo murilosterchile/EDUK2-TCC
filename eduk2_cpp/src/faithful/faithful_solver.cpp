@@ -592,16 +592,33 @@ SolverResult Solver::solve(const Instance& inst) {
     sol.solver_name = "faithful";
     sol.multiplicity_by_id.assign(inst.items.size(), 0);
 
+    // Solutions and the DP reconstruction are indexed by item ID.  Build the
+    // direct lookup once, retaining the first matching item just as find_if
+    // did when duplicate IDs are supplied.
+    std::vector<Weight> item_weight_by_id(inst.items.size());
+    std::vector<bool> item_id_present(inst.items.size(), false);
+    for (const Item& item : inst.items) {
+        if (item.id < 0 || static_cast<std::size_t>(item.id) >= item_weight_by_id.size()) {
+            throw std::runtime_error("backtracking failed");
+        }
+        const std::size_t item_index = static_cast<std::size_t>(item.id);
+        if (!item_id_present[item_index]) {
+            item_weight_by_id[item_index] = item.w;
+            item_id_present[item_index] = true;
+        }
+    }
+
     auto add_trace = [&](detail::PointId index) {
       while (index != detail::no_point) {
         const detail::State& state = sequence.state(index);
         const int item_id = state.item_id;
         if (item_id < 0) break;
-        const auto it = std::find_if(inst.items.begin(), inst.items.end(),
-            [&](const Item& x) { return x.id == item_id; });
-        if (it == inst.items.end()) throw std::runtime_error("backtracking failed");
-        sol.multiplicity_by_id[static_cast<size_t>(it->id)]++;
-        sol.weight += it->w;
+        if (static_cast<std::size_t>(item_id) >= item_weight_by_id.size() ||
+            !item_id_present[static_cast<std::size_t>(item_id)]) {
+            throw std::runtime_error("backtracking failed");
+        }
+        sol.multiplicity_by_id[static_cast<std::size_t>(item_id)]++;
+        sol.weight += item_weight_by_id[static_cast<std::size_t>(item_id)];
         index = state.predecessor;
       }
     };
