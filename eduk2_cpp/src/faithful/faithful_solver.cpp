@@ -2,10 +2,8 @@
 #include "ukp/dominance.hpp"
 #include "eduk2_bounds.hpp"
 #include "preprocessing.hpp"
-#include "critical_sequence.hpp"
 #include "incumbent.hpp"
 #include <algorithm>
-#include <deque>
 #include <iostream>
 #include <map>
 #include <numeric>
@@ -353,136 +351,6 @@ SolverResult Solver::solve(const Instance& inst) {
         }
     }
 
-    // EDUK/Slice.one critical sequence.  Permanent storage contains only the
-    // strict envelope; merge candidates exist only while one slice is built.
-    Weight critical_wmax = 0;
-    for (const Item& item : items) critical_wmax = std::max(critical_wmax, item.w);
-    const Weight critical_limit = std::min(inst.capacity,
-        (inst.capacity + 1) / 2 + critical_wmax);
-    detail::CriticalSequence critical_sequence;
-    critical_sequence.build(items, critical_limit);
-    result.stats.states_kept = static_cast<long long>(critical_sequence.stored_points());
-    result.stats.points_generated = critical_sequence.generated_candidates();
-    result.stats.estimated_state_bytes = static_cast<long long>(
-        critical_sequence.stored_points() * sizeof(detail::CriticalPoint));
-
-    // Gilmore-Gomory/EDUK periodicity certificate: y+ is reached only after a
-    // complete window of wmax_active+1 capacities satisfies the best-item
-    // recurrence f(t) = f(t-w_b) + p_b.
-    const Item periodic_best = ctx.best;
-    const Weight wmax_active = critical_wmax;
-    Weight periodic_level = -1;
-    if (options_.use_periodicity && periodic_best.w > 0) {
-        std::deque<unsigned char> recurrence_window;
-        long long recurrence_count = 0;
-        for (Weight y = 0; y <= critical_limit; ++y) {
-            const bool follows_best = y >= periodic_best.w &&
-                critical_sequence.value_at(y) ==
-                    safe_add(critical_sequence.value_at(y - periodic_best.w), periodic_best.p);
-            recurrence_window.push_back(follows_best ? 1 : 0);
-            recurrence_count += follows_best ? 1 : 0;
-            if (recurrence_window.size() > static_cast<std::size_t>(wmax_active + 1)) {
-                recurrence_count -= recurrence_window.front();
-                recurrence_window.pop_front();
-            }
-            if (y >= wmax_active &&
-                recurrence_window.size() == static_cast<std::size_t>(wmax_active + 1) &&
-                recurrence_count == static_cast<long long>(wmax_active + 1)) {
-                periodic_level = y;
-                ++result.stats.periodicity_hits;
-                result.stats.periodicity_level = y;
-                break;
-            }
-        }
-    }
-
-    if (periodic_level >= 0) {
-        const Weight difference = inst.capacity - periodic_level;
-        const Weight remainder = difference % periodic_best.w;
-        const Weight target_capacity = remainder == 0
-            ? periodic_level
-            : periodic_level - (periodic_best.w - remainder);
-        const detail::PointId base_point = critical_sequence.point_at(target_capacity);
-        const auto& base = critical_sequence.point(base_point);
-        const long long copies = (inst.capacity - base.weight) / periodic_best.w;
-        Solution periodic_solution;
-        periodic_solution.profit = safe_add(base.profit, safe_mul(copies, periodic_best.p));
-        periodic_solution.optimal = true;
-        periodic_solution.solver_name = "faithful";
-        periodic_solution.multiplicity_by_id.assign(inst.items.size(), 0);
-        auto add_periodic_trace = [&](detail::PointId point_id) {
-            while (point_id != detail::no_point) {
-                const auto& point = critical_sequence.point(point_id);
-                if (point.last_item >= 0) {
-                    periodic_solution.multiplicity_by_id[static_cast<std::size_t>(point.last_item)] += point.multiplicity;
-                    const auto found = std::find_if(inst.items.begin(), inst.items.end(),
-                        [&](const Item& item) { return item.id == point.last_item; });
-                    if (found == inst.items.end()) throw std::runtime_error("periodic backtracking failed");
-                    periodic_solution.weight += safe_mul(point.multiplicity, found->w);
-                }
-                point_id = point.predecessor;
-            }
-        };
-        add_periodic_trace(base_point);
-        periodic_solution.multiplicity_by_id[static_cast<std::size_t>(periodic_best.id)] += copies;
-        periodic_solution.weight += safe_mul(copies, periodic_best.w);
-        result.solution = std::move(periodic_solution);
-        result.stats.active_items_final = static_cast<long long>(items.size());
-        result.stats.stop_reason = "periodicity";
-        return result;
-    }
-
-    std::vector<std::pair<Weight, detail::PointId>> critical_prefix;
-    critical_prefix.reserve(critical_sequence.envelope().size());
-    detail::PointId running_point = critical_sequence.envelope().front();
-    for (const detail::PointId point_id : critical_sequence.envelope()) {
-        const auto& point = critical_sequence.point(point_id);
-        if (point.profit > critical_sequence.point(running_point).profit) running_point = point_id;
-        critical_prefix.emplace_back(point.weight, running_point);
-    }
-    detail::PointId first_point = critical_sequence.envelope().front();
-    detail::PointId second_point = first_point;
-    Profit critical_profit = 0;
-    for (const detail::PointId point_id : critical_sequence.envelope()) {
-        const auto& point = critical_sequence.point(point_id);
-        auto partner = std::upper_bound(critical_prefix.begin(), critical_prefix.end(),
-                                        inst.capacity - point.weight,
-            [](Weight capacity, const auto& entry) { return capacity < entry.first; });
-        if (partner == critical_prefix.begin()) continue;
-        --partner;
-        const Profit candidate = safe_add(point.profit,
-            critical_sequence.point(partner->second).profit);
-        if (candidate > critical_profit) {
-            critical_profit = candidate;
-            first_point = point_id;
-            second_point = partner->second;
-        }
-    }
-    Solution critical_solution;
-    critical_solution.profit = critical_profit;
-    critical_solution.optimal = true;
-    critical_solution.solver_name = "faithful";
-    critical_solution.multiplicity_by_id.assign(inst.items.size(), 0);
-    auto reconstruct_critical = [&](detail::PointId point_id) {
-        while (point_id != detail::no_point) {
-            const auto& point = critical_sequence.point(point_id);
-            if (point.last_item >= 0) {
-                critical_solution.multiplicity_by_id[static_cast<std::size_t>(point.last_item)] += point.multiplicity;
-                const auto found = std::find_if(inst.items.begin(), inst.items.end(),
-                    [&](const Item& item) { return item.id == point.last_item; });
-                if (found == inst.items.end()) throw std::runtime_error("critical sequence backtracking failed");
-                critical_solution.weight += safe_mul(point.multiplicity, found->w);
-            }
-            point_id = point.predecessor;
-        }
-    };
-    reconstruct_critical(first_point);
-    reconstruct_critical(second_point);
-    result.solution = std::move(critical_solution);
-    result.stats.active_items_final = static_cast<long long>(items.size());
-    result.stats.stop_reason = "half_capacity";
-    return result;
-
     // EDUK's iteration space is represented by reachable exact-weight states,
     // not by an array indexed by every capacity.  Since all weights are
     // positive, map iteration is a topological order of the unbounded DP DAG.
@@ -494,7 +362,6 @@ SolverResult Solver::solve(const Instance& inst) {
     };
     std::vector<State> states{{0, 0, 0, -1}};
     std::map<Weight, std::size_t> best_at_weight{{0, 0}};
-    std::size_t sequence_incumbent = 0;
     std::vector<unsigned char> active(items.size(), 1);
     std::vector<Weight> last_contribution(items.size(), 0);
     Profit envelope_profit = 0;
@@ -509,26 +376,56 @@ SolverResult Solver::solve(const Instance& inst) {
     // interval so every feasible solution can be partitioned into two states
     // represented by this prefix.
     const Weight compute_limit = std::min(inst.capacity, half_capacity + wmax);
+    bool closed_by_bound = false;
 
-    for (Weight ya = 0; ya < compute_limit; ya += h) {
-        const Weight yb = std::min(compute_limit, ya + h);
+    auto consider_greedy_completion = [&](std::size_t state_index) {
+        const State& state = states[state_index];
+        std::vector<long long> multiplicity(inst.items.size(), 0);
+        for (std::size_t cursor = state_index; cursor != 0; cursor = states[cursor].predecessor) {
+            const int item_id = states[cursor].item_id;
+            if (item_id < 0) break;
+            ++multiplicity[static_cast<std::size_t>(item_id)];
+        }
+
+        Weight used_weight = state.weight;
+        Profit candidate_profit = state.profit;
+        for (std::size_t item_index = 0; item_index < items.size(); ++item_index) {
+            if (!active[item_index]) continue;
+            const Item& item = items[item_index];
+            const long long copies = (inst.capacity - used_weight) / item.w;
+            if (copies == 0) continue;
+            multiplicity[static_cast<std::size_t>(item.id)] += copies;
+            used_weight += safe_mul(copies, item.w);
+            candidate_profit = safe_add(candidate_profit, safe_mul(copies, item.p));
+        }
+        if (incumbent_solution.consider(candidate_profit, used_weight, std::move(multiplicity))) {
+            incumbent = incumbent_solution.profit;
+            ++result.stats.incumbent_improvements_dp;
+        }
+    };
+
+    // Listing 1: dp-solve builds the next slice, then fathoming removes states
+    // and items before the following slice.  The loop stops at the c/2 cut;
+    // successors in the extra wmax interval are retained for the final
+    // two-state aggregation.
+    for (Weight ya = 0; ya < half_capacity; ya += h) {
+        const Weight yb = std::min(compute_limit, ya + h - 1);
         auto current = best_at_weight.lower_bound(ya);
         while (current != best_at_weight.end() && current->first <= yb) {
             const std::size_t state_index = current->second;
             const State state = states[state_index];
             ++current; // insertions have greater weight and must remain iterable.
-            if (state.profit > states[sequence_incumbent].profit) {
-                sequence_incumbent = state_index;
-            }
             if (options_.use_bounds) {
                 const BoundValue residual = compute_bound(ctx, inst.capacity - state.weight);
                 ++result.stats.bound_calls;
-                if (safe_add(state.profit, residual.upper) <=
-                    states[sequence_incumbent].profit) {
+                if (safe_add(state.profit, residual.upper) <= incumbent) {
                     ++result.stats.states_fathomed;
                     continue;
                 }
             }
+            // Listing 1's fathoming improves z by greedily completing every
+            // surviving optimal state with the current dominance-free items.
+            consider_greedy_completion(state_index);
             // `sequence_result` in PYAsUKP contains precisely the strict
             // envelope improvements.  Only those points update an item's last
             // contribution; states discarded by bounds do not.
@@ -557,6 +454,10 @@ SolverResult Solver::solve(const Instance& inst) {
                 best_at_weight[next_weight] = states.size() - 1;
             }
         }
+        if (options_.use_bounds && incumbent >= global_bound.upper) {
+            closed_by_bound = true;
+            break;
+        }
 
         // Dynamic threshold dominance from EDUK/PYAsUKP:
         // last_contribution(i) + w_i <= yb.  Run it only at a completed
@@ -571,8 +472,10 @@ SolverResult Solver::solve(const Instance& inst) {
             if (safe_add(last_contribution[item_index], items[item_index].w) <= yb) {
                 active[item_index] = 0;
                 --active_count;
+                ++result.stats.items_removed_threshold;
             }
         }
+        if (active_count == 1) break;
     }
 
     // c/2 cut: any feasible UKP solution can be split into two submultisets
@@ -626,7 +529,16 @@ SolverResult Solver::solve(const Instance& inst) {
     add_trace(first_index);
     add_trace(second_index);
 
-    result.solution = std::move(sol);
+    if (sol.profit > incumbent_solution.profit) {
+        result.solution = std::move(sol);
+    } else {
+        result.solution = incumbent_solution.solution("faithful");
+    }
+    std::size_t active_count = 0;
+    for (unsigned char enabled : active) active_count += enabled != 0;
+    result.stats.active_items_final = static_cast<long long>(active_count);
+    result.stats.stop_reason = closed_by_bound ? "dp_bound_closed" :
+        (active_count == 1 ? "single_item" : "half_capacity");
     return result;
 }
 

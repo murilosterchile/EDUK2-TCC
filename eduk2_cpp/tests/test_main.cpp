@@ -51,9 +51,8 @@ void check_faithful(const Instance& instance, Profit oracle, const std::string& 
         require(verify_solution(instance, result.solution), prefix + "infeasible reconstruction");
         require(result.solution.weight <= instance.capacity, prefix + "weight exceeds capacity");
         require(result.solution.profit == oracle, prefix + "profit differs from dense oracle");
-        require(result.stats.points_generated >= result.stats.states_kept,
-                prefix + "retained more critical points than generated");
-        require(result.stats.estimated_state_bytes >= 0, prefix + "negative memory estimate");
+        require(result.stats.stop_reason != "uninitialized",
+                prefix + "DP phase did not report a termination reason");
     }
 }
 
