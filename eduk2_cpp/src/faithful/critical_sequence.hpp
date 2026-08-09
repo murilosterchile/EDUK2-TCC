@@ -4,7 +4,6 @@
 
 #include <cstddef>
 #include <functional>
-#include <map>
 #include <vector>
 
 namespace ukp::faithful::detail {
@@ -54,12 +53,37 @@ private:
         int item_id;
     };
 
+    // All successors of the weight currently being visited are at most the
+    // largest item weight ahead.  A circular window of that width therefore
+    // retains every pending candidate without a capacity-sized table.
+    class ComputedWindow {
+    public:
+        void configure(Weight largest_item_weight);
+        void store(Weight weight, const Candidate& candidate);
+        [[nodiscard]] bool contains(Weight weight) const;
+        [[nodiscard]] Candidate take(Weight weight);
+        [[nodiscard]] std::size_t estimated_bytes() const noexcept;
+
+    private:
+        struct Slot {
+            Candidate candidate{};
+            Weight weight = -1;
+            bool occupied = false;
+        };
+
+        [[nodiscard]] std::size_t index(Weight weight) const;
+
+        std::vector<Slot> slots_;
+        Weight largest_item_weight_ = 0;
+    };
+
     void schedule_successors(PointId parent, Weight compute_limit,
                              const std::vector<Item>& items, SliceBuildResult& result);
+    void reserve_storage(Weight compute_limit, const std::vector<Item>& items);
 
     std::vector<State> states_;
     std::vector<PointId> skip_points_;
-    std::map<Weight, Candidate> pending_;
+    ComputedWindow pending_;
     bool root_processed_ = false;
     long long generated_candidates_ = 0;
 };

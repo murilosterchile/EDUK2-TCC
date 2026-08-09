@@ -147,6 +147,20 @@ void check_skip_point_sequence() {
     }
 }
 
+void check_equal_profit_predecessor_order() {
+    // The first generated candidate at a weight must win an equal-profit tie;
+    // reconstruction depends on retaining that deterministic predecessor.
+    const std::vector<Item> items{{41, 2, 3}, {99, 2, 3}};
+    faithful::detail::CriticalSequence sequence;
+    sequence.process_slice(0, 2, 2, items,
+                           [](faithful::detail::PointId) { return true; });
+    const auto chosen = sequence.state(sequence.state_at_or_before(2));
+    require(chosen.weight == 2 && chosen.profit == 3,
+            "equal-profit candidate was not retained");
+    require(chosen.predecessor == 0 && chosen.item_id == 41,
+            "equal-profit tie did not retain the first predecessor");
+}
+
 void check_faithful_switches() {
     const Instance instance{63, {{0, 5, 10}, {1, 6, 9}, {2, 8, 15}, {3, 11, 20}}};
     const Profit oracle = dense_dp_value(instance);
@@ -372,6 +386,7 @@ int main() {
         check_faithful_switches();
         check_faithful_core_selection();
         check_skip_point_sequence();
+        check_equal_profit_predecessor_order();
         std::cout << "faithful correctness suite passed\n";
         return 0;
     } catch (const std::exception& error) {
