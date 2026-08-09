@@ -7,6 +7,17 @@ namespace ukp {
 
 enum class BoundType { U3, V, TauStar, BestItemStar, Both };
 
+inline const char* bound_type_name(BoundType type) {
+    switch (type) {
+        case BoundType::U3: return "U3";
+        case BoundType::V: return "V";
+        case BoundType::TauStar: return "TauStar";
+        case BoundType::BestItemStar: return "BestItemStar";
+        case BoundType::Both: return "none";
+    }
+    return "none";
+}
+
 struct BoundValue {
     Profit upper = 0;
     Profit lower = 0;

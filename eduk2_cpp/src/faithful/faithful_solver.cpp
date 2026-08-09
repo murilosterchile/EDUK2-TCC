@@ -62,6 +62,19 @@ struct CoreSearchResult {
     long long modular_removed = 0;
 };
 
+struct EffectiveOptions {
+    bool simple_dominance = false;
+    bool core_remainder_ordering = false;
+    bool modular_dominance = false;
+    bool core_multiple_dominance = false;
+};
+
+EffectiveOptions effective_options(const SolverOptions& options) {
+    if (options.paper_faithful_mode) return {};
+    return {options.use_simple_dominance, options.use_core_remainder_ordering,
+            options.use_modular_dominance, options.use_core_multiple_dominance};
+}
+
 void core_search(const std::vector<Item>& core, const BoundContext& bounds,
                  Weight capacity, Profit global_upper, long long node_limit,
                  std::size_t k, Weight used_weight, Profit used_profit,
@@ -180,16 +193,19 @@ void backtrack(CoreTraversal& search, std::vector<long long>& multiplicity) {
 
 CoreSearchResult traverse_core(std::vector<Item> items, const BoundContext& bounds,
                                Weight capacity, Profit global_upper, int requested_core,
-                               long long limit, std::size_t original_count) {
+                               long long limit, std::size_t original_count,
+                               const EffectiveOptions& effective) {
     const int default_size = std::min<int>(items.size(), std::max(100, static_cast<int>(items.size() / 100)));
     const int core_size = std::max(1, std::min(requested_core > 0 ? requested_core : default_size,
                                                 static_cast<int>(items.size())));
-    std::sort(items.begin(), items.end(), [capacity](const Item& left, const Item& right) {
+    const auto core_order = [capacity, &effective](const Item& left, const Item& right) {
+        if (!effective.core_remainder_ordering) return better_ratio(left, right);
         const Weight left_remainder = capacity % left.w;
         const Weight right_remainder = capacity % right.w;
         if (left_remainder != right_remainder) return left_remainder < right_remainder;
         return better_ratio(left, right);
-    });
+    };
+    std::sort(items.begin(), items.end(), core_order);
     items.resize(static_cast<std::size_t>(core_size));
     // Core-local multiple dominance before branching.
     std::vector<Item> filtered;
@@ -199,12 +215,14 @@ CoreSearchResult traverse_core(std::vector<Item> items, const BoundContext& boun
         bool dominated = false;
         bool modular = false;
         for (const Item& kept : filtered) {
-            const long long copies = candidate.w / kept.w;
-            if (copies > 0 && safe_mul(copies, kept.p) >= candidate.p) { dominated = true; break; }
+            if (effective.core_multiple_dominance) {
+                const long long copies = candidate.w / kept.w;
+                if (copies > 0 && safe_mul(copies, kept.p) >= candidate.p) { dominated = true; break; }
+            }
             // Modular dominance from dominance.ml/zhubrougan.  The best-ratio
             // item supplies the congruence adjustment; retained item `kept`
             // supplies the residue-class representative.
-            if (kept.w <= candidate.w && bounds.best.w != candidate.w) {
+            if (effective.modular_dominance && kept.w <= candidate.w && bounds.best.w != candidate.w) {
                 const Weight candidate_remainder = candidate.w % bounds.best.w;
                 const Weight kept_remainder = kept.w % bounds.best.w;
                 const Profit kept_z = safe_add(safe_mul(kept.w, bounds.best.p),
@@ -280,31 +298,39 @@ Solver::Solver(SolverOptions options) : options_(options) {}
 SolverResult Solver::solve(const Instance& inst) {
     if (inst.capacity < 0) throw std::invalid_argument("negative capacity");
     SolverResult result;
+    const EffectiveOptions effective = effective_options(options_);
     result.stats.original_items = static_cast<long long>(inst.items.size());
     if (inst.items.empty() || inst.capacity == 0) {
         result.solution.multiplicity_by_id.assign(inst.items.size(), 0);
         result.solution.optimal = true;
         result.solution.solver_name = "faithful";
         result.stats.stop_reason = "empty_instance";
+        result.stats.dp_stop_reason = "empty_instance";
         return result;
     }
 
-    detail::PreprocessResult preprocessing = detail::preprocess_items(inst, options_.use_preprocessing);
+    detail::PreprocessResult preprocessing = detail::preprocess_items(inst, effective.simple_dominance);
     std::vector<Item> items = std::move(preprocessing.items);
     result.stats.items_removed_simple = preprocessing.simple_removed;
     result.stats.items_removed_multiple = preprocessing.multiple_removed;
     result.stats.after_preprocess_items = static_cast<long long>(items.size());
 
-    detail::BoundPhase bound_phase = detail::initialize_bounds(items, inst.capacity);
-    BoundContext ctx = bound_phase.context;
-    BoundValue global_bound = bound_phase.global;
-    result.stats.bound_calls++;
-    result.stats.bound_winner = global_bound.type == BoundType::U3 ? "U3" :
-        global_bound.type == BoundType::V ? "V" :
-        global_bound.type == BoundType::TauStar ? "TauStar" : "BestItemStar";
+    BoundContext ctx = make_bound_context(items);
+    BoundValue global_bound{};
+    global_bound.upper = std::numeric_limits<Profit>::max();
+    long long best_count = inst.capacity / ctx.best.w;
+    Profit incumbent = safe_mul(best_count, ctx.best.p);
+    if (options_.use_bounds) {
+        const detail::BoundPhase bound_phase = detail::initialize_bounds(items, inst.capacity);
+        ctx = bound_phase.context;
+        global_bound = bound_phase.global;
+        best_count = bound_phase.best_count;
+        incumbent = bound_phase.incumbent;
+        ++result.stats.bound_calls;
+        result.stats.global_bound_used = bound_type_name(global_bound.type);
+        result.stats.bound_winner = result.stats.global_bound_used;
+    }
 
-    const long long best_count = bound_phase.best_count;
-    Profit incumbent = bound_phase.incumbent;
     detail::Incumbent incumbent_solution(inst.items.size());
     incumbent_solution.consider(incumbent, safe_mul(best_count, ctx.best.w),
                                 solution_from_best_item(inst, ctx.best, best_count).multiplicity_by_id,
@@ -332,7 +358,7 @@ SolverResult Solver::solve(const Instance& inst) {
     if (options_.use_core_bb) {
         CoreSearchResult core = traverse_core(items, ctx, inst.capacity,
                                                global_bound.upper, options_.core_size,
-                                               options_.bb_node_limit, inst.items.size());
+                                               options_.bb_node_limit, inst.items.size(), effective);
         incumbent = std::max(incumbent, core.profit);
         if (core.profit > incumbent_solution.profit) ++result.stats.incumbent_improvements_bb;
         Weight core_weight = 0;
@@ -341,7 +367,7 @@ SolverResult Solver::solve(const Instance& inst) {
         }
         incumbent_solution.consider(core.profit, core_weight, core.multiplicity);
         result.stats.bb_nodes += core.nodes;
-        result.stats.items_removed_multiple += core.multiple_removed;
+        result.stats.items_removed_core_multiple += core.multiple_removed;
         result.stats.items_removed_modular += core.modular_removed;
         if (core.closed) {
             result.solution = incumbent_solution.solution("faithful");
@@ -404,22 +430,31 @@ SolverResult Solver::solve(const Instance& inst) {
         }
     };
 
-    // Listing 1: dp-solve builds the next slice, then fathoming removes states
-    // and items before the following slice.  The loop stops at the c/2 cut;
-    // successors in the extra wmax interval are retained for the final
-    // two-state aggregation.
+    // Listing 1 mapping: build/process a slice; fathom its states with
+    // f(y)+U(c-y)<=z; greedily complete survivors; update contributions;
+    // apply threshold dominance at the completed boundary; then test stopping.
+    // The loop stops at the c/2 cut while retaining the extra wmax interval
+    // required by the final two-state aggregation.
     for (Weight ya = 0; ya < half_capacity; ya += h) {
         const Weight yb = std::min(compute_limit, ya + h - 1);
+        SliceStats slice;
+        slice.begin = ya;
+        slice.end = yb;
+        for (unsigned char enabled : active) slice.active_items_before += enabled != 0;
         auto current = best_at_weight.lower_bound(ya);
         while (current != best_at_weight.end() && current->first <= yb) {
             const std::size_t state_index = current->second;
             const State state = states[state_index];
             ++current; // insertions have greater weight and must remain iterable.
+            ++slice.states_entered;
             if (options_.use_bounds) {
                 const BoundValue residual = compute_bound(ctx, inst.capacity - state.weight);
                 ++result.stats.bound_calls;
+                ++result.stats.contextual_bound_calls[bound_type_name(residual.type)];
+                slice.contextual_bound_used = bound_type_name(residual.type);
                 if (safe_add(state.profit, residual.upper) <= incumbent) {
                     ++result.stats.states_fathomed;
+                    ++slice.states_fathomed_by_bound;
                     continue;
                 }
             }
@@ -440,22 +475,27 @@ SolverResult Solver::solve(const Instance& inst) {
                 }
             }
             ++result.stats.states_kept;
+            ++slice.states_kept;
             for (std::size_t item_index = 0; item_index < items.size(); ++item_index) {
                 if (!active[item_index]) continue;
                 const Item& item = items[item_index];
                 const Weight next_weight = state.weight + item.w;
                 if (next_weight > compute_limit) continue;
                 ++result.stats.states_scanned;
+                ++slice.successor_attempts;
                 const Profit next_profit = safe_add(state.profit, item.p);
                 const auto known = best_at_weight.find(next_weight);
                 if (known != best_at_weight.end() &&
                     states[known->second].profit >= next_profit) continue;
                 states.push_back(State{next_weight, next_profit, state_index, item.id});
                 best_at_weight[next_weight] = states.size() - 1;
+                ++slice.states_created;
             }
         }
         if (options_.use_bounds && incumbent >= global_bound.upper) {
             closed_by_bound = true;
+            slice.active_items_after = slice.active_items_before;
+            result.stats.slices.push_back(std::move(slice));
             break;
         }
 
@@ -464,7 +504,11 @@ SolverResult Solver::solve(const Instance& inst) {
         // slice, and keep one item so the active recurrence is never empty.
         const Weight introduced_through = std::max_element(items.begin(), items.end(),
             [](const Item& left, const Item& right) { return left.w < right.w; })->w;
-        if (yb < introduced_through) continue;
+        if (yb < introduced_through) {
+            slice.active_items_after = slice.active_items_before;
+            result.stats.slices.push_back(std::move(slice));
+            continue;
+        }
         std::size_t active_count = 0;
         for (unsigned char enabled : active) active_count += enabled != 0;
         for (std::size_t item_index = 0; item_index < items.size() && active_count > 1; ++item_index) {
@@ -473,8 +517,11 @@ SolverResult Solver::solve(const Instance& inst) {
                 active[item_index] = 0;
                 --active_count;
                 ++result.stats.items_removed_threshold;
+                ++slice.items_removed_threshold;
             }
         }
+        slice.active_items_after = static_cast<long long>(active_count);
+        result.stats.slices.push_back(std::move(slice));
         if (active_count == 1) break;
     }
 
@@ -537,6 +584,8 @@ SolverResult Solver::solve(const Instance& inst) {
     std::size_t active_count = 0;
     for (unsigned char enabled : active) active_count += enabled != 0;
     result.stats.active_items_final = static_cast<long long>(active_count);
+    result.stats.dp_stop_reason = closed_by_bound ? "bound_closed" :
+        (active_count == 1 ? "single_active_item" : "half_capacity_cut");
     result.stats.stop_reason = closed_by_bound ? "dp_bound_closed" :
         (active_count == 1 ? "single_item" : "half_capacity");
     return result;

@@ -13,6 +13,22 @@
 
 ## Faithful implementation
 
+`paper_faithful_mode=true` is the default.  It disables all experimental
+extensions (simple dominance, remainder core ordering, modular dominance, and
+core-local multiple dominance), even if their flags are set.  The mandatory
+best-item multiple-dominance reduction is not a core-local extension.
+
+| Paper phase | C++ block |
+|---|---|
+| 1. Initial reduction | `preprocess_items`: optional simple dominance, ratio sort, mandatory `remove_multiple_dominated_by_best`, ratio sort |
+| 2. Bounds/reduction | `initialize_bounds`, `reduce_variables_by_bound` |
+| 3. Core B&B | `traverse_core`, `greedy_fill`, `backtrack`/`complete` |
+| 4. Listing 1 sliced DP | slice loop in `faithful_solver.cpp`, contextual fathoming, completion, threshold dominance |
+
+`Stats::slices` records the Listing 1 work per actual slice, and the global
+and contextual bound types are exposed through stable names (`U3`, `V`,
+`TauStar`, `BestItemStar`, or `none`).
+
 The faithful implementation keeps the EDUK2 decomposition visible:
 
 - preprocessing by simple and multiple dominance;

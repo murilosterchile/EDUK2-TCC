@@ -4,18 +4,21 @@
 
 namespace ukp::faithful::detail {
 
-PreprocessResult preprocess_items(const Instance& instance, bool enabled) {
+PreprocessResult preprocess_items(const Instance& instance, bool use_simple_dominance) {
     PreprocessResult result;
     std::vector<Item>& items = result.items;
     items = instance.items;
-    if (enabled) {
+    if (use_simple_dominance) {
         const auto before_simple = items.size();
         items = remove_simple_dominated(std::move(items));
         result.simple_removed = static_cast<long long>(before_simple - items.size());
-        const Item best = *std::max_element(items.begin(), items.end(),
-            [](const Item& left, const Item& right) { return better_ratio(right, left); });
+    }
+    std::sort(items.begin(), items.end(), better_ratio);
+    // EDUK2 stage 1: best-item multiple dominance is mandatory, including in
+    // paper-faithful mode; it is distinct from core-local multiple dominance.
+    if (!items.empty()) {
         const auto before_multiple = items.size();
-        items = remove_multiple_dominated_by_best(std::move(items), best);
+        items = remove_multiple_dominated_by_best(std::move(items), items.front());
         result.multiple_removed = static_cast<long long>(before_multiple - items.size());
     }
     std::sort(items.begin(), items.end(), better_ratio);

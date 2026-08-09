@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <limits>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -31,6 +32,20 @@ struct Solution {
     std::string solver_name;
 };
 
+struct SliceStats {
+    Weight begin = 0;
+    Weight end = 0;
+    long long states_entered = 0;
+    long long successor_attempts = 0;
+    long long states_created = 0;
+    long long states_kept = 0;
+    long long states_fathomed_by_bound = 0;
+    long long items_removed_threshold = 0;
+    long long active_items_before = 0;
+    long long active_items_after = 0;
+    std::string contextual_bound_used = "none";
+};
+
 struct Stats {
     long long original_items = 0;
     long long after_preprocess_items = 0;
@@ -43,6 +58,7 @@ struct Stats {
     long long items_removed_simple = 0;
     long long items_removed_multiple = 0;
     long long items_removed_modular = 0;
+    long long items_removed_core_multiple = 0;
     long long items_removed_bound = 0;
     long long items_removed_threshold = 0;
     long long points_generated = 0;
@@ -50,13 +66,21 @@ struct Stats {
     long long incumbent_improvements_dp = 0;
     long long active_items_final = 0;
     long long estimated_state_bytes = 0;
-    std::string bound_winner = "U3";
+    std::string bound_winner = "none";
+    std::string global_bound_used = "none";
+    std::map<std::string, long long> contextual_bound_calls;
+    std::vector<SliceStats> slices;
+    std::string dp_stop_reason = "not_started";
     Weight periodicity_level = -1;
     std::string stop_reason = "uninitialized";
 };
 
 struct SolverOptions {
-    bool use_preprocessing = true;
+    bool paper_faithful_mode = true;
+    bool use_simple_dominance = false;
+    bool use_core_remainder_ordering = false;
+    bool use_modular_dominance = false;
+    bool use_core_multiple_dominance = false;
     bool use_bounds = true;
     bool use_core_bb = true;
     bool use_periodicity = true;

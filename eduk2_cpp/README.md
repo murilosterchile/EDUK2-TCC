@@ -7,6 +7,14 @@ This repository contains two C++17 implementations for the Unbounded Knapsack Pr
 
 The code is intended as a research scaffold for replication and engineering experiments. It preserves the exact UKP objective and uses the same families of bounds and dominance tests discussed in Poirriez, Yanev and Andonov's EDUK2 work. The `faithful` solver is deliberately written in a more explicit style to make comparisons against the OCaml modules easier.
 
+`faithful` defaults to `paper_faithful_mode=true`.  In that mode the four
+paper phases are explicit: initial best-item reduction, bounds and bound
+reduction, ratio-ordered core B&B, and Listing 1's sliced DP/fathoming.  The
+experimental `--simple-dominance`, `--core-remainder-ordering`,
+`--modular-dominance`, and `--core-multiple-dominance` switches take effect
+only with `--no-paper-faithful`.  The best-item multiple-dominance reduction
+remains mandatory in phase 1 in either mode.
+
 ## Build
 
 ```bash
@@ -25,6 +33,7 @@ cmake --build build -j
 ```bash
 ./build/ukp_solve faithful data/example.ukp
 ./build/ukp_solve optimized data/example.ukp
+./build/ukp_solve faithful data/example.ukp --no-paper-faithful --simple-dominance --core-remainder-ordering --modular-dominance --core-multiple-dominance
 ```
 
 Input format used by this workspace:

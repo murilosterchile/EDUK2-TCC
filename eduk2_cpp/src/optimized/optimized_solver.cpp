@@ -1166,7 +1166,9 @@ SolverResult Solver::solve(const Instance& inst) {
     }
 
     std::vector<Item> items = inst.items;
-    if (options_.use_preprocessing) {
+    // Keep the optimized solver's historical preprocessing policy independent
+    // from the faithful solver's explicit experimental switches.
+    {
         items = remove_simple_dominated(items);
         Item best = *std::max_element(items.begin(), items.end(),
             [](const Item& a, const Item& b) { return better_ratio(b, a); });

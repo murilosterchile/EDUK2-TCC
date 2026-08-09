@@ -28,7 +28,7 @@ struct Configuration {
 
 std::vector<Configuration> faithful_configurations() {
     SolverOptions baseline;
-    baseline.use_preprocessing = false;
+    baseline.paper_faithful_mode = false;
     baseline.use_bounds = false;
     baseline.use_core_bb = false;
     baseline.use_periodicity = false;
@@ -53,6 +53,73 @@ void check_faithful(const Instance& instance, Profit oracle, const std::string& 
         require(result.solution.profit == oracle, prefix + "profit differs from dense oracle");
         require(result.stats.stop_reason != "uninitialized",
                 prefix + "DP phase did not report a termination reason");
+        if (configuration.name == std::string("complete")) {
+            require(configuration.options.paper_faithful_mode, prefix + "default is not paper faithful");
+            require(result.stats.items_removed_modular == 0, prefix + "paper mode used modular dominance");
+            require(result.stats.items_removed_core_multiple == 0, prefix + "paper mode used core multiple dominance");
+        }
+        if (result.stats.dp_stop_reason != "not_started" && result.stats.dp_stop_reason != "empty_instance") {
+            require(!result.stats.slices.empty(), prefix + "DP telemetry has no slices");
+            long long fathomed = 0;
+            long long threshold = 0;
+            for (const SliceStats& slice : result.stats.slices) {
+                require(slice.begin <= slice.end, prefix + "invalid slice range");
+                fathomed += slice.states_fathomed_by_bound;
+                threshold += slice.items_removed_threshold;
+            }
+            require(fathomed == result.stats.states_fathomed, prefix + "slice fathoming mismatch");
+            require(threshold == result.stats.items_removed_threshold, prefix + "slice threshold mismatch");
+            require(result.stats.slices.back().active_items_after == result.stats.active_items_final,
+                    prefix + "final active-item mismatch");
+        }
+        if (!configuration.options.use_bounds) {
+            require(result.stats.global_bound_used == "none", prefix + "disabled bounds reported a global bound");
+            require(result.stats.contextual_bound_calls.empty(), prefix + "disabled bounds made contextual calls");
+        }
+    }
+}
+
+void check_faithful_switches() {
+    const Instance instance{63, {{0, 5, 10}, {1, 6, 9}, {2, 8, 15}, {3, 11, 20}}};
+    const Profit oracle = dense_dp_value(instance);
+    const SolverResult paper = faithful::Solver(SolverOptions{}).solve(instance);
+    require(paper.stats.items_removed_simple == 0, "paper mode enabled simple dominance");
+    require(paper.stats.items_removed_multiple > 0, "mandatory best-item reduction was skipped");
+    require(paper.solution.profit == oracle && verify_solution(instance, paper.solution), "paper switch result invalid");
+
+    SolverOptions simple;
+    simple.paper_faithful_mode = false;
+    simple.use_simple_dominance = true;
+    const SolverResult experimental = faithful::Solver(simple).solve(instance);
+    require(experimental.stats.items_removed_simple > 0, "experimental simple dominance was not used");
+    require(experimental.solution.profit == oracle && verify_solution(instance, experimental.solution),
+            "experimental switch result invalid");
+
+    SolverOptions forced_paper;
+    forced_paper.use_simple_dominance = true;
+    forced_paper.use_core_remainder_ordering = true;
+    forced_paper.use_modular_dominance = true;
+    forced_paper.use_core_multiple_dominance = true;
+    const SolverResult forced = faithful::Solver(forced_paper).solve(instance);
+    require(forced.stats.items_removed_simple == 0 && forced.stats.items_removed_modular == 0 &&
+                forced.stats.items_removed_core_multiple == 0,
+            "paper mode did not override extensions");
+
+    const Instance core_instance{2900, {{0, 120, 300}, {1, 245, 580}, {2, 130, 301},
+                                        {3, 260, 601}, {4, 310, 605}, {5, 194, 322},
+                                        {6, 190, 310}}};
+    const Profit core_oracle = dense_dp_value(core_instance);
+    const SolverResult core_paper = faithful::Solver(SolverOptions{}).solve(core_instance);
+    require(core_paper.stats.bb_nodes > 0, "core B&B was not entered");
+    for (int extension = 0; extension != 3; ++extension) {
+        SolverOptions option;
+        option.paper_faithful_mode = false;
+        if (extension == 0) option.use_core_remainder_ordering = true;
+        if (extension == 1) option.use_modular_dominance = true;
+        if (extension == 2) option.use_core_multiple_dominance = true;
+        const SolverResult trial = faithful::Solver(option).solve(core_instance);
+        require(verify_solution(core_instance, trial.solution) && trial.solution.profit == core_oracle,
+                "isolated core extension changed the optimum");
     }
 }
 
@@ -161,6 +228,7 @@ int main() {
         check_article_examples();
         check_generated_families();
         check_pyasukp_corpus();
+        check_faithful_switches();
         std::cout << "faithful correctness suite passed\n";
         return 0;
     } catch (const std::exception& error) {
