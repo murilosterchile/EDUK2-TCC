@@ -403,13 +403,13 @@ SolverResult Solver::solve(const Instance& inst) {
         [](const Item& a, const Item& b) { return a.w < b.w; })->w;
     Weight h = options_.slice_height > 0 ? options_.slice_height : wmin;
     if (h <= 0) h = 1;
-    Weight wmax = 0;
-    for (const Item& item : items) wmax = std::max(wmax, item.w);
     const Weight half_capacity = (inst.capacity + 1) / 2;
-    // EDUK2 stops the forward DP around c/2, retaining one largest-item
-    // interval so every feasible solution can be partitioned into two states
-    // represented by this prefix.
-    const Weight compute_limit = std::min(inst.capacity, half_capacity + wmax);
+    // EDUK2 first computes through c/2, then extends the recurrence once by
+    // the largest item still active after threshold dominance.  Candidates
+    // must nevertheless be retained up to c before that extension is known.
+    const Weight candidate_limit = inst.capacity;
+    Weight process_limit = half_capacity;
+    bool half_capacity_extension_done = false;
     bool closed_by_bound = false;
 
     auto consider_greedy_completion = [&](detail::PointId state_index) {
@@ -440,16 +440,16 @@ SolverResult Solver::solve(const Instance& inst) {
     // Listing 1 mapping: build/process a slice; fathom its states with
     // f(y)+U(c-y)<=z; greedily complete survivors; update contributions;
     // apply threshold dominance at the completed boundary; then test stopping.
-    // The loop stops at the c/2 cut while retaining the extra wmax interval
-    // required by the final two-state aggregation.
-    for (Weight ya = 0; ya < half_capacity; ya += h) {
-        const Weight yb = std::min(compute_limit, ya + h);
+    // After crossing c/2, extend once through the largest active-item range,
+    // as in EDUK2's `standard` recurrence.
+    for (Weight ya = 0; ya < process_limit;) {
+        const Weight yb = std::min(process_limit, ya + h);
         SliceStats slice;
         slice.begin = ya;
         slice.end = yb;
         slice.active_items_before = static_cast<long long>(items.size());
         const detail::SliceBuildResult build = sequence.process_slice(
-            ya, yb, compute_limit, items, [&](detail::PointId state_index) {
+            ya, yb, candidate_limit, items, [&](detail::PointId state_index) {
             const detail::State& state = sequence.state(state_index);
             ++slice.states_entered;
             if (options_.use_bounds) {
@@ -491,31 +491,38 @@ SolverResult Solver::solve(const Instance& inst) {
         if (yb < introduced_through) {
             slice.active_items_after = slice.active_items_before;
             result.stats.slices.push_back(std::move(slice));
-            continue;
-        }
-        std::vector<Item> next_items;
-        next_items.reserve(items.size());
-        std::size_t remaining_active = items.size();
-        for (const Item& item : items) {
-            if (remaining_active > 1 &&
-                safe_add(last_contribution[item.id], item.w) <= yb) {
-                --remaining_active;
-                ++result.stats.items_removed_threshold;
-                ++slice.items_removed_threshold;
-            } else {
-                next_items.push_back(item);
+        } else {
+            std::vector<Item> next_items;
+            next_items.reserve(items.size());
+            std::size_t remaining_active = items.size();
+            for (const Item& item : items) {
+                if (remaining_active > 1 &&
+                    safe_add(last_contribution[item.id], item.w) <= yb) {
+                    --remaining_active;
+                    ++result.stats.items_removed_threshold;
+                    ++slice.items_removed_threshold;
+                } else {
+                    next_items.push_back(item);
+                }
             }
-        }
-        // Threshold removal changes the actual residual instance.  Rebuild so
-        // q* certification and BestCertified selection never use stale items.
-        if (next_items.size() != items.size()) {
-            items = std::move(next_items);
-            ctx = make_bound_context(items);
+            // Threshold removal changes the actual residual instance. Rebuild
+            // so q* certification and BestCertified selection stay current.
+            if (next_items.size() != items.size()) {
+                items = std::move(next_items);
+                ctx = make_bound_context(items);
+            }
+            slice.active_items_after = static_cast<long long>(items.size());
+            result.stats.slices.push_back(std::move(slice));
         }
         const std::size_t active_count = items.size();
-        slice.active_items_after = static_cast<long long>(active_count);
-        result.stats.slices.push_back(std::move(slice));
-        if (active_count == 1) break;
+        if (!half_capacity_extension_done && yb >= half_capacity) {
+            const Weight active_wmax = std::max_element(items.begin(), items.end(),
+                [](const Item& left, const Item& right) { return left.w < right.w; })->w;
+            process_limit = std::min(inst.capacity, safe_add(yb, active_wmax));
+            half_capacity_extension_done = true;
+        }
+        if (active_count == 1 && half_capacity_extension_done && yb >= process_limit) break;
+        ya = yb;
     }
 
     // c/2 cut: the sequence query is the prefix maximum, because its profits

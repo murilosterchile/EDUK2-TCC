@@ -11,7 +11,7 @@ BUILD_DIR="${BUILD_DIR:-${PROJECT_DIR}/build}"
 OCAML_DIR="${OCAML_DIR:-/home/aprix/Downloads/pyasukp_mail/pyasukp}"
 BUILD_TYPE="${BUILD_TYPE:-Release}"
 RUN_ID="$(date +%Y%m%d_%H%M%S)"
-OUTPUT_DIR="${OUTPUT_DIR:-${PROJECT_DIR}/results/${RUN_ID}}"
+OUTPUT_FILE="${OUTPUT_FILE:-${PROJECT_DIR}/results/run_${RUN_ID}.txt}"
 BUILD=1
 
 usage() {
@@ -22,13 +22,14 @@ Options:
   --data-dir DIR       Directory containing .ukp files (default: data/)
   --build-dir DIR      CMake build directory (default: build/)
   --ocaml-dir DIR      PYAsUKP directory (default: ~/Downloads/pyasukp_mail/pyasukp)
-  --output-dir DIR     Directory for CSV and per-run logs
+  --output-file FILE   Single text report (default: results/run_<timestamp>.txt)
+  --output-dir DIR     Deprecated alias; writes DIR/results.txt
   --build-type TYPE    CMake build type (default: Release)
   --no-build           Reuse existing C++ and OCaml executables
   -h, --help           Show this help
 
-Environment variables DATA_DIR, BUILD_DIR, OCAML_DIR, OUTPUT_DIR and BUILD_TYPE
-have the equivalent effect. The script writes results.csv and one log per solver/run.
+Environment variables DATA_DIR, BUILD_DIR, OCAML_DIR, OUTPUT_FILE and BUILD_TYPE
+have the equivalent effect. The script writes one tab-separated text report.
 EOF
 }
 
@@ -37,7 +38,8 @@ while (($#)); do
         --data-dir) DATA_DIR="$2"; shift 2 ;;
         --build-dir) BUILD_DIR="$2"; shift 2 ;;
         --ocaml-dir) OCAML_DIR="$2"; shift 2 ;;
-        --output-dir) OUTPUT_DIR="$2"; shift 2 ;;
+        --output-file) OUTPUT_FILE="$2"; shift 2 ;;
+        --output-dir) OUTPUT_FILE="${2%/}/results.txt"; shift 2 ;;
         --build-type) BUILD_TYPE="$2"; shift 2 ;;
         --no-build) BUILD=0; shift ;;
         -h|--help) usage; exit 0 ;;
@@ -78,39 +80,57 @@ if [[ ! -x "$OCAML_BIN" ]]; then
     exit 2
 fi
 
-mkdir -p "$OUTPUT_DIR"/{faithful,optimized,ocaml}
-CSV="${OUTPUT_DIR}/results.csv"
-printf 'instance,solver,status,elapsed_seconds,log\n' > "$CSV"
+mkdir -p "$(dirname "$OUTPUT_FILE")"
+TEMP_DIR="$(mktemp -d)"
+trap 'rm -rf "$TEMP_DIR"' EXIT
 
-append_result() {
-    local instance="$1" solver="$2" status="$3" time_file="$4" log="$5"
-    local elapsed=""
-    [[ -f "$time_file" ]] && elapsed="$(tail -n 1 "$time_file")"
-    printf '%s,%s,%s,%s,%s\n' "$instance" "$solver" "$status" "$elapsed" "$log" >> "$CSV"
-    rm -f "$time_file"
+printf '# EDUK2 solver execution report\n# generated_at: %s\n' "$(date --iso-8601=seconds)" > "$OUTPUT_FILE"
+printf 'instance\talgorithm\tstatus\telapsed_seconds\tprofit\tweight\toptimal\tverified\tstates_scanned\tpoints_generated\tbb_nodes\tdetails\n' >> "$OUTPUT_FILE"
+
+elapsed_seconds() {
+    awk -v begin="$1" -v end="$2" 'BEGIN { printf "%.6f", (end - begin) / 1000000000 }'
+}
+
+value_from_cpp_output() {
+    local output="$1" key="$2"
+    awk -v key="$key" '$1 == key { print $2; exit }' <<< "$output"
+}
+
+append_row() {
+    local instance="$1" algorithm="$2" status="$3" elapsed="$4" profit="$5" weight="$6"
+    local optimal="$7" verified="$8" states="$9" points="${10}" bb_nodes="${11}" details="${12}"
+    details="${details//$'\t'/ }"
+    details="${details//$'\n'/ }"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$instance" "$algorithm" "$status" "$elapsed" "$profit" "$weight" "$optimal" "$verified" \
+        "$states" "$points" "$bb_nodes" "$details" >> "$OUTPUT_FILE"
 }
 
 run_cpp() {
-    local instance="$1"
-    local kind="$2"
-    local log="$3"
-    local time_file="${log}.time"
-    if /usr/bin/time -f '%e' -o "$time_file" "$FAITHFUL_BIN" "$kind" "$instance" > "$log" 2>&1; then
-        append_result "$(basename "$instance")" "$kind" "ok" "$time_file" "$log"
-    else
-        append_result "$(basename "$instance")" "$kind" "failed" "$time_file" "$log"
-    fi
+    local instance="$1" kind="$2" label="$3"
+    local start end output exit_code status
+    start="$(date +%s%N)"
+    output="$("$FAITHFUL_BIN" "$kind" "$instance" 2>&1)"
+    exit_code=$?
+    end="$(date +%s%N)"
+    status="ok"
+    ((exit_code == 0)) || status="failed"
+    append_row "$label" "$kind" "$status" "$(elapsed_seconds "$start" "$end")" \
+        "$(value_from_cpp_output "$output" profit)" "$(value_from_cpp_output "$output" weight)" \
+        "$(value_from_cpp_output "$output" optimal)" "$(value_from_cpp_output "$output" verified)" \
+        "$(value_from_cpp_output "$output" states_scanned)" "$(value_from_cpp_output "$output" points_generated)" \
+        "$(value_from_cpp_output "$output" bb_nodes)" \
+        "$(value_from_cpp_output "$output" stop_reason)"
 }
 
 run_ocaml() {
-    local instance="$1"
-    local log="$2"
-    local time_file="${log}.time"
+    local instance="$1" label="$2"
     local source="$instance"
-    local converted="${log%.log}.input.ukp"
+    local converted
     # PYAsUKP accepts its own n:/c:/begin-data format. Convert only the
     # compact C++ legacy format, whose item order is profit then weight.
     if ! grep -qE '^[[:space:]]*(n|m):|^[[:space:]]*begin data' "$instance"; then
+        converted="$(mktemp "${TEMP_DIR}/input.XXXXXX.ukp")"
         awk '
             /^[[:space:]]*#/ { next }
             { for (i = 1; i <= NF; ++i) values[++count] = $i }
@@ -126,27 +146,37 @@ run_ocaml() {
         ' "$instance" > "$converted" || return 1
         source="$converted"
     fi
-    if /usr/bin/time -f '%e' -o "$time_file" "$OCAML_BIN" -src "$source" -batch > "$log" 2>&1; then
-        append_result "$(basename "$instance")" "ocaml_pyasukpbct" "ok" "$time_file" "$log"
-    else
-        append_result "$(basename "$instance")" "ocaml_pyasukpbct" "failed" "$time_file" "$log"
-    fi
+    local start end output exit_code status summary
+    start="$(date +%s%N)"
+    output="$("$OCAML_BIN" -src "$source" -batch 2>&1)"
+    exit_code=$?
+    end="$(date +%s%N)"
+    status="ok"
+    ((exit_code == 0)) || status="failed"
+    summary="$(awk 'NF { print; exit }' <<< "$output")"
+    # PYAsUKP prefixes the batch fields with a variable-length instance
+    # classification. The stable fields are counted from the end: exact flag,
+    # profit, internal time, and B&B nodes; critical points precede them.
+    append_row "$label" "ocaml_pyasukpbct" "$status" "$(elapsed_seconds "$start" "$end")" \
+        "$(awk 'NF { print $(NF - 2); exit }' <<< "$output")" "" \
+        "$(awk 'NF { print $(NF - 3); exit }' <<< "$output")" "" "" \
+        "$(awk 'NF { print $(NF - 4); exit }' <<< "$output")" \
+        "$(awk 'NF { print $NF; exit }' <<< "$output")" "$summary"
 }
 
-shopt -s nullglob
-instances=("${DATA_DIR}"/*.ukp)
+mapfile -d '' -t instances < <(find "$DATA_DIR" -type f -name '*.ukp' -print0 | sort -z)
 if ((${#instances[@]} == 0)); then
     echo "no .ukp instances in ${DATA_DIR}" >&2
     exit 2
 fi
 
 for instance in "${instances[@]}"; do
-    stem="$(basename "${instance%.ukp}")"
-    echo "running ${stem}"
-    run_cpp "$instance" faithful "${OUTPUT_DIR}/faithful/${stem}.log"
-    run_cpp "$instance" optimized "${OUTPUT_DIR}/optimized/${stem}.log"
-    run_ocaml "$instance" "${OUTPUT_DIR}/ocaml/${stem}.log"
+    label="${instance#"${DATA_DIR}"/}"
+    echo "running ${label}"
+    run_cpp "$instance" faithful "$label"
+    run_cpp "$instance" optimized "$label"
+    run_ocaml "$instance" "$label"
 done
 
 echo "completed ${#instances[@]} instances"
-echo "CSV: ${CSV}"
+echo "report: ${OUTPUT_FILE}"

@@ -376,6 +376,21 @@ void check_pyasukp_corpus() {
     require(dense_checked > 0, "no PYAsUKP corpus instance was eligible for dense oracle");
 }
 
+void check_faithful_extended_prefix_regression() {
+    // The final two-state aggregation needs the interval after c/2.  This
+    // instance regressed when the slice loop stopped at half_capacity rather
+    // than extending once through the post-threshold active-item range.
+    const auto path = std::filesystem::path(UKP_SOURCE_DIR) / "data" / "exnsdbis10.ukp";
+    const Instance instance = read_instance_file(path.string());
+    const SolverResult result = faithful::Solver(SolverOptions{}).solve(instance);
+    require(verify_solution(instance, result.solution),
+            "extended-prefix regression: infeasible faithful solution");
+    require(result.solution.profit == 1'028'035,
+            "extended-prefix regression: faithful missed the optimum");
+    require(result.solution.weight == 894'642,
+            "extended-prefix regression: faithful selected the wrong solution");
+}
+
 }  // namespace
 
 int main() {
@@ -383,6 +398,7 @@ int main() {
         check_article_examples();
         check_generated_families();
         check_pyasukp_corpus();
+        check_faithful_extended_prefix_regression();
         check_faithful_switches();
         check_faithful_core_selection();
         check_skip_point_sequence();
