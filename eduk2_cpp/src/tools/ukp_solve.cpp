@@ -12,12 +12,14 @@ int main(int argc, char** argv) {
     if (argc < 3) {
         std::cerr << "usage: ukp_solve <faithful|optimized> <instance-file> [--paper-faithful|--no-paper-faithful]"
                      " [--simple-dominance] [--core-remainder-ordering] [--modular-dominance]"
-                     " [--core-multiple-dominance] [--bound-policy=u3|v|tau-star|best-item-star|best-certified]\n";
+                     " [--core-multiple-dominance] [--bound-policy=u3|v|tau-star|best-item-star|best-certified]"
+                     " [--verbose]\n";
         return 2;
     }
     std::string solver = argv[1];
     Instance inst = read_instance_file(argv[2]);
     SolverOptions opt;
+    bool verbose = false;
     for (int i = 3; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--paper-faithful") opt.paper_faithful_mode = true;
@@ -26,6 +28,7 @@ int main(int argc, char** argv) {
         else if (arg == "--core-remainder-ordering") opt.use_core_remainder_ordering = true;
         else if (arg == "--modular-dominance") opt.use_modular_dominance = true;
         else if (arg == "--core-multiple-dominance") opt.use_core_multiple_dominance = true;
+        else if (arg == "--verbose") verbose = true;
         else if (arg.rfind("--bound-policy=", 0) == 0) {
             const std::string value = arg.substr(15);
             if (value == "u3") opt.bound_policy = BoundPolicy::U3;
@@ -76,17 +79,19 @@ int main(int argc, char** argv) {
     for (const auto& [type, calls] : res.stats.contextual_bound_calls) {
         std::cout << "contextual_bound_calls " << type << ' ' << calls << '\n';
     }
-    for (const SliceStats& slice : res.stats.slices) {
-        std::cout << "slice begin=" << slice.begin << " end=" << slice.end
-                  << " states_entered=" << slice.states_entered
-                  << " successor_attempts=" << slice.successor_attempts
-                  << " states_created=" << slice.states_created
-                  << " states_kept=" << slice.states_kept
-                  << " states_fathomed_by_bound=" << slice.states_fathomed_by_bound
-                  << " items_removed_threshold=" << slice.items_removed_threshold
-                  << " active_items_before=" << slice.active_items_before
-                  << " active_items_after=" << slice.active_items_after
-                  << " contextual_bound_used=" << slice.contextual_bound_used << '\n';
+    if (verbose) {
+        for (const SliceStats& slice : res.stats.slices) {
+            std::cout << "slice begin=" << slice.begin << " end=" << slice.end
+                      << " states_entered=" << slice.states_entered
+                      << " successor_attempts=" << slice.successor_attempts
+                      << " states_created=" << slice.states_created
+                      << " states_kept=" << slice.states_kept
+                      << " states_fathomed_by_bound=" << slice.states_fathomed_by_bound
+                      << " items_removed_threshold=" << slice.items_removed_threshold
+                      << " active_items_before=" << slice.active_items_before
+                      << " active_items_after=" << slice.active_items_after
+                      << " contextual_bound_used=" << slice.contextual_bound_used << '\n';
+        }
     }
     std::cout << "periodicity_level " << res.stats.periodicity_level << '\n';
     std::cout << "stop_reason " << res.stats.stop_reason << '\n';

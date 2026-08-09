@@ -1,6 +1,7 @@
 #include "ukp/faithful_solver.hpp"
 #include "ukp/dominance.hpp"
 #include "eduk2_bounds.hpp"
+#include "critical_sequence.hpp"
 #include "preprocessing.hpp"
 #include "incumbent.hpp"
 #include <algorithm>
@@ -394,20 +395,10 @@ SolverResult Solver::solve(const Instance& inst) {
     // starts from the unchanged global list selected above.
     items = dp_items;
 
-    // EDUK's iteration space is represented by reachable exact-weight states,
-    // not by an array indexed by every capacity.  Since all weights are
-    // positive, map iteration is a topological order of the unbounded DP DAG.
-    struct State {
-        Weight weight;
-        Profit profit;
-        std::size_t predecessor;
-        int item_id;
-    };
-    std::vector<State> states{{0, 0, 0, -1}};
-    std::map<Weight, std::size_t> best_at_weight{{0, 0}};
-    std::vector<unsigned char> active(items.size(), 1);
-    std::vector<Weight> last_contribution(items.size(), 0);
-    Profit envelope_profit = 0;
+    // The sequence is the DP representation: it stores only strict increases
+    // of f(N, y), in topological weight order.
+    detail::CriticalSequence sequence;
+    std::unordered_map<int, Weight> last_contribution;
     Weight wmin = std::min_element(items.begin(), items.end(),
         [](const Item& a, const Item& b) { return a.w < b.w; })->w;
     Weight h = options_.slice_height > 0 ? options_.slice_height : wmin;
@@ -421,20 +412,19 @@ SolverResult Solver::solve(const Instance& inst) {
     const Weight compute_limit = std::min(inst.capacity, half_capacity + wmax);
     bool closed_by_bound = false;
 
-    auto consider_greedy_completion = [&](std::size_t state_index) {
-        const State& state = states[state_index];
+    auto consider_greedy_completion = [&](detail::PointId state_index) {
+        const detail::State& state = sequence.state(state_index);
         std::vector<long long> multiplicity(inst.items.size(), 0);
-        for (std::size_t cursor = state_index; cursor != 0; cursor = states[cursor].predecessor) {
-            const int item_id = states[cursor].item_id;
+        for (detail::PointId cursor = state_index; cursor != detail::no_point;
+             cursor = sequence.state(cursor).predecessor) {
+            const int item_id = sequence.state(cursor).item_id;
             if (item_id < 0) break;
             ++multiplicity[static_cast<std::size_t>(item_id)];
         }
 
         Weight used_weight = state.weight;
         Profit candidate_profit = state.profit;
-        for (std::size_t item_index = 0; item_index < items.size(); ++item_index) {
-            if (!active[item_index]) continue;
-            const Item& item = items[item_index];
+        for (const Item& item : items) {
             const long long copies = (inst.capacity - used_weight) / item.w;
             if (copies == 0) continue;
             multiplicity[static_cast<std::size_t>(item.id)] += copies;
@@ -453,16 +443,14 @@ SolverResult Solver::solve(const Instance& inst) {
     // The loop stops at the c/2 cut while retaining the extra wmax interval
     // required by the final two-state aggregation.
     for (Weight ya = 0; ya < half_capacity; ya += h) {
-        const Weight yb = std::min(compute_limit, ya + h - 1);
+        const Weight yb = std::min(compute_limit, ya + h);
         SliceStats slice;
         slice.begin = ya;
         slice.end = yb;
-        for (unsigned char enabled : active) slice.active_items_before += enabled != 0;
-        auto current = best_at_weight.lower_bound(ya);
-        while (current != best_at_weight.end() && current->first <= yb) {
-            const std::size_t state_index = current->second;
-            const State state = states[state_index];
-            ++current; // insertions have greater weight and must remain iterable.
+        slice.active_items_before = static_cast<long long>(items.size());
+        const detail::SliceBuildResult build = sequence.process_slice(
+            ya, yb, compute_limit, items, [&](detail::PointId state_index) {
+            const detail::State& state = sequence.state(state_index);
             ++slice.states_entered;
             if (options_.use_bounds) {
                 const BoundValue residual = compute_bound(ctx, inst.capacity - state.weight, options_.bound_policy);
@@ -472,43 +460,22 @@ SolverResult Solver::solve(const Instance& inst) {
                 if (safe_add(state.profit, residual.upper) <= incumbent) {
                     ++result.stats.states_fathomed;
                     ++slice.states_fathomed_by_bound;
-                    continue;
+                    return false;
                 }
             }
             // Listing 1's fathoming improves z by greedily completing every
             // surviving optimal state with the current dominance-free items.
             consider_greedy_completion(state_index);
-            // `sequence_result` in PYAsUKP contains precisely the strict
-            // envelope improvements.  Only those points update an item's last
-            // contribution; states discarded by bounds do not.
-            if (state.profit > envelope_profit) {
-                envelope_profit = state.profit;
-                if (state.item_id >= 0) {
-                    const auto item_pos = std::find_if(items.begin(), items.end(),
-                        [&](const Item& item) { return item.id == state.item_id; });
-                    if (item_pos != items.end()) {
-                        last_contribution[static_cast<std::size_t>(item_pos - items.begin())] = state.weight;
-                    }
-                }
-            }
+            // Every state exposed by the sequence is a strict skip-point.
+            if (state.item_id >= 0) last_contribution[state.item_id] = state.weight;
             ++result.stats.states_kept;
             ++slice.states_kept;
-            for (std::size_t item_index = 0; item_index < items.size(); ++item_index) {
-                if (!active[item_index]) continue;
-                const Item& item = items[item_index];
-                const Weight next_weight = state.weight + item.w;
-                if (next_weight > compute_limit) continue;
-                ++result.stats.states_scanned;
-                ++slice.successor_attempts;
-                const Profit next_profit = safe_add(state.profit, item.p);
-                const auto known = best_at_weight.find(next_weight);
-                if (known != best_at_weight.end() &&
-                    states[known->second].profit >= next_profit) continue;
-                states.push_back(State{next_weight, next_profit, state_index, item.id});
-                best_at_weight[next_weight] = states.size() - 1;
-                ++slice.states_created;
-            }
-        }
+            return true;
+        });
+        result.stats.states_scanned += build.successor_attempts;
+        slice.successor_attempts += build.successor_attempts;
+        slice.states_created += build.states_created;
+        result.stats.points_generated += build.points_generated;
         if (options_.use_bounds && incumbent >= global_bound.upper) {
             closed_by_bound = true;
             slice.active_items_after = slice.active_items_before;
@@ -526,51 +493,40 @@ SolverResult Solver::solve(const Instance& inst) {
             result.stats.slices.push_back(std::move(slice));
             continue;
         }
-        std::size_t active_count = 0;
-        for (unsigned char enabled : active) active_count += enabled != 0;
-        for (std::size_t item_index = 0; item_index < items.size() && active_count > 1; ++item_index) {
-            if (!active[item_index]) continue;
-            if (safe_add(last_contribution[item_index], items[item_index].w) <= yb) {
-                active[item_index] = 0;
-                --active_count;
+        std::vector<Item> next_items;
+        next_items.reserve(items.size());
+        std::size_t remaining_active = items.size();
+        for (const Item& item : items) {
+            if (remaining_active > 1 &&
+                safe_add(last_contribution[item.id], item.w) <= yb) {
+                --remaining_active;
                 ++result.stats.items_removed_threshold;
                 ++slice.items_removed_threshold;
+            } else {
+                next_items.push_back(item);
             }
         }
         // Threshold removal changes the actual residual instance.  Rebuild so
         // q* certification and BestCertified selection never use stale items.
-        if (active_count != items.size()) {
-            std::vector<Item> active_items;
-            active_items.reserve(active_count);
-            for (std::size_t i = 0; i < items.size(); ++i) if (active[i]) active_items.push_back(items[i]);
-            ctx = make_bound_context(active_items);
+        if (next_items.size() != items.size()) {
+            items = std::move(next_items);
+            ctx = make_bound_context(items);
         }
+        const std::size_t active_count = items.size();
         slice.active_items_after = static_cast<long long>(active_count);
         result.stats.slices.push_back(std::move(slice));
         if (active_count == 1) break;
     }
 
-    // c/2 cut: any feasible UKP solution can be split into two submultisets
-    // whose weights are bounded by ceil(c/2)+wmax.  A prefix maximum lets us
-    // select the best compatible partner in linear time over critical states.
-    std::vector<std::pair<Weight, std::size_t>> prefix_best;
-    prefix_best.reserve(best_at_weight.size());
-    std::size_t running_best = 0;
-    for (const auto& [weight, index] : best_at_weight) {
-        if (states[index].profit > states[running_best].profit) running_best = index;
-        prefix_best.emplace_back(weight, running_best);
-    }
-    std::size_t first_index = 0;
-    std::size_t second_index = 0;
+    // c/2 cut: the sequence query is the prefix maximum, because its profits
+    // are strictly increasing with its skip-point weights.
+    detail::PointId first_index = 0;
+    detail::PointId second_index = 0;
     Profit split_profit = 0;
-    for (const auto& [weight, index] : best_at_weight) {
-        const Weight remaining = inst.capacity - weight;
-        auto pos = std::upper_bound(prefix_best.begin(), prefix_best.end(), remaining,
-            [](Weight value, const auto& entry) { return value < entry.first; });
-        if (pos == prefix_best.begin()) continue;
-        --pos;
-        const std::size_t partner = pos->second;
-        const Profit candidate = safe_add(states[index].profit, states[partner].profit);
+    for (const detail::PointId index : sequence.skip_points()) {
+        const detail::State& state = sequence.state(index);
+        const detail::PointId partner = sequence.state_at_or_before(inst.capacity - state.weight);
+        const Profit candidate = safe_add(state.profit, sequence.state(partner).profit);
         if (candidate > split_profit) {
             split_profit = candidate;
             first_index = index;
@@ -585,9 +541,9 @@ SolverResult Solver::solve(const Instance& inst) {
     sol.solver_name = "faithful";
     sol.multiplicity_by_id.assign(inst.items.size(), 0);
 
-    auto add_trace = [&](std::size_t index) {
-      while (index != 0) {
-        const State& state = states[index];
+    auto add_trace = [&](detail::PointId index) {
+      while (index != detail::no_point) {
+        const detail::State& state = sequence.state(index);
         const int item_id = state.item_id;
         if (item_id < 0) break;
         const auto it = std::find_if(inst.items.begin(), inst.items.end(),
@@ -606,8 +562,8 @@ SolverResult Solver::solve(const Instance& inst) {
     } else {
         result.solution = incumbent_solution.solution("faithful");
     }
-    std::size_t active_count = 0;
-    for (unsigned char enabled : active) active_count += enabled != 0;
+    result.stats.estimated_state_bytes = static_cast<long long>(sequence.estimated_bytes());
+    const std::size_t active_count = items.size();
     result.stats.active_items_final = static_cast<long long>(active_count);
     result.stats.dp_stop_reason = closed_by_bound ? "bound_closed" :
         (active_count == 1 ? "single_active_item" : "half_capacity_cut");

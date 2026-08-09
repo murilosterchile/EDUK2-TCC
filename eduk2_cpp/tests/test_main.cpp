@@ -5,6 +5,7 @@
 #include "ukp/io.hpp"
 #include "ukp/verify.hpp"
 #include "../src/faithful/preprocessing.hpp"
+#include "../src/faithful/critical_sequence.hpp"
 
 #include <filesystem>
 #include <iostream>
@@ -77,6 +78,72 @@ void check_faithful(const Instance& instance, Profit oracle, const std::string& 
             require(result.stats.global_bound_used == "none", prefix + "disabled bounds reported a global bound");
             require(result.stats.contextual_bound_calls.empty(), prefix + "disabled bounds made contextual calls");
         }
+    }
+}
+
+void check_skip_point_sequence() {
+    // Includes gaps, collisions at a weight, equal-profit collisions, a
+    // weight-one item, and deliberately unordered IDs/weights.
+    const std::vector<Item> items{{17, 4, 7}, {3, 1, 2}, {29, 3, 6},
+                                  {8, 2, 4}, {41, 5, 9}, {5, 3, 6}};
+    constexpr Weight limit = 31;
+    std::vector<Profit> dense(static_cast<std::size_t>(limit + 1), 0);
+    for (Weight y = 1; y <= limit; ++y) {
+        for (const Item& item : items) {
+            if (item.w <= y) dense[static_cast<std::size_t>(y)] = std::max(
+                dense[static_cast<std::size_t>(y)],
+                safe_add(dense[static_cast<std::size_t>(y - item.w)], item.p));
+        }
+    }
+
+    for (const Weight height : {Weight{1}, Weight{4}, Weight{7}}) {
+        faithful::detail::CriticalSequence sequence;
+        for (Weight ya = 0; ya < limit; ya += height) {
+            const Weight yb = std::min(limit, ya + height);
+            sequence.process_slice(ya, yb, limit, items,
+                                   [](faithful::detail::PointId) { return true; });
+        }
+        for (Weight y = 0; y <= limit; ++y) {
+            require(sequence.value_at(y) == dense[static_cast<std::size_t>(y)],
+                    "skip-point value differs from dense DP");
+        }
+
+        const auto& points = sequence.skip_points();
+        require(!points.empty(), "skip-point sequence is empty");
+        const auto& root = sequence.state(points.front());
+        require(root.weight == 0 && root.profit == 0 && root.predecessor == faithful::detail::no_point,
+                "skip-point root is invalid");
+        for (std::size_t i = 1; i < points.size(); ++i) {
+            const auto& prior = sequence.state(points[i - 1]);
+            const auto& state = sequence.state(points[i]);
+            require(state.weight > prior.weight && state.profit > prior.profit,
+                    "skip-points are not strictly ordered");
+            require(state.predecessor != faithful::detail::no_point && state.predecessor < points[i],
+                    "skip-point predecessor is not preserved");
+            const auto item = std::find_if(items.begin(), items.end(), [&](const Item& x) {
+                return x.id == state.item_id;
+            });
+            require(item != items.end(), "skip-point item is missing");
+            const auto& parent = sequence.state(state.predecessor);
+            require(parent.weight + item->w == state.weight && parent.profit + item->p == state.profit,
+                    "skip-point transition is inconsistent");
+        }
+        const auto chosen = points.back();
+        Weight reconstructed_weight = 0;
+        Profit reconstructed_profit = 0;
+        for (auto cursor = chosen; cursor != faithful::detail::no_point;
+             cursor = sequence.state(cursor).predecessor) {
+            const auto& state = sequence.state(cursor);
+            if (state.item_id < 0) break;
+            const auto item = std::find_if(items.begin(), items.end(), [&](const Item& x) {
+                return x.id == state.item_id;
+            });
+            reconstructed_weight += item->w;
+            reconstructed_profit += item->p;
+        }
+        require(reconstructed_weight == sequence.state(chosen).weight &&
+                    reconstructed_profit == sequence.state(chosen).profit,
+                "skip-point reconstruction is invalid");
     }
 }
 
@@ -304,6 +371,7 @@ int main() {
         check_pyasukp_corpus();
         check_faithful_switches();
         check_faithful_core_selection();
+        check_skip_point_sequence();
         std::cout << "faithful correctness suite passed\n";
         return 0;
     } catch (const std::exception& error) {

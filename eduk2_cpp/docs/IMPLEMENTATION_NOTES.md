@@ -23,7 +23,7 @@ best-item multiple-dominance reduction is not a core-local extension.
 | 1. Initial reduction | `preprocess_items`: select the best item directly from the working instance with `better_ratio`, optional simple dominance, mandatory global `remove_multiple_dominated_by_best`, then ratio sort |
 | 2. Bounds/reduction | `initialize_bounds`, `reduce_variables_by_bound` |
 | 3. Core B&B | `traverse_core`, `greedy_fill`, `backtrack`/`complete` |
-| 4. Listing 1 sliced DP | slice loop in `faithful_solver.cpp`, contextual fathoming, completion, threshold dominance |
+| 4. Listing 1 sliced DP | sequence of skip-points for the strict increases of `f(N,y)`, contextual fathoming, completion, threshold dominance |
 
 `Stats::slices` records the Listing 1 work per actual slice, and the global
 and contextual bound types are exposed through stable names (`U3`, `V`,
@@ -47,7 +47,7 @@ the separate, unchanged global list.  Ordering by `capacity % weight` and all
 core-local reductions are experimental-only and are never reached by this
 faithful path.
 
-The exact solution is certified by dynamic programming over capacities up to `c`. This makes the implementation easier to validate module by module before replacing the DP state container with a closer clone of the OCaml `Seq` structure.
+The exact solution is certified by a dynamic-programming sequence of skip-points. `value_at(y)` returns the last point whose weight is at most `y`; items eliminated by threshold dominance do not participate in recurrences of later slices.
 
 ## Optimized implementation
 

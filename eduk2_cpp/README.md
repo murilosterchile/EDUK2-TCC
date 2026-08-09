@@ -44,6 +44,8 @@ cmake --build build -j
 ./build/ukp_solve faithful data/example.ukp --no-paper-faithful --simple-dominance --core-remainder-ordering --modular-dominance --core-multiple-dominance
 ```
 
+Por padr\u00e3o, o programa mostra somente o resultado e estat\u00edsticas consolidadas. Para imprimir o diagn\u00f3stico detalhado de cada `slice`, acrescente `--verbose` ao comando.
+
 Input format used by this workspace:
 
 ```text
