@@ -573,6 +573,18 @@ SolverResult Solver::solve(const Instance& inst) {
         }
     }
 
+    if (split_profit <= incumbent_solution.profit) {
+        result.solution = incumbent_solution.solution("faithful");
+        result.stats.estimated_state_bytes = static_cast<long long>(sequence.estimated_bytes());
+        const std::size_t active_count = items.size();
+        result.stats.active_items_final = static_cast<long long>(active_count);
+        result.stats.dp_stop_reason = closed_by_bound ? "bound_closed" :
+            (active_count == 1 ? "single_active_item" : "half_capacity_cut");
+        result.stats.stop_reason = closed_by_bound ? "dp_bound_closed" :
+            (active_count == 1 ? "single_item" : "half_capacity");
+        return result;
+    }
+
     Solution sol;
     sol.profit = split_profit;
     sol.weight = 0;
@@ -596,11 +608,7 @@ SolverResult Solver::solve(const Instance& inst) {
     add_trace(first_index);
     add_trace(second_index);
 
-    if (sol.profit > incumbent_solution.profit) {
-        result.solution = std::move(sol);
-    } else {
-        result.solution = incumbent_solution.solution("faithful");
-    }
+    result.solution = std::move(sol);
     result.stats.estimated_state_bytes = static_cast<long long>(sequence.estimated_bytes());
     const std::size_t active_count = items.size();
     result.stats.active_items_final = static_cast<long long>(active_count);
