@@ -1,1 +1,0 @@
-/usr/bin/c++ -O3 -DNDEBUG -flto CMakeFiles/ukp_bench.dir/src/tools/ukp_bench.cpp.o -o ukp_bench  libukp_faithful.a libukp_optimized.a libukp_common.a 

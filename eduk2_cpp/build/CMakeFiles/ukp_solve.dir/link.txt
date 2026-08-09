@@ -1,1 +1,0 @@
-/usr/bin/c++ -O3 -DNDEBUG -flto CMakeFiles/ukp_solve.dir/src/tools/ukp_solve.cpp.o -o ukp_solve  libukp_faithful.a libukp_optimized.a libukp_common.a 

@@ -1,2 +1,0 @@
-/usr/bin/ar qc libukp_optimized.a CMakeFiles/ukp_optimized.dir/src/optimized/optimized_solver.cpp.o
-/usr/bin/ranlib libukp_optimized.a

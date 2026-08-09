@@ -1,2 +1,0 @@
-/usr/bin/ar qc libukp_common.a CMakeFiles/ukp_common.dir/src/common/bounds.cpp.o CMakeFiles/ukp_common.dir/src/common/dominance.cpp.o CMakeFiles/ukp_common.dir/src/common/io.cpp.o CMakeFiles/ukp_common.dir/src/common/generator.cpp.o CMakeFiles/ukp_common.dir/src/common/verify.cpp.o
-/usr/bin/ranlib libukp_common.a
