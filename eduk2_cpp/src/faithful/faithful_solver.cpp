@@ -192,58 +192,78 @@ void backtrack(CoreTraversal& search, std::vector<long long>& multiplicity) {
     complete(search, 0, 0, 0, multiplicity);
 }
 
-CoreSearchResult traverse_core(std::vector<Item> items, const BoundContext& bounds, BoundPolicy policy,
+CoreSearchResult traverse_core(const std::vector<Item>& dp_items, const BoundContext& bounds, BoundPolicy policy,
                                Weight capacity, Profit global_upper, int requested_core,
                                long long limit, std::size_t original_count,
-                               const EffectiveOptions& effective) {
-    const int default_size = std::min<int>(items.size(), std::max(100, static_cast<int>(items.size() / 100)));
-    const int core_size = std::max(1, std::min(requested_core > 0 ? requested_core : default_size,
-                                                static_cast<int>(items.size())));
-    const auto core_order = [capacity, &effective](const Item& left, const Item& right) {
-        if (!effective.core_remainder_ordering) return better_ratio(left, right);
-        const Weight left_remainder = capacity % left.w;
-        const Weight right_remainder = capacity % right.w;
-        if (left_remainder != right_remainder) return left_remainder < right_remainder;
-        return better_ratio(left, right);
-    };
-    std::sort(items.begin(), items.end(), core_order);
-    items.resize(static_cast<std::size_t>(core_size));
-    // Core-local multiple dominance before branching.
-    std::vector<Item> filtered;
+                               const EffectiveOptions& effective, bool paper_faithful_mode,
+                               std::vector<int>* selected_core_ids = nullptr) {
+    std::vector<Item> core_items;
+    if (paper_faithful_mode) {
+        // dp_items is already globally reduced and sorted by better_ratio.
+        // The faithful core is exactly its prefix: no local ordering or
+        // filtering is permitted on this path.
+        const std::size_t n = dp_items.size();
+        const std::size_t core_size = std::min(n, std::max<std::size_t>(100, n / 100));
+        core_items.assign(dp_items.begin(), dp_items.begin() + core_size);
+    } else {
+        core_items = dp_items;
+        const int default_size = std::min<int>(core_items.size(), std::max(100, static_cast<int>(core_items.size() / 100)));
+        const int core_size = std::max(1, std::min(requested_core > 0 ? requested_core : default_size,
+                                                    static_cast<int>(core_items.size())));
+        if (effective.core_remainder_ordering) {
+            std::sort(core_items.begin(), core_items.end(), [capacity](const Item& left, const Item& right) {
+                const Weight left_remainder = capacity % left.w;
+                const Weight right_remainder = capacity % right.w;
+                if (left_remainder != right_remainder) return left_remainder < right_remainder;
+                return better_ratio(left, right);
+            });
+        } else {
+            std::sort(core_items.begin(), core_items.end(), better_ratio);
+        }
+        core_items.resize(static_cast<std::size_t>(core_size));
+    }
+    if (selected_core_ids != nullptr) {
+        selected_core_ids->clear();
+        selected_core_ids->reserve(core_items.size());
+        for (const Item& item : core_items) selected_core_ids->push_back(item.id);
+    }
+
+    std::vector<Item> filtered = core_items;
     long long core_multiple_removed = 0;
     long long core_modular_removed = 0;
-    for (const Item& candidate : items) {
-        bool dominated = false;
-        bool modular = false;
-        for (const Item& kept : filtered) {
-            if (effective.core_multiple_dominance) {
-                const long long copies = candidate.w / kept.w;
-                if (copies > 0 && safe_mul(copies, kept.p) >= candidate.p) { dominated = true; break; }
-            }
-            // Modular dominance from dominance.ml/zhubrougan.  The best-ratio
-            // item supplies the congruence adjustment; retained item `kept`
-            // supplies the residue-class representative.
-            if (effective.modular_dominance && kept.w <= candidate.w && bounds.best.w != candidate.w) {
-                const Weight candidate_remainder = candidate.w % bounds.best.w;
-                const Weight kept_remainder = kept.w % bounds.best.w;
-                const Profit kept_z = safe_add(safe_mul(kept.w, bounds.best.p),
-                                                -safe_mul(bounds.best.w, kept.p));
-                const Profit candidate_z = safe_add(safe_mul(candidate.w, bounds.best.p),
-                                                     -safe_mul(bounds.best.w, candidate.p));
-                if (candidate_remainder == 0 ||
-                    (candidate_remainder == kept_remainder && kept_z <= candidate_z)) {
-                    dominated = true;
-                    modular = true;
-                    break;
+    if (!paper_faithful_mode) {
+        filtered.clear();
+        // Core-local reductions are experimental and apply only to this copy.
+        for (const Item& candidate : core_items) {
+            bool dominated = false;
+            bool modular = false;
+            for (const Item& kept : filtered) {
+                if (effective.core_multiple_dominance) {
+                    const long long copies = candidate.w / kept.w;
+                    if (copies > 0 && safe_mul(copies, kept.p) >= candidate.p) { dominated = true; break; }
+                }
+                if (effective.modular_dominance && kept.w <= candidate.w && bounds.best.w != candidate.w) {
+                    const Weight candidate_remainder = candidate.w % bounds.best.w;
+                    const Weight kept_remainder = kept.w % bounds.best.w;
+                    const Profit kept_z = safe_add(safe_mul(kept.w, bounds.best.p),
+                                                    -safe_mul(bounds.best.w, kept.p));
+                    const Profit candidate_z = safe_add(safe_mul(candidate.w, bounds.best.p),
+                                                         -safe_mul(bounds.best.w, candidate.p));
+                    if (candidate_remainder == 0 ||
+                        (candidate_remainder == kept_remainder && kept_z <= candidate_z)) {
+                        dominated = true;
+                        modular = true;
+                        break;
+                    }
                 }
             }
-        }
-        if (!dominated) {
-            filtered.push_back(candidate);
-        } else if (modular) {
-            ++core_modular_removed;
-        } else {
-            ++core_multiple_removed;
+            if (!dominated) {
+                filtered.push_back(candidate);
+            } else if (modular) {
+                ++core_modular_removed;
+            } else {
+                ++core_multiple_removed;
+            }
         }
     }
     // Bounds in the core must describe its locally filtered items, while the
@@ -336,10 +356,22 @@ SolverResult Solver::solve(const Instance& inst) {
         result.stats.after_preprocess_items = static_cast<long long>(items.size());
     }
 
+    // This is the global post-reduction list used by the DP.  The core B&B
+    // only receives a const view and performs every experimental reduction on
+    // its own local copy.
+    const std::vector<Item> dp_items = items;
+    result.stats.dp_item_ids.reserve(dp_items.size());
+    for (const Item& item : dp_items) result.stats.dp_item_ids.push_back(item.id);
+
     if (options_.use_core_bb) {
-        CoreSearchResult core = traverse_core(items, ctx, options_.bound_policy, inst.capacity,
+        constexpr long long kFaithfulCoreNodeLimit = 10'000;
+        const long long core_node_limit = options_.paper_faithful_mode
+            ? kFaithfulCoreNodeLimit : options_.bb_node_limit;
+        result.stats.core_node_limit = core_node_limit;
+        CoreSearchResult core = traverse_core(dp_items, ctx, options_.bound_policy, inst.capacity,
                                                global_bound.upper, options_.core_size,
-                                               options_.bb_node_limit, inst.items.size(), effective);
+                                               core_node_limit, inst.items.size(), effective,
+                                               options_.paper_faithful_mode, &result.stats.core_item_ids);
         incumbent = std::max(incumbent, core.profit);
         if (core.profit > incumbent_solution.profit) ++result.stats.incumbent_improvements_bb;
         Weight core_weight = 0;
@@ -352,11 +384,15 @@ SolverResult Solver::solve(const Instance& inst) {
         result.stats.items_removed_modular += core.modular_removed;
         if (core.closed) {
             result.solution = incumbent_solution.solution("faithful");
-            result.stats.active_items_final = static_cast<long long>(items.size());
+            result.stats.active_items_final = static_cast<long long>(dp_items.size());
             result.stats.stop_reason = "core_bound_closed";
             return result;
         }
     }
+
+    // The DP may maintain a changing active set for its recurrence, but it
+    // starts from the unchanged global list selected above.
+    items = dp_items;
 
     // EDUK's iteration space is represented by reachable exact-weight states,
     // not by an array indexed by every capacity.  Since all weights are

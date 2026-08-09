@@ -4,6 +4,7 @@
 #include "ukp/generator.hpp"
 #include "ukp/io.hpp"
 #include "ukp/verify.hpp"
+#include "../src/faithful/preprocessing.hpp"
 
 #include <filesystem>
 #include <iostream>
@@ -123,6 +124,79 @@ void check_faithful_switches() {
     }
 }
 
+void check_faithful_core_selection() {
+    // The best item is selected from the original working instance, before
+    // optional simple dominance and before any ratio ordering.
+    const Instance best_first{300, {{7, 30, 270}, {3, 10, 100}, {8, 20, 190}}};
+    const auto preprocessing = faithful::detail::preprocess_items(best_first, true);
+    require(preprocessing.best_item.id == 3,
+            "preprocessing did not select the best item directly from the instance");
+    require(preprocessing.multiple_removed == 2,
+            "multiple dominance did not use the best original-instance item");
+    require(std::none_of(preprocessing.items.begin(), preprocessing.items.end(),
+                         [](const Item& item) { return item.id == 7; }),
+            "item dominated by the original best item survived preprocessing");
+
+    Instance instance;
+    instance.capacity = 2'500;
+    instance.items.push_back({0, 100, 10'000});
+    // All survivors have distinct ratios below the best item's ratio.  The
+    // item at weight 200 is deliberately globally multiple-dominated.
+    for (int weight = 1; weight <= 120; ++weight) {
+        if (weight == 100) continue;
+        instance.items.push_back({static_cast<int>(instance.items.size()), weight, 100 * weight - 1});
+    }
+    const int dominated_id = static_cast<int>(instance.items.size());
+    instance.items.push_back({dominated_id, 200, 19'999});
+
+    const auto reduced = faithful::detail::preprocess_items(instance, false);
+    require(reduced.multiple_removed == 1, "global multiple dominance was not recorded");
+    require(std::none_of(reduced.items.begin(), reduced.items.end(), [dominated_id](const Item& item) {
+                return item.id == dominated_id;
+            }), "multiple-dominated item reached the reduced global list");
+    require(reduced.items.size() > 100, "test instance has too few global survivors");
+    require(std::is_sorted(reduced.items.begin(), reduced.items.end(), better_ratio),
+            "reduced global list is not ratio ordered");
+
+    SolverOptions faithful_options;
+    faithful_options.use_bounds = false;
+    faithful_options.use_periodicity = false;
+    faithful_options.core_size = 3;
+    faithful_options.bb_node_limit = 7;
+    faithful_options.use_core_remainder_ordering = true;
+    faithful_options.use_core_multiple_dominance = true;
+    faithful_options.use_modular_dominance = true;
+    const SolverResult faithful_result = faithful::Solver(faithful_options).solve(instance);
+    const std::size_t n = faithful_result.stats.dp_item_ids.size();
+    const std::size_t expected_core = std::min(n, std::max<std::size_t>(100, n / 100));
+    require(faithful_result.stats.core_item_ids.size() == expected_core,
+            "faithful core did not use prescribed C");
+    require(faithful_result.stats.core_node_limit == 10'000,
+            "faithful B&B did not use fixed node limit");
+    require(faithful_result.stats.items_removed_core_multiple == 0 &&
+                faithful_result.stats.items_removed_modular == 0,
+            "faithful core applied local reductions");
+    for (std::size_t i = 0; i < expected_core; ++i) {
+        require(faithful_result.stats.core_item_ids[i] == faithful_result.stats.dp_item_ids[i],
+                "faithful core is not the exact ratio-ordered DP prefix");
+    }
+
+    SolverOptions without_bb = faithful_options;
+    without_bb.use_core_bb = false;
+    const SolverResult no_bb_result = faithful::Solver(without_bb).solve(instance);
+    require(no_bb_result.stats.dp_item_ids == faithful_result.stats.dp_item_ids,
+            "B&B changed the global item list delivered to DP");
+
+    SolverOptions experimental = without_bb;
+    experimental.paper_faithful_mode = false;
+    experimental.use_core_bb = true;
+    experimental.use_core_remainder_ordering = true;
+    experimental.use_core_multiple_dominance = true;
+    const SolverResult experimental_result = faithful::Solver(experimental).solve(instance);
+    require(experimental_result.stats.dp_item_ids == no_bb_result.stats.dp_item_ids,
+            "experimental local core processing changed the global DP list");
+}
+
 void check_paper_bound(const Instance& instance, Profit expected, bool tau, const char* name) {
     const auto items = remove_simple_dominated(instance.items);
     const auto context = make_bound_context(items);
@@ -229,6 +303,7 @@ int main() {
         check_generated_families();
         check_pyasukp_corpus();
         check_faithful_switches();
+        check_faithful_core_selection();
         std::cout << "faithful correctness suite passed\n";
         return 0;
     } catch (const std::exception& error) {

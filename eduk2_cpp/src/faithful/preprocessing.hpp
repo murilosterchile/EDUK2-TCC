@@ -6,6 +6,7 @@ namespace ukp::faithful::detail {
 
 struct PreprocessResult {
     std::vector<Item> items;
+    Item best_item;
     long long simple_removed = 0;
     long long multiple_removed = 0;
 };

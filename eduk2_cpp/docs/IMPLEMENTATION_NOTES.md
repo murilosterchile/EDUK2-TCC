@@ -20,7 +20,7 @@ best-item multiple-dominance reduction is not a core-local extension.
 
 | Paper phase | C++ block |
 |---|---|
-| 1. Initial reduction | `preprocess_items`: optional simple dominance, ratio sort, mandatory `remove_multiple_dominated_by_best`, ratio sort |
+| 1. Initial reduction | `preprocess_items`: select the best item directly from the working instance with `better_ratio`, optional simple dominance, mandatory global `remove_multiple_dominated_by_best`, then ratio sort |
 | 2. Bounds/reduction | `initialize_bounds`, `reduce_variables_by_bound` |
 | 3. Core B&B | `traverse_core`, `greedy_fill`, `backtrack`/`complete` |
 | 4. Listing 1 sliced DP | slice loop in `faithful_solver.cpp`, contextual fathoming, completion, threshold dominance |
@@ -37,6 +37,15 @@ The faithful implementation keeps the EDUK2 decomposition visible:
 - branch-and-bound on a small core as a lower-bound improvement stage;
 - sliced DP over capacities;
 - context-bound instrumentation using the same condition as the paper: `f(y) + U(c-y) <= z`.
+
+In faithful mode the order is deliberately fixed: select the best item from the
+working instance, apply global multiple dominance with it, sort the reduced
+global list by `better_ratio`, and take its first
+`C = min(n, max(100, n / 100))` items as the core.  The B&B receives only a
+local copy of that prefix and is capped at `B = 10,000` nodes; the DP retains
+the separate, unchanged global list.  Ordering by `capacity % weight` and all
+core-local reductions are experimental-only and are never reached by this
+faithful path.
 
 The exact solution is certified by dynamic programming over capacities up to `c`. This makes the implementation easier to validate module by module before replacing the DP state container with a closer clone of the OCaml `Seq` structure.
 

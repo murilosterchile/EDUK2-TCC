@@ -58,6 +58,7 @@ struct Stats {
     long long bound_calls = 0;
     long long periodicity_hits = 0;
     long long bb_nodes = 0;
+    long long core_node_limit = 0;
     long long items_removed_simple = 0;
     long long items_removed_multiple = 0;
     long long items_removed_modular = 0;
@@ -76,6 +77,10 @@ struct Stats {
     std::string dp_stop_reason = "not_started";
     Weight periodicity_level = -1;
     std::string stop_reason = "uninitialized";
+    // Test/debug telemetry.  These identify the immutable post-global-
+    // reduction DP list and the local B&B core selected from it.
+    std::vector<int> dp_item_ids;
+    std::vector<int> core_item_ids;
 };
 
 struct SolverOptions {
@@ -89,7 +94,11 @@ struct SolverOptions {
     bool use_periodicity = true;
     bool trace = false;
     BoundPolicy bound_policy = BoundPolicy::BestCertified;
+    // Experimental-only.  In paper_faithful_mode the core size is
+    // min(n, max(100, n / 100)) and this value is ignored.
     int core_size = -1;
+    // Experimental-only.  In paper_faithful_mode B&B always uses 10,000
+    // nodes and this value is ignored.
     long long bb_node_limit = 10000;
     Weight slice_height = 0;
 };

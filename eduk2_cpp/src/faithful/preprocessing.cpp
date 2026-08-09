@@ -6,6 +6,13 @@ namespace ukp::faithful::detail {
 
 PreprocessResult preprocess_items(const Instance& instance, bool use_simple_dominance) {
     PreprocessResult result;
+    // Stage 1's reference item belongs to the working instance, not to an
+    // intermediate reduction.  In particular, simple dominance is optional
+    // and must never change the item used for multiple dominance.
+    const Item best = *std::max_element(
+        instance.items.begin(), instance.items.end(),
+        [](const Item& a, const Item& b) { return better_ratio(b, a); });
+    result.best_item = best;
     std::vector<Item>& items = result.items;
     items = instance.items;
     if (use_simple_dominance) {
@@ -13,14 +20,11 @@ PreprocessResult preprocess_items(const Instance& instance, bool use_simple_domi
         items = remove_simple_dominated(std::move(items));
         result.simple_removed = static_cast<long long>(before_simple - items.size());
     }
-    std::sort(items.begin(), items.end(), better_ratio);
     // EDUK2 stage 1: best-item multiple dominance is mandatory, including in
     // paper-faithful mode; it is distinct from core-local multiple dominance.
-    if (!items.empty()) {
-        const auto before_multiple = items.size();
-        items = remove_multiple_dominated_by_best(std::move(items), items.front());
-        result.multiple_removed = static_cast<long long>(before_multiple - items.size());
-    }
+    const auto before_multiple = items.size();
+    items = remove_multiple_dominated_by_best(std::move(items), best);
+    result.multiple_removed = static_cast<long long>(before_multiple - items.size());
     std::sort(items.begin(), items.end(), better_ratio);
     return result;
 }

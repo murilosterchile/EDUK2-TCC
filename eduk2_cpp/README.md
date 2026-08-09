@@ -15,6 +15,14 @@ experimental `--simple-dominance`, `--core-remainder-ordering`,
 only with `--no-paper-faithful`.  The best-item multiple-dominance reduction
 remains mandatory in phase 1 in either mode.
 
+In faithful mode phase 1 selects the best item directly from the working
+instance using `better_ratio`, then applies global multiple dominance and
+sorts the remaining global DP list by that same comparator.  The B&B core is
+exactly the first `min(n, max(100, n / 100))` items of that list and uses a
+fixed 10,000-node limit.  B&B works on a local core copy; the DP keeps the
+global list unchanged.  Remainder ordering (`capacity % weight`) is only an
+experimental, non-faithful option.
+
 ## Build
 
 ```bash
