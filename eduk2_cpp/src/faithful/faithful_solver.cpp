@@ -46,7 +46,7 @@ Profit run_core_bb_rec(const std::vector<Item>& core, Weight c, size_t k,
                                     long long node_limit, long long& nodes) {
     std::sort(items.begin(), items.end(), better_ratio);
     const int default_core_size = std::min<int>(static_cast<int>(items.size()),
-                                                std::max(100, static_cast<int>(items.size() / 100)));
+                                                std::max(500, static_cast<int>(items.size() / 100)));
     int core_size = requested_core > 0 ? requested_core : default_core_size;
     core_size = std::max(1, std::min<int>(core_size, static_cast<int>(items.size())));
     items.resize(static_cast<size_t>(core_size));
@@ -113,7 +113,7 @@ void core_search(const std::vector<Item>& core, const BoundContext& bounds, Boun
                                                        int requested_core, long long node_limit,
                                                        std::size_t original_count) {
     std::sort(items.begin(), items.end(), better_ratio);
-    const int default_size = std::min<int>(items.size(), std::max(100, static_cast<int>(items.size() / 100)));
+    const int default_size = std::min<int>(items.size(), std::max(500, static_cast<int>(items.size() / 100)));
     items.resize(static_cast<std::size_t>(std::max(1, std::min(requested_core > 0 ? requested_core : default_size,
                                                                 static_cast<int>(items.size())))));
     CoreSearchResult result;
@@ -137,7 +137,25 @@ struct CoreTraversal {
     long long limit;
     CoreSearchResult result;
     std::unordered_map<Weight, Profit> best_profit_at_weight;
+    std::vector<Weight> min_remaining_weight;
 };
+
+std::vector<Weight> lightest_worse(const std::vector<Item>& items) {
+    std::vector<Weight> minweights(items.size(), 0);
+    if (items.size() < 2) return minweights;
+    minweights[items.size() - 2] = items[items.size() - 1].w;
+    for (std::size_t i = items.size() - 2; i > 0; --i) {
+        minweights[i - 1] = std::min(items[i].w, minweights[i]);
+    }
+    return minweights;
+}
+
+bool remember_core_state(CoreTraversal& search, Weight used_weight, Profit used_profit) {
+    const auto known = search.best_profit_at_weight.find(used_weight);
+    if (known != search.best_profit_at_weight.end() && known->second >= used_profit) return false;
+    search.best_profit_at_weight[used_weight] = used_profit;
+    return true;
+}
 
 void record_core_solution(CoreTraversal& search, Profit profit,
                           const std::vector<long long>& multiplicity) {
@@ -152,14 +170,17 @@ void complete(CoreTraversal& search, std::size_t item_index, Weight used_weight,
               Profit used_profit, std::vector<long long>& multiplicity) {
     if (search.result.closed || search.result.nodes >= search.limit) return;
     ++search.result.nodes;
-    const auto known = search.best_profit_at_weight.find(used_weight);
-    if (known != search.best_profit_at_weight.end() && known->second >= used_profit) return;
-    search.best_profit_at_weight[used_weight] = used_profit;
+    if (!remember_core_state(search, used_weight, used_profit)) return;
     record_core_solution(search, used_profit, multiplicity);
-    if (item_index == search.items.size()) return;
+    if (item_index + 1 >= search.items.size()) return;
+
+    const Weight remaining = search.capacity - used_weight;
+    if (item_index < search.min_remaining_weight.size() &&
+        remaining < search.min_remaining_weight[item_index]) {
+        return;
+    }
 
     const Item& item = search.items[item_index];
-    const Weight remaining = search.capacity - used_weight;
     for (long long count = remaining / item.w; count >= 0; --count) {
         const Weight next_weight = used_weight + safe_mul(count, item.w);
         const Profit next_profit = safe_add(used_profit, safe_mul(count, item.p));
@@ -179,9 +200,12 @@ void greedy_fill(CoreTraversal& search, std::vector<long long>& multiplicity) {
     for (const Item& item : search.items) {
         const long long count = (search.capacity - used_weight) / item.w;
         if (count == 0) continue;
-        multiplicity[static_cast<std::size_t>(item.id)] += count;
-        used_weight += safe_mul(count, item.w);
-        profit = safe_add(profit, safe_mul(count, item.p));
+        for (long long copy = 0; copy < count; ++copy) {
+            multiplicity[static_cast<std::size_t>(item.id)] += 1;
+            used_weight += item.w;
+            profit = safe_add(profit, item.p);
+            remember_core_state(search, used_weight, profit);
+        }
     }
     record_core_solution(search, profit, multiplicity);
     std::fill(multiplicity.begin(), multiplicity.end(), 0);
@@ -204,7 +228,7 @@ CoreSearchResult traverse_core(const std::vector<Item>& dp_items, const BoundCon
         // The faithful core is exactly its prefix: no local ordering or
         // filtering is permitted on this path.
         const std::size_t n = dp_items.size();
-        const std::size_t core_size = std::min(n, std::max<std::size_t>(100, n / 100));
+        const std::size_t core_size = std::min(n, std::max<std::size_t>(500, n / 100));
         core_items.assign(dp_items.begin(), dp_items.begin() + core_size);
     } else {
         core_items = dp_items;
@@ -270,7 +294,8 @@ CoreSearchResult traverse_core(const std::vector<Item>& dp_items, const BoundCon
     // Bounds in the core must describe its locally filtered items, while the
     // global upper remains the global certificate used for closure.
     BoundContext core_bounds = make_bound_context(filtered);
-    CoreTraversal search{filtered, core_bounds, policy, capacity, global_upper, std::max<long long>(0, limit), {}, {}};
+    CoreTraversal search{filtered, core_bounds, policy, capacity, global_upper, std::max<long long>(0, limit), {}, {},
+                         lightest_worse(filtered)};
     search.result.multiple_removed = core_multiple_removed;
     search.result.modular_removed = core_modular_removed;
     search.result.multiplicity.assign(original_count, 0);
