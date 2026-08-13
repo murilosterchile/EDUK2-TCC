@@ -440,6 +440,142 @@ void check_precomputed_q_star() {
     }
 }
 
+bool same_item(const Item& left, const Item& right) {
+    return left.id == right.id && left.w == right.w && left.p == right.p;
+}
+
+bool same_items(const std::vector<Item>& left, const std::vector<Item>& right) {
+    return left.size() == right.size() && std::equal(left.begin(), left.end(), right.begin(), same_item);
+}
+
+// Regression oracle for the pre-optimization selection: it intentionally
+// performs the old full ratio sort, while production selects the same prefix
+// in one pass.
+void check_linear_ratio_selection_equivalence() {
+    std::vector<std::vector<Item>> cases{
+        {{9, 6, 12}, {2, 3, 6}, {7, 9, 18}, {1, 4, 8}, {4, 12, 24}},
+        // Equal ratios exercise better_ratio's weight and id tie breakers.
+        {{9, 8, 16}, {4, 2, 4}, {7, 4, 8}, {1, 3, 6}, {3, 6, 12}},
+        {{5, 7, 13}, {1, 2, 5}},
+        {{3, 5, 11}}};
+    for (unsigned seed = 1; seed <= 64; ++seed) {
+        std::vector<Item> items;
+        for (int i = 0; i < 3 + static_cast<int>(seed % 12); ++i) {
+            const Weight weight = 1 + ((i * 7 + static_cast<int>(seed)) % 17);
+            // The small multiplier deliberately creates many equal ratios.
+            const Profit profit = weight * (1 + static_cast<int>((seed + i) % 4));
+            items.push_back({i, weight, profit});
+        }
+        cases.push_back(std::move(items));
+    }
+
+    for (const auto& items : cases) {
+        std::vector<Item> legacy_ratio_items = items;
+        std::sort(legacy_ratio_items.begin(), legacy_ratio_items.end(), better_ratio);
+        const BoundContext context = make_bound_context(items);
+        require(same_items(context.items, items), "linear context changed residual items");
+        require(same_item(context.best, legacy_ratio_items[0]),
+                "linear selection changed the best ratio item");
+        if (items.size() >= 2)
+            require(same_item(context.second, legacy_ratio_items[1]),
+                    "linear selection changed the second ratio item");
+        if (items.size() >= 3)
+            require(context.has_three && same_item(context.third, legacy_ratio_items[2]),
+                    "linear selection changed the third ratio item");
+        else
+            require(!context.has_three, "linear selection changed has_three");
+
+        std::vector<Item> normalized = items;
+        for (Item& item : normalized) item.p *= context.psi;
+        std::sort(normalized.begin(), normalized.end(), better_ratio);
+        require(same_items(context.normalized_ratio_items, normalized),
+                "linear selection changed normalized ratio items");
+        require(same_item(context.best_item_star_base, legacy_ratio_items[0]),
+                "linear selection changed BestItemStar base");
+
+        const Item* expected_lightest = nullptr;
+        for (const Item& item : items) {
+            if (item.p <= item.w) continue;
+            if (!expected_lightest || item.w < expected_lightest->w ||
+                (item.w == expected_lightest->w && item.id < expected_lightest->id))
+                expected_lightest = &item;
+        }
+        const Item& expected_tau = expected_lightest ? *expected_lightest : legacy_ratio_items[0];
+        const int expected_psi = expected_tau.p <= expected_tau.w
+            ? static_cast<int>(expected_tau.w / expected_tau.p + 1) : 1;
+        const Profit expected_delta1 = expected_psi * expected_tau.p - expected_tau.w;
+        require(context.has_lightest_positive && same_item(context.lightest_positive, expected_tau) &&
+                    same_item(context.tau_star_base, expected_tau) &&
+                    context.psi == expected_psi && context.delta1 == expected_delta1 &&
+                    context.tau_normalized == (expected_psi != 1),
+                "linear selection changed tau context fields");
+        require(same_item(context.normalized_tau_star_base,
+                          {expected_tau.id, expected_tau.w, expected_tau.p * expected_psi}) &&
+                    same_item(context.normalized_best_item_star_base,
+                              {legacy_ratio_items[0].id, legacy_ratio_items[0].w,
+                               legacy_ratio_items[0].p * expected_psi}),
+                "linear selection changed normalized base fields");
+
+        Profit expected_alpha_num = 0;
+        Weight expected_alpha_den = 1;
+        for (const Item& item : normalized) {
+            if (item.id == expected_tau.id || item.w < expected_tau.w) continue;
+            const Profit delta = item.p - item.w;
+            const Weight copies = item.w / expected_tau.w;
+            if (copies <= 0) continue;
+            const Weight denominator = copies * expected_delta1;
+            if (static_cast<__int128>(delta) * expected_alpha_den >
+                static_cast<__int128>(expected_alpha_num) * denominator) {
+                expected_alpha_num = delta;
+                expected_alpha_den = denominator;
+            }
+        }
+        bool expected_no_multiple_dominance = true;
+        for (std::size_t i = 0; i < items.size(); ++i) for (std::size_t j = 0; j < items.size(); ++j) {
+            if (i == j || items[i].w > items[j].w) continue;
+            const Weight copies = items[j].w / items[i].w;
+            if (copies > 0 && static_cast<__int128>(copies) * items[i].p >= items[j].p)
+                expected_no_multiple_dominance = false;
+        }
+        require(context.alpha_num == expected_alpha_num && context.alpha_den == expected_alpha_den &&
+                    context.preferred == (expected_alpha_num <= expected_alpha_den ? BoundType::V : BoundType::Both) &&
+                    context.no_multiple_dominance == expected_no_multiple_dominance,
+                "linear selection changed alpha or certification fields");
+
+        const DirectRational direct_tau = direct_q_star(
+            context.normalized_ratio_items, context.normalized_tau_star_base);
+        const DirectRational direct_best = direct_q_star(
+            context.normalized_ratio_items, context.normalized_best_item_star_base);
+        require(context.tau_star_q_star_num == direct_tau.numerator &&
+                    context.tau_star_q_star_den == direct_tau.denominator &&
+                    context.best_item_star_q_star_num == direct_best.numerator &&
+                    context.best_item_star_q_star_den == direct_best.denominator,
+                "linear selection changed cached q* fields");
+        const std::array<BoundType, 3> expected_certified{
+            BoundType::U3, BoundType::V, BoundType::BestItemStar};
+        const std::size_t expected_certified_count = expected_no_multiple_dominance ? 3 : 2;
+        require(context.certified_type_count == expected_certified_count &&
+                    std::equal(context.certified_types.begin(),
+                               context.certified_types.begin() + expected_certified_count,
+                               expected_certified.begin()),
+                "linear selection changed certified-bound cache");
+
+        const Weight max_capacity = std::min<Weight>(40, 3 * (*std::max_element(
+            items.begin(), items.end(), [](const Item& left, const Item& right) {
+                return left.w < right.w;
+            })).w);
+        for (Weight capacity = 0; capacity <= max_capacity; ++capacity) {
+            const Profit oracle = dense_dp_value({capacity, items});
+            for (const BoundPolicy policy : {BoundPolicy::U3, BoundPolicy::V, BoundPolicy::TauStar,
+                                              BoundPolicy::BestItemStar, BoundPolicy::BestCertified}) {
+                const BoundValue value = compute_bound(context, capacity, policy);
+                require(value.upper >= oracle && value.lower <= oracle,
+                        "linear selection changed a bound policy result");
+            }
+        }
+    }
+}
+
 std::vector<BoundType> original_certified_bound_types(const BoundContext& context) {
     std::vector<BoundType> types;
     for (const BoundType type : {BoundType::U3, BoundType::V, BoundType::TauStar,
@@ -640,6 +776,7 @@ int main() {
         check_pyasukp_corpus();
         check_faithful_extended_prefix_regression();
         check_precomputed_q_star();
+        check_linear_ratio_selection_equivalence();
         check_certified_bound_cache_and_policies();
         check_faithful_switches();
         check_faithful_core_selection();

@@ -2,7 +2,6 @@
 
 #include "ukp/types.hpp"
 #include <array>
-#include <optional>
 
 namespace ukp {
 
@@ -28,7 +27,6 @@ struct BoundValue {
 struct BoundContext {
     // Exactly the items of the residual instance being bounded.
     std::vector<Item> items;
-    std::vector<Item> ratio_items;
     std::vector<Item> normalized_ratio_items;
     Item best{};
     Item second{};

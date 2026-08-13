@@ -1,5 +1,7 @@
 #include "ukp/bounds.hpp"
 
+#include <optional>
+
 namespace ukp {
 namespace {
 struct Rational { Profit numerator = 0; Weight denominator = 1; };
@@ -74,12 +76,28 @@ BoundContext make_bound_context(const std::vector<Item>& items) {
     if (items.empty()) throw std::invalid_argument("empty item set");
     BoundContext ctx;
     ctx.items = items;
-    ctx.ratio_items = items;
-    std::sort(ctx.ratio_items.begin(), ctx.ratio_items.end(), better_ratio);
-    ctx.best = ctx.ratio_items.front();
+    // ratio_items used to be a full sorted copy solely to select these three
+    // items. Keep the exact better_ratio ordering, without allocating or
+    // sorting a second copy of the residual instance.
+    ctx.best = items.front();
+    std::optional<Item> second;
+    std::optional<Item> third;
+    for (std::size_t i = 1; i < items.size(); ++i) {
+        const Item& candidate = items[i];
+        if (better_ratio(candidate, ctx.best)) {
+            third = second;
+            second = ctx.best;
+            ctx.best = candidate;
+        } else if (!second || better_ratio(candidate, *second)) {
+            third = second;
+            second = candidate;
+        } else if (!third || better_ratio(candidate, *third)) {
+            third = candidate;
+        }
+    }
     ctx.best_item_star_base = ctx.best;
-    if (ctx.ratio_items.size() >= 2) ctx.second = ctx.ratio_items[1];
-    if (ctx.ratio_items.size() >= 3) { ctx.third = ctx.ratio_items[2]; ctx.has_three = true; }
+    if (second) ctx.second = *second;
+    if (third) { ctx.third = *third; ctx.has_three = true; }
 
     bool found = false;
     for (const Item& it : items) if (diff(it) > 0 && (!found || it.w < ctx.lightest_positive.w ||
