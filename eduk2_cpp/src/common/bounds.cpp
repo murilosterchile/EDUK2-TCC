@@ -102,6 +102,17 @@ BoundContext make_bound_context(const std::vector<Item>& items) {
     for (Item& it : ctx.normalized_ratio_items)
         it.p = floor_div(static_cast<__int128>(it.p) * ctx.psi, 1);
     std::sort(ctx.normalized_ratio_items.begin(), ctx.normalized_ratio_items.end(), better_ratio);
+    ctx.normalized_tau_star_base = {ctx.tau_star_base.id, ctx.tau_star_base.w,
+        floor_div(static_cast<__int128>(ctx.tau_star_base.p) * ctx.psi, 1)};
+    ctx.normalized_best_item_star_base = {ctx.best_item_star_base.id, ctx.best_item_star_base.w,
+        floor_div(static_cast<__int128>(ctx.best_item_star_base.p) * ctx.psi, 1)};
+    const Rational tau_q = q_star(ctx.normalized_ratio_items, ctx.normalized_tau_star_base);
+    ctx.tau_star_q_star_num = tau_q.numerator;
+    ctx.tau_star_q_star_den = tau_q.denominator;
+    const Rational best_item_q = q_star(ctx.normalized_ratio_items,
+                                        ctx.normalized_best_item_star_base);
+    ctx.best_item_star_q_star_num = best_item_q.numerator;
+    ctx.best_item_star_q_star_den = best_item_q.denominator;
 
     Profit alpha_num = 0; Weight alpha_den = 1;
     for (const Item& it : ctx.normalized_ratio_items) {
@@ -117,6 +128,11 @@ BoundContext make_bound_context(const std::vector<Item>& items) {
     ctx.alpha_num = alpha_num; ctx.alpha_den = alpha_den;
     ctx.preferred = static_cast<__int128>(alpha_num) <= alpha_den ? BoundType::V : BoundType::Both;
     ctx.no_multiple_dominance = has_no_multiple_dominance(ctx.items);
+    for (const BoundType type : {BoundType::U3, BoundType::V, BoundType::TauStar,
+                                 BoundType::BestItemStar}) {
+        if (is_bound_certified(ctx, type))
+            ctx.certified_types[ctx.certified_type_count++] = type;
+    }
     return ctx;
 }
 
@@ -143,8 +159,9 @@ bool is_bound_certified(const BoundContext& ctx, BoundType type) {
 }
 std::vector<BoundType> certified_bound_types(const BoundContext& ctx) {
     std::vector<BoundType> out;
-    for (BoundType t : {BoundType::U3, BoundType::V, BoundType::TauStar, BoundType::BestItemStar})
-        if (is_bound_certified(ctx, t)) out.push_back(t);
+    out.reserve(ctx.certified_type_count);
+    for (std::size_t i = 0; i < ctx.certified_type_count; ++i)
+        out.push_back(ctx.certified_types[i]);
     return out;
 }
 
@@ -168,17 +185,15 @@ BoundValue compute_v(const BoundContext& ctx, Weight c) {
     return {floor_div(n,static_cast<__int128>(ad)*ctx.psi),safe_mul(xb,m.p),BoundType::V};
 }
 BoundValue compute_tau_star(const BoundContext& ctx, Weight c) {
-    const Item normalized_base{ctx.tau_star_base.id,ctx.tau_star_base.w,
-        floor_div(static_cast<__int128>(ctx.tau_star_base.p)*ctx.psi,1)};
-    Rational q=q_star(ctx.normalized_ratio_items,normalized_base);
+    Rational q{ctx.tau_star_q_star_num, ctx.tau_star_q_star_den};
     if (greater(q,{1,1})) q={1,1};
-    return normalized_bound_from_q(normalized_base,ctx.tau_star_base,c,q,ctx.psi,BoundType::TauStar);
+    return normalized_bound_from_q(ctx.normalized_tau_star_base, ctx.tau_star_base,
+                                   c, q, ctx.psi, BoundType::TauStar);
 }
 BoundValue compute_best_item_star(const BoundContext& ctx, Weight c) {
-    const Item normalized_base{ctx.best_item_star_base.id,ctx.best_item_star_base.w,
-        floor_div(static_cast<__int128>(ctx.best_item_star_base.p)*ctx.psi,1)};
-    return normalized_bound_from_q(normalized_base,ctx.best_item_star_base,c,
-        q_star(ctx.normalized_ratio_items,normalized_base),ctx.psi,BoundType::BestItemStar);
+    const Rational q{ctx.best_item_star_q_star_num, ctx.best_item_star_q_star_den};
+    return normalized_bound_from_q(ctx.normalized_best_item_star_base,
+        ctx.best_item_star_base, c, q, ctx.psi, BoundType::BestItemStar);
 }
 BoundValue compute_bound(const BoundContext& ctx, Weight c, BoundPolicy policy) {
     if (c <= 0) return {0,0,BoundType::U3};
@@ -186,13 +201,12 @@ BoundValue compute_bound(const BoundContext& ctx, Weight c, BoundPolicy policy) 
     if (requested != BoundType::Both && is_bound_certified(ctx,requested)) return individual(ctx,c,requested);
     // Forced q* policies that are not certified fall back to certified U3;
     // the returned type always describes that fallback, never the request.
-    const auto eligible=certified_bound_types(ctx);
-    if (eligible.empty()) throw std::logic_error("no certified bound");
-    BoundValue out=individual(ctx,c,eligible.front());
+    if (ctx.certified_type_count == 0) throw std::logic_error("no certified bound");
+    BoundValue out=individual(ctx,c,ctx.certified_types.front());
     if (requested != BoundType::Both) return out;
     // Stable ordering in certified_bound_types is the documented tie break.
-    for (std::size_t i=1;i<eligible.size();++i) {
-        BoundValue candidate=individual(ctx,c,eligible[i]);
+    for (std::size_t i=1;i<ctx.certified_type_count;++i) {
+        BoundValue candidate=individual(ctx,c,ctx.certified_types[i]);
         if (candidate.upper < out.upper) out=candidate;
     }
     return out;

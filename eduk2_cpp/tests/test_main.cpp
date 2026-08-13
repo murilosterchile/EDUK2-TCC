@@ -161,6 +161,73 @@ void check_equal_profit_predecessor_order() {
             "equal-profit tie did not retain the first predecessor");
 }
 
+struct GreedyCompletion {
+    Weight used_weight = 0;
+    Profit profit = 0;
+    std::vector<long long> multiplicity;
+};
+
+GreedyCompletion original_greedy_completion(Weight capacity, Weight initial_weight,
+                                            Profit initial_profit, const std::vector<Item>& items) {
+    GreedyCompletion result{initial_weight, initial_profit, std::vector<long long>(items.size(), 0)};
+    for (const Item& item : items) {
+        const long long copies = (capacity - result.used_weight) / item.w;
+        if (copies == 0) continue;
+        result.used_weight += safe_mul(copies, item.w);
+        result.profit = safe_add(result.profit, safe_mul(copies, item.p));
+        result.multiplicity[static_cast<std::size_t>(item.id)] += copies;
+    }
+    return result;
+}
+
+GreedyCompletion optimized_greedy_completion(Weight capacity, Weight initial_weight,
+                                             Profit initial_profit, const std::vector<Item>& items) {
+    std::vector<Weight> suffix_minimum(items.size());
+    Weight minimum_weight = items.back().w;
+    for (std::size_t index = items.size(); index-- > 0;) {
+        minimum_weight = std::min(minimum_weight, items[index].w);
+        suffix_minimum[index] = minimum_weight;
+    }
+
+    GreedyCompletion result{initial_weight, initial_profit, std::vector<long long>(items.size(), 0)};
+    Weight remaining = capacity - result.used_weight;
+    for (std::size_t index = 0; index < items.size(); ++index) {
+        if (remaining < suffix_minimum[index]) break;
+        const Item& item = items[index];
+        if (item.w > remaining) continue;
+        const long long copies = remaining / item.w;
+        const Weight added_weight = safe_mul(copies, item.w);
+        result.used_weight += added_weight;
+        remaining -= added_weight;
+        result.profit = safe_add(result.profit, safe_mul(copies, item.p));
+        result.multiplicity[static_cast<std::size_t>(item.id)] += copies;
+    }
+    return result;
+}
+
+void check_greedy_completion_equivalence() {
+    const std::vector<std::vector<Item>> item_sets{
+        // Only the late item fits initially; earlier oversized items must be skipped.
+        {{0, 17, 31}, {1, 23, 47}, {2, 5, 9}, {3, 19, 38}},
+        {{0, 8, 15}, {1, 3, 5}, {2, 13, 26}, {3, 2, 3}, {4, 11, 20}},
+        {{0, 9, 19}, {1, 14, 30}, {2, 6, 11}, {3, 4, 7}},
+    };
+    for (const auto& items : item_sets) {
+        for (const Weight capacity : {Weight{5}, Weight{11}, Weight{18}, Weight{37}, Weight{64}}) {
+            for (const Weight initial_weight : {Weight{0}, Weight{1}, capacity / 2, capacity}) {
+                const GreedyCompletion original =
+                    original_greedy_completion(capacity, initial_weight, 41, items);
+                const GreedyCompletion optimized =
+                    optimized_greedy_completion(capacity, initial_weight, 41, items);
+                require(optimized.used_weight == original.used_weight &&
+                            optimized.profit == original.profit &&
+                            optimized.multiplicity == original.multiplicity,
+                        "optimized greedy completion differs from original traversal");
+            }
+        }
+    }
+}
+
 void check_faithful_unordered_valid_ids() {
     // Item IDs are valid multiplicity indexes but deliberately do not follow
     // input order.  This exercises final-trace reconstruction through the
@@ -295,6 +362,170 @@ void check_paper_bound(const Instance& instance, Profit expected, bool tau, cons
     require(value.upper >= dense_dp_value(instance), std::string(name) + ": invalid upper bound");
 }
 
+struct DirectRational {
+    Profit numerator = 0;
+    Weight denominator = 1;
+};
+
+bool direct_greater(const DirectRational& left, const DirectRational& right) {
+    return static_cast<__int128>(left.numerator) * right.denominator >
+           static_cast<__int128>(right.numerator) * left.denominator;
+}
+
+// Keep a local copy of the original q* scan as a regression oracle for the
+// values cached by BoundContext.
+DirectRational direct_q_star(const std::vector<Item>& items, const Item& base) {
+    DirectRational best{0, 1};
+    for (const Item& item : items) {
+        if (item.id == base.id) continue;
+        const Weight copies = item.w / base.w;
+        const Weight remainder = item.w - copies * base.w;
+        const __int128 numerator = static_cast<__int128>(item.p) -
+                                   static_cast<__int128>(copies) * base.p;
+        if (remainder <= 0 || numerator <= 0) continue;
+        const DirectRational candidate{static_cast<Profit>(numerator), remainder};
+        if (direct_greater(candidate, best)) best = candidate;
+    }
+    return best;
+}
+
+BoundValue direct_normalized_bound(const Item& normalized_base, const Item& original_base,
+                                   Weight capacity, DirectRational q, int psi, BoundType type) {
+    const Weight copies = capacity / normalized_base.w;
+    const __int128 normalized_upper = static_cast<__int128>(q.numerator) * capacity +
+        (static_cast<__int128>(normalized_base.p) * q.denominator -
+         static_cast<__int128>(q.numerator) * normalized_base.w) * copies;
+    return {static_cast<Profit>(normalized_upper /
+                                (static_cast<__int128>(q.denominator) * psi)),
+            safe_mul(copies, original_base.p), type};
+}
+
+void check_precomputed_q_star() {
+    const std::vector<std::vector<Item>> item_sets{
+        {{10, 9, 12}, {3, 4, 5}, {17, 14, 19}, {2, 7, 9}, {21, 17, 22}},
+        {{5, 5, 4}, {8, 7, 5}, {1, 11, 7}, {13, 13, 8}, {29, 17, 10}},
+        {{4, 3, 8}, {6, 5, 12}, {9, 8, 19}, {12, 13, 30}, {15, 21, 47}}};
+
+    for (const auto& items : item_sets) {
+        const BoundContext context = make_bound_context(items);
+        const DirectRational direct_tau = direct_q_star(
+            context.normalized_ratio_items, context.normalized_tau_star_base);
+        const DirectRational direct_best = direct_q_star(
+            context.normalized_ratio_items, context.normalized_best_item_star_base);
+        require(context.tau_star_q_star_num == direct_tau.numerator &&
+                    context.tau_star_q_star_den == direct_tau.denominator,
+                "cached tau q* differs from direct scan");
+        require(context.best_item_star_q_star_num == direct_best.numerator &&
+                    context.best_item_star_q_star_den == direct_best.denominator,
+                "cached best-item q* differs from direct scan");
+
+        for (const Weight capacity : {Weight{0}, Weight{1}, Weight{4}, Weight{17}, Weight{68}}) {
+            DirectRational tau_q = direct_tau;
+            if (direct_greater(tau_q, {1, 1})) tau_q = {1, 1};
+            const BoundValue expected_tau = direct_normalized_bound(
+                context.normalized_tau_star_base, context.tau_star_base, capacity, tau_q,
+                context.psi, BoundType::TauStar);
+            const BoundValue expected_best = direct_normalized_bound(
+                context.normalized_best_item_star_base, context.best_item_star_base, capacity,
+                direct_best, context.psi, BoundType::BestItemStar);
+            const BoundValue actual_tau = compute_tau_star(context, capacity);
+            const BoundValue actual_best = compute_best_item_star(context, capacity);
+            require(actual_tau.upper == expected_tau.upper && actual_tau.lower == expected_tau.lower &&
+                        actual_tau.type == expected_tau.type,
+                    "cached tau q* changed a bound result");
+            require(actual_best.upper == expected_best.upper && actual_best.lower == expected_best.lower &&
+                        actual_best.type == expected_best.type,
+                    "cached best-item q* changed a bound result");
+        }
+    }
+}
+
+std::vector<BoundType> original_certified_bound_types(const BoundContext& context) {
+    std::vector<BoundType> types;
+    for (const BoundType type : {BoundType::U3, BoundType::V, BoundType::TauStar,
+                                 BoundType::BestItemStar}) {
+        if (is_bound_certified(context, type)) types.push_back(type);
+    }
+    return types;
+}
+
+BoundValue original_individual_bound(const BoundContext& context, Weight capacity, BoundType type) {
+    switch (type) {
+        case BoundType::U3: return compute_u3(context, capacity);
+        case BoundType::V: return compute_v(context, capacity);
+        case BoundType::TauStar: return compute_tau_star(context, capacity);
+        case BoundType::BestItemStar: return compute_best_item_star(context, capacity);
+        case BoundType::Both: break;
+    }
+    throw std::runtime_error("invalid reference certified bound");
+}
+
+BoundValue original_best_certified(const BoundContext& context, Weight capacity) {
+    const std::vector<BoundType> types = original_certified_bound_types(context);
+    require(!types.empty(), "reference certified-bound list is empty");
+    BoundValue best = original_individual_bound(context, capacity, types.front());
+    for (std::size_t i = 1; i < types.size(); ++i) {
+        const BoundValue candidate = original_individual_bound(context, capacity, types[i]);
+        if (candidate.upper < best.upper) best = candidate;
+    }
+    return best;
+}
+
+void check_certified_bound_cache_and_policies() {
+    const std::vector<std::vector<Item>> item_sets{
+        {{0, 3, 4}, {1, 4, 5}, {2, 7, 10}},
+        {{0, 2, 3}, {1, 5, 9}, {2, 8, 14}, {3, 11, 18}},
+        {{0, 5, 5}, {1, 6, 13}, {2, 9, 18}, {3, 13, 25}}};
+    constexpr std::array<BoundType, 4> expected_order{
+        BoundType::U3, BoundType::V, BoundType::TauStar, BoundType::BestItemStar};
+
+    for (const auto& items : item_sets) {
+        const BoundContext context = make_bound_context(items);
+        const std::vector<BoundType> before = original_certified_bound_types(context);
+        const std::vector<BoundType> after = certified_bound_types(context);
+        require(before == after, "certified-bound API changed its set or order");
+        require(context.certified_type_count == before.size(),
+                "certified-bound cache has the wrong count");
+        std::size_t previous_order = 0;
+        for (std::size_t i = 0; i < before.size(); ++i) {
+            require(context.certified_types[i] == before[i], "certified-bound cache changed order");
+            const auto position = std::find(expected_order.begin(), expected_order.end(), before[i]);
+            require(position != expected_order.end() &&
+                        (i == 0 || static_cast<std::size_t>(position - expected_order.begin()) > previous_order),
+                    "certified-bound order is not canonical");
+            previous_order = static_cast<std::size_t>(position - expected_order.begin());
+        }
+
+        for (const Weight capacity : {Weight{1}, Weight{7}, Weight{19}, Weight{43}}) {
+            const Instance instance{capacity, items};
+            const Profit oracle = dense_dp_value(instance);
+            const BoundValue expected = original_best_certified(context, capacity);
+            for (const BoundPolicy policy : {BoundPolicy::U3, BoundPolicy::V, BoundPolicy::TauStar,
+                                              BoundPolicy::BestItemStar, BoundPolicy::BestCertified}) {
+                const BoundValue actual = compute_bound(context, capacity, policy);
+                require(actual.upper >= oracle && actual.lower <= oracle,
+                        "bound policy disagrees with dense-DP oracle");
+                if (policy == BoundPolicy::BestCertified) {
+                    require(actual.upper == expected.upper && actual.lower == expected.lower &&
+                                actual.type == expected.type,
+                            "BestCertified changed winner or stable tie break");
+                } else {
+                    const BoundType requested = policy == BoundPolicy::U3 ? BoundType::U3 :
+                        policy == BoundPolicy::V ? BoundType::V :
+                        policy == BoundPolicy::TauStar ? BoundType::TauStar : BoundType::BestItemStar;
+                    const BoundType expected_type = is_bound_certified(context, requested) ?
+                        requested : before.front();
+                    const BoundValue forced_expected =
+                        original_individual_bound(context, capacity, expected_type);
+                    require(actual.upper == forced_expected.upper && actual.lower == forced_expected.lower &&
+                                actual.type == forced_expected.type,
+                            "forced policy changed its certified fallback");
+                }
+            }
+        }
+    }
+}
+
 Instance subset_sum_family(unsigned seed) {
     Instance instance;
     instance.capacity = 300 + static_cast<Weight>(seed % 7);
@@ -403,10 +634,13 @@ void check_faithful_extended_prefix_regression() {
 
 int main() {
     try {
+        check_greedy_completion_equivalence();
         check_article_examples();
         check_generated_families();
         check_pyasukp_corpus();
         check_faithful_extended_prefix_regression();
+        check_precomputed_q_star();
+        check_certified_bound_cache_and_policies();
         check_faithful_switches();
         check_faithful_core_selection();
         check_skip_point_sequence();

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ukp/types.hpp"
+#include <array>
 #include <optional>
 
 namespace ukp {
@@ -35,6 +36,14 @@ struct BoundContext {
     Item lightest_positive{};
     Item tau_star_base{};
     Item best_item_star_base{};
+    // q* bases retain the normalized profit used by the rational formula.
+    Item normalized_tau_star_base{};
+    Item normalized_best_item_star_base{};
+    // Exact q* values, independent of the residual capacity.
+    Profit tau_star_q_star_num = 0;
+    Weight tau_star_q_star_den = 1;
+    Profit best_item_star_q_star_num = 0;
+    Weight best_item_star_q_star_den = 1;
     bool has_three = false;
     bool has_lightest_positive = false;
     bool tau_normalized = false;
@@ -45,6 +54,10 @@ struct BoundContext {
     Profit delta1 = 0;
     BoundType preferred = BoundType::Both;
     bool no_multiple_dominance = false;
+    // Certified bounds in the stable selection order.  This avoids rebuilding
+    // an allocating vector for every contextual BestCertified query.
+    std::array<BoundType, 4> certified_types{};
+    std::size_t certified_type_count = 0;
 };
 
 BoundContext make_bound_context(const std::vector<Item>& items);

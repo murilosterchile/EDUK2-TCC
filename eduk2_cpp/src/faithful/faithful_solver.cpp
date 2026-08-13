@@ -444,14 +444,33 @@ SolverResult Solver::solve(const Instance& inst) {
     std::vector<int> reconstruction_touched_ids;
     reconstruction_touched_ids.reserve(items.size());
 
+    // Greedy completion retains the active-item order.  This suffix minimum
+    // only lets it stop once no remaining item can fit; it never changes
+    // which item would be considered next.
+    std::vector<Weight> active_suffix_min_weight;
+    auto rebuild_active_suffix_min_weight = [&]() {
+        active_suffix_min_weight.resize(items.size());
+        Weight minimum_weight = items.back().w;
+        for (std::size_t index = items.size(); index-- > 0;) {
+            minimum_weight = std::min(minimum_weight, items[index].w);
+            active_suffix_min_weight[index] = minimum_weight;
+        }
+    };
+    rebuild_active_suffix_min_weight();
+
     auto consider_greedy_completion = [&](detail::PointId state_index) {
         const detail::State& state = sequence.state(state_index);
         Weight used_weight = state.weight;
+        Weight remaining = inst.capacity - used_weight;
         Profit candidate_profit = state.profit;
-        for (const Item& item : items) {
-            const long long copies = (inst.capacity - used_weight) / item.w;
-            if (copies == 0) continue;
-            used_weight += safe_mul(copies, item.w);
+        for (std::size_t index = 0; index < items.size(); ++index) {
+            if (remaining < active_suffix_min_weight[index]) break;
+            const Item& item = items[index];
+            if (item.w > remaining) continue;
+            const long long copies = remaining / item.w;
+            const Weight added_weight = safe_mul(copies, item.w);
+            used_weight += added_weight;
+            remaining -= added_weight;
             candidate_profit = safe_add(candidate_profit, safe_mul(copies, item.p));
         }
 
@@ -475,13 +494,18 @@ SolverResult Solver::solve(const Instance& inst) {
             ++count;
         }
         Weight reconstruction_weight = state.weight;
-        for (const Item& item : items) {
-            const long long copies = (inst.capacity - reconstruction_weight) / item.w;
-            if (copies == 0) continue;
+        Weight reconstruction_remaining = inst.capacity - reconstruction_weight;
+        for (std::size_t index = 0; index < items.size(); ++index) {
+            if (reconstruction_remaining < active_suffix_min_weight[index]) break;
+            const Item& item = items[index];
+            if (item.w > reconstruction_remaining) continue;
+            const long long copies = reconstruction_remaining / item.w;
             long long& count = reconstruction_multiplicity[static_cast<std::size_t>(item.id)];
             if (count == 0) reconstruction_touched_ids.push_back(item.id);
             count += copies;
-            reconstruction_weight += safe_mul(copies, item.w);
+            const Weight added_weight = safe_mul(copies, item.w);
+            reconstruction_weight += added_weight;
+            reconstruction_remaining -= added_weight;
         }
 
         if (incumbent_solution.consider(candidate_profit, used_weight, reconstruction_multiplicity)) {
@@ -567,6 +591,7 @@ SolverResult Solver::solve(const Instance& inst) {
             if (next_items.size() != items.size()) {
                 items = std::move(next_items);
                 ctx = make_bound_context(items);
+                rebuild_active_suffix_min_weight();
             }
             slice.active_items_after = static_cast<long long>(items.size());
             result.stats.slices.push_back(std::move(slice));
