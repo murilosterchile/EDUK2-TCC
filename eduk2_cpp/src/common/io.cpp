@@ -1,22 +1,93 @@
 #include "ukp/io.hpp"
 
+#include <charconv>
 #include <cmath>
 #include <fstream>
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <string_view>
+#include <system_error>
 #include <vector>
 
 namespace ukp {
 
 namespace {
 
-std::string trim(const std::string& s) {
-    const auto begin = s.find_first_not_of(" \t\r\n");
-    if (begin == std::string::npos) return "";
+std::string_view trim(std::string_view text) {
+    const auto begin = text.find_first_not_of(" \t\r\n");
+    if (begin == std::string_view::npos) return {};
 
-    const auto end = s.find_last_not_of(" \t\r\n");
-    return s.substr(begin, end - begin + 1);
+    const auto end = text.find_last_not_of(" \t\r\n");
+    return text.substr(begin, end - begin + 1);
+}
+
+bool parse_integer_prefix(std::string_view text, long long& value) {
+    text = trim(text);
+    const auto result = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (result.ec == std::errc{} && result.ptr != text.data()) return true;
+
+    // Preserve the stream parser's acceptance of less common spellings, such
+    // as a leading plus sign, without paying its allocation cost normally.
+    std::istringstream fallback{std::string(text)};
+    return static_cast<bool>(fallback >> value);
+}
+
+bool parse_pyasukp_item(std::string_view text, Weight& weight, Profit& profit) {
+    text = trim(text);
+    const std::string_view original = text;
+    const auto weight_result =
+        std::from_chars(text.data(), text.data() + text.size(), weight);
+    if (weight_result.ec == std::errc{} && weight_result.ptr != text.data()) {
+        text.remove_prefix(static_cast<std::size_t>(weight_result.ptr - text.data()));
+        text = trim(text);
+        const std::size_t token_size = text.find_first_of(" \t\r\n");
+        const std::string_view token = text.substr(0, token_size);
+        Profit integer_profit = 0;
+        const auto integer_result =
+            std::from_chars(token.data(), token.data() + token.size(), integer_profit);
+        constexpr Profit kLargestExactDoubleInteger = Profit{1} << 53;
+        if (integer_result.ec == std::errc{} &&
+            integer_result.ptr == token.data() + token.size() &&
+            integer_profit >= -kLargestExactDoubleInteger &&
+            integer_profit <= kLargestExactDoubleInteger) {
+            profit = integer_profit;
+            return true;
+        }
+
+        double floating_profit = 0;
+        const auto profit_result = std::from_chars(
+            text.data(), text.data() + text.size(), floating_profit);
+        if (profit_result.ec == std::errc{} && profit_result.ptr != text.data()) {
+            profit = static_cast<Profit>(std::llround(floating_profit));
+            return true;
+        }
+    }
+
+    double floating_profit = 0;
+    std::istringstream fallback{std::string(original)};
+    if (!(fallback >> weight >> floating_profit)) return false;
+    profit = static_cast<Profit>(std::llround(floating_profit));
+    return true;
+}
+
+void append_legacy_integers(std::string_view text, std::vector<long long>& values) {
+    while (true) {
+        text = trim(text);
+        if (text.empty()) return;
+
+        long long value = 0;
+        const auto result = std::from_chars(text.data(), text.data() + text.size(), value);
+        if (result.ec == std::errc{} && result.ptr != text.data()) {
+            values.push_back(value);
+            text.remove_prefix(static_cast<std::size_t>(result.ptr - text.data()));
+            continue;
+        }
+
+        std::istringstream fallback{std::string(text)};
+        while (fallback >> value) values.push_back(value);
+        return;
+    }
 }
 
 }  // namespace
@@ -53,44 +124,42 @@ Instance read_instance(std::istream& in) {
     std::vector<long long> legacy_values;
 
     while (std::getline(in, line)) {
-        auto comment_pos = line.find('#');
-        if (comment_pos != std::string::npos) {
-            line = line.substr(0, comment_pos);
-        }
+        std::string_view content(line);
+        const auto comment_pos = content.find('#');
+        if (comment_pos != std::string_view::npos) content = content.substr(0, comment_pos);
+        content = trim(content);
 
-        line = trim(line);
-
-        if (line.empty()) continue;
+        if (content.empty()) continue;
 
         // -------------------------------------------------------------
         // Detect PYAsUKP/OCaml format
         // -------------------------------------------------------------
 
-        if (line.rfind("n:", 0) == 0) {
+        if (content.rfind("n:", 0) == 0) {
             pyasukp_format = true;
-
-            std::stringstream ss(line.substr(2));
-            ss >> expected_n;
+            parse_integer_prefix(content.substr(2), expected_n);
+            if (expected_n >= 0 &&
+                static_cast<unsigned long long>(expected_n) <= inst.items.max_size()) {
+                inst.items.reserve(static_cast<std::size_t>(expected_n));
+            }
 
             continue;
         }
 
-        if (line.rfind("c:", 0) == 0) {
+        if (content.rfind("c:", 0) == 0) {
             pyasukp_format = true;
-
-            std::stringstream ss(line.substr(2));
-            ss >> inst.capacity;
+            parse_integer_prefix(content.substr(2), inst.capacity);
 
             continue;
         }
 
-        if (line == "begin data") {
+        if (content == "begin data") {
             pyasukp_format = true;
             in_data = true;
             continue;
         }
 
-        if (line == "end data") {
+        if (content == "end data") {
             break;
         }
 
@@ -99,17 +168,12 @@ Instance read_instance(std::istream& in) {
         // -------------------------------------------------------------
 
         if (pyasukp_format && in_data) {
-            std::stringstream ss(line);
-
             Weight w;
-            double p_double;
+            Profit p;
 
-            if (!(ss >> w >> p_double)) {
+            if (!parse_pyasukp_item(content, w, p)) {
                 continue;
             }
-
-            Profit p =
-                static_cast<Profit>(std::llround(p_double));
 
             if (p <= 0 || w <= 0) {
                 throw std::runtime_error(
@@ -127,13 +191,7 @@ Instance read_instance(std::istream& in) {
         // -------------------------------------------------------------
 
         if (!pyasukp_format) {
-            std::stringstream ss(line);
-
-            long long x;
-
-            while (ss >> x) {
-                legacy_values.push_back(x);
-            }
+            append_legacy_integers(content, legacy_values);
         }
     }
 

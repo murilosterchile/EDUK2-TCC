@@ -12,53 +12,66 @@ CriticalSequence::CriticalSequence() {
 }
 
 std::size_t CriticalSequence::ComputedWindow::index(Weight weight) const {
-    return static_cast<std::size_t>(weight % static_cast<Weight>(slots_.size()));
+    return static_cast<std::size_t>(weight) & index_mask_;
 }
 
 void CriticalSequence::ComputedWindow::configure(Weight largest_item_weight) {
     if (!slots_.empty() && largest_item_weight <= largest_item_weight_) return;
+    if (largest_item_weight < 0) {
+        throw std::invalid_argument("negative computed-window item weight");
+    }
     if (largest_item_weight == std::numeric_limits<Weight>::max()) {
         throw std::length_error("computed-window item weight is too large");
     }
-    const auto size = static_cast<std::size_t>(largest_item_weight + 1);
-    if (static_cast<Weight>(size) != largest_item_weight + 1) {
+    const auto required_size = static_cast<std::size_t>(largest_item_weight + 1);
+    if (static_cast<Weight>(required_size) != largest_item_weight + 1) {
         throw std::length_error("computed-window does not fit in size_t");
     }
 
+    std::size_t size = 1;
+    while (size < required_size) {
+        if (size > std::numeric_limits<std::size_t>::max() / 2) {
+            throw std::length_error("computed-window power-of-two size overflow");
+        }
+        size <<= 1;
+    }
+    largest_item_weight_ = largest_item_weight;
+    if (size == slots_.size()) return;
+
     std::vector<Slot> replacement(size);
+    const std::size_t replacement_mask = size - 1;
     for (const Slot& slot : slots_) {
-        if (!slot.occupied) continue;
-        Slot& destination = replacement[static_cast<std::size_t>(
-            slot.weight % static_cast<Weight>(replacement.size()))];
+        if (slot.weight < 0) continue;
+        Slot& destination = replacement[static_cast<std::size_t>(slot.weight) & replacement_mask];
         destination = slot;
     }
     slots_ = std::move(replacement);
-    largest_item_weight_ = largest_item_weight;
+    index_mask_ = replacement_mask;
 }
 
 void CriticalSequence::ComputedWindow::store(Weight weight, const Candidate& candidate) {
     Slot& slot = slots_[index(weight)];
-    if (!slot.occupied || slot.weight != weight || candidate.profit > slot.candidate.profit ||
+    if (slot.weight != weight || candidate.profit > slot.candidate.profit ||
         (candidate.profit == slot.candidate.profit &&
          candidate.tie_rank < slot.candidate.tie_rank)) {
         // Equal-profit candidates retain the highest ratio-order priority.
-        slot = Slot{candidate, weight, true};
+        slot = Slot{candidate, weight};
     }
 }
 
 bool CriticalSequence::ComputedWindow::contains(Weight weight) const {
     if (slots_.empty()) return false;
     const Slot& slot = slots_[index(weight)];
-    return slot.occupied && slot.weight == weight;
+    return slot.weight == weight;
 }
 
 CriticalSequence::Candidate CriticalSequence::ComputedWindow::take(Weight weight) {
     Slot& slot = slots_[index(weight)];
-    if (!slot.occupied || slot.weight != weight) {
+    if (slot.weight != weight) {
         throw std::logic_error("computed-window candidate is missing");
     }
     const Candidate candidate = slot.candidate;
-    slot.occupied = false;
+    slot.weight = -1;
     return candidate;
 }
 
@@ -115,22 +128,21 @@ int CriticalSequence::tie_rank(const Item& item, std::size_t fallback) const noe
 }
 
 void CriticalSequence::reserve_storage(Weight compute_limit, const std::vector<Item>& items) {
+    if (compute_limit >= 0) {
+        constexpr std::size_t kMaximumInitialReserve = 1U << 18;
+        const std::size_t estimate = compute_limit >= static_cast<Weight>(kMaximumInitialReserve - 1)
+            ? kMaximumInitialReserve : static_cast<std::size_t>(compute_limit + 1);
+        states_.reserve(estimate);
+        skip_points_.reserve(estimate);
+        expandable_points_.reserve(estimate);
+    }
+
     if (items.empty()) return;
-    Weight smallest_weight = items.front().w;
     Weight largest_weight = items.front().w;
     for (const Item& item : items) {
-        smallest_weight = std::min(smallest_weight, item.w);
         largest_weight = std::max(largest_weight, item.w);
     }
     pending_.configure(largest_weight);
-
-    if (smallest_weight <= 0 || compute_limit < 0) return;
-    const Weight chain_estimate = compute_limit / smallest_weight + 1;
-    constexpr std::size_t kMaximumInitialReserve = 1U << 20;
-    const std::size_t estimate = static_cast<std::size_t>(std::min<Weight>(
-        chain_estimate, static_cast<Weight>(kMaximumInitialReserve)));
-    states_.reserve(std::max(states_.size(), estimate));
-    skip_points_.reserve(std::max(skip_points_.size(), estimate));
 }
 
 void CriticalSequence::schedule_successors(PointId parent, Weight compute_limit,
@@ -170,118 +182,6 @@ void CriticalSequence::backfill_item(const Item& item, Weight compute_limit,
         ++result.points_generated;
         pending_.store(weight, Candidate{safe_add(base.profit, item.p), parent, item.id, rank});
     }
-}
-
-SliceBuildResult CriticalSequence::process_slice(
-    Weight ya, Weight yb, Weight compute_limit, const std::vector<Item>& items,
-    const std::function<bool(PointId)>& should_expand) {
-    SliceBuildResult result;
-    if (yb < ya || compute_limit < 0) return result;
-
-    reserve_storage(compute_limit, items);
-
-    if (!root_processed_ && ya == 0) {
-        root_processed_ = true;
-        ++result.states_entered;
-        if (should_expand(0)) {
-            expandable_points_.push_back(0);
-            schedule_successors(0, compute_limit, items, result);
-        }
-    }
-
-    // Scan the slice in weight order.  Newly accepted states can enqueue a
-    // later position in this same slice, closing it transitively.
-    const Weight first_weight = ya == std::numeric_limits<Weight>::max() ? ya : ya + 1;
-    for (Weight weight = first_weight;; ++weight) {
-        if (pending_.contains(weight)) {
-            const Candidate candidate = pending_.take(weight);
-
-            const Profit previous_profit = state(skip_points_.back()).profit;
-            if (candidate.profit > previous_profit) {
-                states_.push_back(State{weight, candidate.profit, candidate.predecessor, candidate.item_id});
-                const PointId id = states_.size() - 1;
-                skip_points_.push_back(id);
-                ++result.states_created;
-                ++result.states_entered;
-                if (should_expand(id)) {
-                    expandable_points_.push_back(id);
-                    schedule_successors(id, compute_limit, items, result);
-                }
-            }
-        }
-        if (weight == yb) break;
-    }
-    return result;
-}
-
-SliceBuildResult CriticalSequence::process_slice_incremental(
-    Weight ya, Weight yb, Weight compute_limit, std::vector<Item>& active_items,
-    const std::vector<Item>& items_by_weight, std::size_t& next_item,
-    const std::function<bool(const Item&, Profit)>& should_introduce,
-    const std::function<bool(PointId)>& should_expand) {
-    SliceBuildResult result;
-    if (yb < ya || compute_limit < 0) return result;
-
-    reserve_storage(compute_limit, active_items);
-    if (!root_processed_ && ya == 0) {
-        root_processed_ = true;
-        ++result.states_entered;
-        if (should_expand(0)) {
-            expandable_points_.push_back(0);
-            schedule_successors(0, compute_limit, active_items, result);
-        }
-    }
-
-    const Weight first_weight = ya == std::numeric_limits<Weight>::max() ? ya : ya + 1;
-    for (Weight weight = first_weight;; ++weight) {
-        Candidate selected{};
-        bool has_selected = false;
-        const Profit previous_profit = state(skip_points_.back()).profit;
-        Profit envelope = previous_profit;
-
-        if (pending_.contains(weight)) {
-            selected = pending_.take(weight);
-            has_selected = true;
-            envelope = std::max(envelope, selected.profit);
-        }
-
-        while (next_item < items_by_weight.size() && items_by_weight[next_item].w == weight) {
-            const Item& item = items_by_weight[next_item++];
-            ++result.items_considered_for_introduction;
-            if (item.p <= envelope) {
-                ++result.items_rejected_by_envelope;
-                continue;
-            }
-            if (!should_introduce(item, envelope)) {
-                ++result.items_rejected_by_bound;
-                continue;
-            }
-
-            backfill_item(item, compute_limit, result);
-            const auto position = std::lower_bound(
-                active_items.begin(), active_items.end(), item,
-                [](const Item& existing, const Item& value) { return better_ratio(existing, value); });
-            active_items.insert(position, item);
-            selected = Candidate{item.p, 0, item.id, tie_rank(item, 0)};
-            has_selected = true;
-            envelope = item.p;
-            ++result.items_introduced;
-        }
-
-        if (has_selected && selected.profit > previous_profit) {
-            states_.push_back(State{weight, selected.profit, selected.predecessor, selected.item_id});
-            const PointId id = states_.size() - 1;
-            skip_points_.push_back(id);
-            ++result.states_created;
-            ++result.states_entered;
-            if (should_expand(id)) {
-                expandable_points_.push_back(id);
-                schedule_successors(id, compute_limit, active_items, result);
-            }
-        }
-        if (weight == yb) break;
-    }
-    return result;
 }
 
 }  // namespace ukp::faithful::detail

@@ -405,6 +405,21 @@ SolverResult Solver::solve(const Instance& inst) {
     result.stats.dp_item_ids.reserve(dp_items.size());
     for (const Item& item : dp_items) result.stats.dp_item_ids.push_back(item.id);
 
+    // The residual bound set is monotone: a candidate leaves it only after an
+    // envelope/bound rejection or threshold removal.  Keep membership by id
+    // and rebuild in dp_items' stable ratio order, avoiding the old active +
+    // weight-ordered concatenation and its full sort on every change.
+    std::vector<unsigned char> residual_item_alive(inst.items.size(), 0);
+    auto residual_slot = [&](const Item& item) -> unsigned char& {
+        if (item.id < 0 || static_cast<std::size_t>(item.id) >= residual_item_alive.size()) {
+            throw std::logic_error("item id is outside residual bound membership");
+        }
+        return residual_item_alive[static_cast<std::size_t>(item.id)];
+    };
+    for (const Item& item : dp_items) residual_slot(item) = 1;
+    std::vector<Item> residual_items;
+    residual_items.reserve(dp_items.size());
+
     if (options_.use_core_bb) {
         constexpr long long kFaithfulCoreNodeLimit = 10'000;
         const long long core_node_limit = options_.paper_faithful_mode
@@ -456,7 +471,14 @@ SolverResult Solver::solve(const Instance& inst) {
     // of f(N, y), in topological weight order.
     detail::CriticalSequence sequence;
     sequence.configure_item_order(dp_items);
-    std::unordered_map<int, Weight> last_contribution;
+    constexpr Weight kNoContribution = std::numeric_limits<Weight>::min();
+    std::vector<Weight> last_contribution(inst.items.size(), kNoContribution);
+    auto contribution_slot = [&](int item_id) -> Weight& {
+        if (item_id < 0 || static_cast<std::size_t>(item_id) >= last_contribution.size()) {
+            throw std::logic_error("item id is outside contribution table");
+        }
+        return last_contribution[static_cast<std::size_t>(item_id)];
+    };
     const Weight wmin = items_by_weight.empty() ? Weight{1} : items_by_weight.front().w;
     // PYAsUKP's executable defaults layer_height to 100 and then takes the
     // maximum with the lightest weight during reduction.
@@ -470,6 +492,14 @@ SolverResult Solver::solve(const Instance& inst) {
     const Weight initial_process_limit = std::max(half_capacity, introduction_limit);
     const Weight candidate_limit = inst.capacity;
     Weight process_limit = initial_process_limit;
+    constexpr Weight kMaximumSliceReserve = 1U << 16;
+    const __int128 desired_process_limit =
+        static_cast<__int128>(initial_process_limit) + introduction_limit;
+    const Weight expected_process_limit = desired_process_limit >= inst.capacity
+        ? inst.capacity : static_cast<Weight>(desired_process_limit);
+    const Weight estimated_slice_count = std::min(
+        kMaximumSliceReserve, expected_process_limit / h + 2);
+    result.stats.slices.reserve(static_cast<std::size_t>(estimated_slice_count));
     bool half_capacity_extension_done = false;
     bool closed_by_bound = false;
     std::array<long long, kBoundTypes.size()> contextual_bound_counts{};
@@ -566,7 +596,9 @@ SolverResult Solver::solve(const Instance& inst) {
             reconstruction_remaining -= added_weight;
         }
 
-        if (incumbent_solution.consider(candidate_profit, used_weight, reconstruction_multiplicity)) {
+        if (incumbent_solution.consider_sparse(candidate_profit, used_weight,
+                                               reconstruction_multiplicity,
+                                               reconstruction_touched_ids)) {
             incumbent = incumbent_solution.profit;
             ++result.stats.incumbent_improvements_dp;
         }
@@ -581,12 +613,15 @@ SolverResult Solver::solve(const Instance& inst) {
     // apply threshold dominance at the completed boundary; then test stopping.
     // After crossing c/2, extend once through the largest active-item range,
     // as in EDUK2's `standard` recurrence.
+    std::vector<Item> threshold_survivors;
+    threshold_survivors.reserve(dp_items.size());
     for (Weight ya = 0; ya < process_limit;) {
         const Weight yb = std::min(process_limit, ya + h);
         SliceStats slice;
         slice.begin = ya;
         slice.end = yb;
         slice.active_items_before = static_cast<long long>(items.size());
+        const std::size_t previous_next_item = next_item;
         const detail::SliceBuildResult build = sequence.process_slice_incremental(
             ya, yb, candidate_limit, items, items_by_weight, next_item,
             [&](const Item& item, Profit) {
@@ -597,14 +632,15 @@ SolverResult Solver::solve(const Instance& inst) {
                     record_contextual_bound(residual.type, slice);
                     if (safe_add(item.p, residual.upper) <= incumbent) return false;
                 }
-                last_contribution[item.id] = item.w;
+                contribution_slot(item.id) = item.w;
                 return true;
             },
             [&](detail::PointId state_index) {
             const detail::State& state = sequence.state(state_index);
             ++slice.states_entered;
             if (options_.use_bounds) {
-                const BoundValue residual = compute_bound(ctx, inst.capacity - state.weight, options_.bound_policy);
+                const BoundValue residual = compute_bound(
+                    ctx, inst.capacity - state.weight, options_.bound_policy);
                 ++result.stats.bound_calls;
                 record_contextual_bound(residual.type, slice);
                 if (safe_add(state.profit, residual.upper) <= incumbent) {
@@ -617,7 +653,7 @@ SolverResult Solver::solve(const Instance& inst) {
             // surviving optimal state with the current dominance-free items.
             consider_greedy_completion(state_index);
             // Every state exposed by the sequence is a strict skip-point.
-            if (state.item_id >= 0) last_contribution[state.item_id] = state.weight;
+            if (state.item_id >= 0) contribution_slot(state.item_id) = state.weight;
             ++result.stats.states_kept;
             ++slice.states_kept;
             return true;
@@ -629,6 +665,12 @@ SolverResult Solver::solve(const Instance& inst) {
         result.stats.items_introduced += build.items_introduced;
         result.stats.items_rejected_by_envelope += build.items_rejected_by_envelope;
         result.stats.items_rejected_by_bound += build.items_rejected_by_bound;
+        if (build.items_considered_for_introduction > 0) {
+            for (std::size_t index = previous_next_item; index < next_item; ++index) {
+                residual_slot(items_by_weight[index]) = 0;
+            }
+            for (const Item& item : items) residual_slot(item) = 1;
+        }
         slice.successor_attempts += build.successor_attempts;
         slice.successor_item_scans += build.successor_item_scans;
         slice.backfill_attempts += build.backfill_attempts;
@@ -649,41 +691,39 @@ SolverResult Solver::solve(const Instance& inst) {
         // last_contribution(i) + w_i <= yb.  Run it only at a completed
         // slice, and keep one item so the active recurrence is never empty.
         if (!items.empty()) {
-            std::vector<Item> next_items;
-            next_items.reserve(items.size());
+            threshold_survivors.clear();
             std::size_t remaining_active = items.size();
             for (const Item& item : items) {
-                const auto contribution = last_contribution.find(item.id);
-                if (contribution == last_contribution.end()) {
+                const Weight contribution = contribution_slot(item.id);
+                if (contribution == kNoContribution) {
                     throw std::logic_error("active item has no introduction contribution");
                 }
                 if (remaining_active > 1 &&
-                    safe_add(contribution->second, item.w) <= yb) {
+                    safe_add(contribution, item.w) <= yb) {
                     --remaining_active;
+                    residual_slot(item) = 0;
                     ++result.stats.items_removed_threshold;
                     ++slice.items_removed_threshold;
                 } else {
-                    next_items.push_back(item);
+                    threshold_survivors.push_back(item);
                 }
             }
             // Threshold removal changes the active recurrence.  Rebuild the
             // greedy suffix now; the valid residual bound context is rebuilt
             // below together with the not-yet-introduced candidates.
-            if (next_items.size() != items.size()) {
-                items = std::move(next_items);
+            if (threshold_survivors.size() != items.size()) {
+                items.swap(threshold_survivors);
                 rebuild_active_suffix_min_weight();
             }
         }
         if (build.items_considered_for_introduction > 0 || slice.items_removed_threshold > 0) {
-            // Remove collectively/context/threshold dominated items from the
-            // bound instance, but retain every item whose introduction weight
-            // has not been reached yet.  This keeps the bound valid while it
-            // tightens monotonically toward the active residual problem.
-            std::vector<Item> residual_items = items;
-            residual_items.insert(residual_items.end(),
-                                  items_by_weight.begin() + static_cast<std::ptrdiff_t>(next_item),
-                                  items_by_weight.end());
-            if (!residual_items.empty()) ctx = make_bound_context(residual_items);
+            residual_items.clear();
+            for (const Item& item : dp_items) {
+                if (residual_slot(item) != 0) residual_items.push_back(item);
+            }
+            if (!residual_items.empty()) {
+                rebuild_bound_context_ratio_ordered(ctx, residual_items);
+            }
         }
         slice.active_items_after = static_cast<long long>(items.size());
         result.stats.slices.push_back(std::move(slice));
@@ -704,9 +744,18 @@ SolverResult Solver::solve(const Instance& inst) {
     detail::PointId first_index = 0;
     detail::PointId second_index = 0;
     Profit split_profit = 0;
-    for (const detail::PointId index : sequence.skip_points()) {
+    const std::vector<detail::PointId>& skip_points = sequence.skip_points();
+    std::size_t partner_position = skip_points.size() - 1;
+    for (const detail::PointId index : skip_points) {
         const detail::State& state = sequence.state(index);
-        const detail::PointId partner = sequence.state_at_or_before(inst.capacity - state.weight);
+        const Weight residual_capacity = inst.capacity - state.weight;
+        // State weights increase while the complementary capacity decreases,
+        // so the best feasible partner moves only toward the sequence front.
+        while (partner_position > 0 &&
+               sequence.state(skip_points[partner_position]).weight > residual_capacity) {
+            --partner_position;
+        }
+        const detail::PointId partner = skip_points[partner_position];
         const Profit candidate = safe_add(state.profit, sequence.state(partner).profit);
         if (candidate > split_profit) {
             split_profit = candidate;

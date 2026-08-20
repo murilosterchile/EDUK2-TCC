@@ -1,23 +1,33 @@
 #include "ukp/bounds.hpp"
 
 #include <optional>
+#include <utility>
 
 namespace ukp {
 namespace {
 struct Rational { Profit numerator = 0; Weight denominator = 1; };
+struct RationalWitness {
+    Rational value{};
+    int item_id = -1;
+};
 bool greater(const Rational& a, const Rational& b) {
     return static_cast<__int128>(a.numerator) * b.denominator >
            static_cast<__int128>(b.numerator) * a.denominator;
 }
 Profit floor_div(__int128 n, __int128 d) {
     if (d <= 0) throw std::invalid_argument("non-positive rational denominator");
+    if (n <= std::numeric_limits<Profit>::max() &&
+        n >= std::numeric_limits<Profit>::min() &&
+        d <= std::numeric_limits<Weight>::max()) {
+        return static_cast<Profit>(n) / static_cast<Weight>(d);
+    }
     const __int128 v = n / d;
     if (v > std::numeric_limits<Profit>::max() || v < std::numeric_limits<Profit>::min())
         throw std::overflow_error("bound overflow");
     return static_cast<Profit>(v);
 }
-Rational q_star(const std::vector<Item>& items, const Item& base) {
-    Rational best{0, 1};
+RationalWitness q_star(const std::vector<Item>& items, const Item& base) {
+    RationalWitness best{{0, 1}, -1};
     for (const Item& item : items) {
         if (item.id == base.id) continue;
         const Weight copies = item.w / base.w;
@@ -26,9 +36,12 @@ Rational q_star(const std::vector<Item>& items, const Item& base) {
         if (remainder <= 0 || n <= 0) continue;
         if (n > std::numeric_limits<Profit>::max()) throw std::overflow_error("q* overflow");
         Rational candidate{static_cast<Profit>(n), remainder};
-        if (greater(candidate, best)) best = candidate;
+        if (greater(candidate, best.value)) best = {candidate, item.id};
     }
     return best;
+}
+bool same_item(const Item& left, const Item& right) {
+    return left.id == right.id && left.w == right.w && left.p == right.p;
 }
 BoundValue normalized_bound_from_q(const Item& normalized_base, const Item& original_base,
                                    Weight c, Rational q, int psi, BoundType type) {
@@ -72,27 +85,54 @@ BoundType policy_type(BoundPolicy p) {
 }
 } // namespace
 
-BoundContext make_bound_context(const std::vector<Item>& items) {
+namespace {
+void populate_bound_context(BoundContext& ctx, const std::vector<Item>& items,
+                            bool items_are_ratio_ordered) {
     if (items.empty()) throw std::invalid_argument("empty item set");
-    BoundContext ctx;
-    ctx.items = items;
+    const bool has_previous_subset = items_are_ratio_ordered && !ctx.items.empty();
+    const Item previous_tau_base = ctx.tau_star_base;
+    const Item previous_best_base = ctx.best_item_star_base;
+    const int previous_psi = ctx.psi;
+    const Profit previous_tau_q_num = ctx.tau_star_q_star_num;
+    const Weight previous_tau_q_den = ctx.tau_star_q_star_den;
+    const int previous_tau_q_item_id = ctx.tau_star_q_star_item_id;
+    const Profit previous_best_q_num = ctx.best_item_star_q_star_num;
+    const Weight previous_best_q_den = ctx.best_item_star_q_star_den;
+    const int previous_best_q_item_id = ctx.best_item_star_q_star_item_id;
+    const Profit previous_alpha_num = ctx.alpha_num;
+    const Weight previous_alpha_den = ctx.alpha_den;
+    const int previous_alpha_item_id = ctx.alpha_item_id;
+    const bool previous_no_multiple_dominance = ctx.no_multiple_dominance;
+    // Contexts are rebuilt repeatedly while the residual item set shrinks.
+    // Preserve the two largest buffers instead of allocating fresh copies.
+    std::vector<Item> item_storage = std::move(ctx.items);
+    std::vector<Item> normalized_storage = std::move(ctx.normalized_ratio_items);
+    ctx = BoundContext{};
+    ctx.items = std::move(item_storage);
+    ctx.normalized_ratio_items = std::move(normalized_storage);
+    ctx.items.assign(items.begin(), items.end());
     // ratio_items used to be a full sorted copy solely to select these three
     // items. Keep the exact better_ratio ordering, without allocating or
     // sorting a second copy of the residual instance.
     ctx.best = items.front();
     std::optional<Item> second;
     std::optional<Item> third;
-    for (std::size_t i = 1; i < items.size(); ++i) {
-        const Item& candidate = items[i];
-        if (better_ratio(candidate, ctx.best)) {
-            third = second;
-            second = ctx.best;
-            ctx.best = candidate;
-        } else if (!second || better_ratio(candidate, *second)) {
-            third = second;
-            second = candidate;
-        } else if (!third || better_ratio(candidate, *third)) {
-            third = candidate;
+    if (items_are_ratio_ordered) {
+        if (items.size() >= 2) second = items[1];
+        if (items.size() >= 3) third = items[2];
+    } else {
+        for (std::size_t i = 1; i < items.size(); ++i) {
+            const Item& candidate = items[i];
+            if (better_ratio(candidate, ctx.best)) {
+                third = second;
+                second = ctx.best;
+                ctx.best = candidate;
+            } else if (!second || better_ratio(candidate, *second)) {
+                third = second;
+                second = candidate;
+            } else if (!third || better_ratio(candidate, *third)) {
+                third = candidate;
+            }
         }
     }
     ctx.best_item_star_base = ctx.best;
@@ -116,42 +156,98 @@ BoundContext make_bound_context(const std::vector<Item>& items) {
         ctx.tau_normalized = true;
     }
     ctx.delta1 = floor_div(static_cast<__int128>(ctx.psi) * ctx.tau_star_base.p - ctx.tau_star_base.w, 1);
-    ctx.normalized_ratio_items = items;
-    for (Item& it : ctx.normalized_ratio_items)
-        it.p = floor_div(static_cast<__int128>(it.p) * ctx.psi, 1);
-    std::sort(ctx.normalized_ratio_items.begin(), ctx.normalized_ratio_items.end(), better_ratio);
+    ctx.normalized_ratio_items.assign(items.begin(), items.end());
+    bool previous_tau_q_item_present = previous_tau_q_item_id < 0;
+    bool previous_best_q_item_present = previous_best_q_item_id < 0;
+    bool previous_alpha_item_present = previous_alpha_item_id < 0;
+    for (std::size_t index = 0; index < items.size(); ++index) {
+        const Item& original = items[index];
+        previous_tau_q_item_present |= original.id == previous_tau_q_item_id;
+        previous_best_q_item_present |= original.id == previous_best_q_item_id;
+        previous_alpha_item_present |= original.id == previous_alpha_item_id;
+        Item& normalized = ctx.normalized_ratio_items[index];
+        normalized.p = floor_div(static_cast<__int128>(normalized.p) * ctx.psi, 1);
+    }
+    if (!items_are_ratio_ordered) {
+        std::sort(ctx.normalized_ratio_items.begin(), ctx.normalized_ratio_items.end(), better_ratio);
+    }
     ctx.normalized_tau_star_base = {ctx.tau_star_base.id, ctx.tau_star_base.w,
         floor_div(static_cast<__int128>(ctx.tau_star_base.p) * ctx.psi, 1)};
     ctx.normalized_best_item_star_base = {ctx.best_item_star_base.id, ctx.best_item_star_base.w,
         floor_div(static_cast<__int128>(ctx.best_item_star_base.p) * ctx.psi, 1)};
-    const Rational tau_q = q_star(ctx.normalized_ratio_items, ctx.normalized_tau_star_base);
-    ctx.tau_star_q_star_num = tau_q.numerator;
-    ctx.tau_star_q_star_den = tau_q.denominator;
-    const Rational best_item_q = q_star(ctx.normalized_ratio_items,
-                                        ctx.normalized_best_item_star_base);
-    ctx.best_item_star_q_star_num = best_item_q.numerator;
-    ctx.best_item_star_q_star_den = best_item_q.denominator;
-
-    Profit alpha_num = 0; Weight alpha_den = 1;
-    for (const Item& it : ctx.normalized_ratio_items) {
-        if (it.id == ctx.tau_star_base.id || it.w < ctx.tau_star_base.w) continue;
-        const Profit delta = it.p - static_cast<Profit>(it.w);
-        const Weight copies = it.w / ctx.tau_star_base.w;
-        if (copies <= 0) continue;
-        const __int128 den = static_cast<__int128>(copies) * ctx.delta1;
-        if (static_cast<__int128>(delta) * alpha_den > static_cast<__int128>(alpha_num) * den) {
-            alpha_num = delta; alpha_den = floor_div(den, 1);
-        }
+    const bool tau_context_unchanged = has_previous_subset && previous_psi == ctx.psi &&
+        same_item(previous_tau_base, ctx.tau_star_base);
+    if (tau_context_unchanged && previous_tau_q_item_present) {
+        ctx.tau_star_q_star_num = previous_tau_q_num;
+        ctx.tau_star_q_star_den = previous_tau_q_den;
+        ctx.tau_star_q_star_item_id = previous_tau_q_item_id;
+    } else {
+        const RationalWitness tau_q =
+            q_star(ctx.normalized_ratio_items, ctx.normalized_tau_star_base);
+        ctx.tau_star_q_star_num = tau_q.value.numerator;
+        ctx.tau_star_q_star_den = tau_q.value.denominator;
+        ctx.tau_star_q_star_item_id = tau_q.item_id;
     }
-    ctx.alpha_num = alpha_num; ctx.alpha_den = alpha_den;
-    ctx.preferred = static_cast<__int128>(alpha_num) <= alpha_den ? BoundType::V : BoundType::Both;
-    ctx.no_multiple_dominance = has_no_multiple_dominance(ctx.items);
+    const bool best_context_unchanged = has_previous_subset && previous_psi == ctx.psi &&
+        same_item(previous_best_base, ctx.best_item_star_base);
+    if (best_context_unchanged && previous_best_q_item_present) {
+        ctx.best_item_star_q_star_num = previous_best_q_num;
+        ctx.best_item_star_q_star_den = previous_best_q_den;
+        ctx.best_item_star_q_star_item_id = previous_best_q_item_id;
+    } else {
+        const RationalWitness best_item_q =
+            q_star(ctx.normalized_ratio_items, ctx.normalized_best_item_star_base);
+        ctx.best_item_star_q_star_num = best_item_q.value.numerator;
+        ctx.best_item_star_q_star_den = best_item_q.value.denominator;
+        ctx.best_item_star_q_star_item_id = best_item_q.item_id;
+    }
+
+    if (tau_context_unchanged && previous_alpha_item_present) {
+        ctx.alpha_num = previous_alpha_num;
+        ctx.alpha_den = previous_alpha_den;
+        ctx.alpha_item_id = previous_alpha_item_id;
+    } else {
+        Profit alpha_num = 0;
+        Weight alpha_den = 1;
+        int alpha_item_id = -1;
+        for (const Item& it : ctx.normalized_ratio_items) {
+            if (it.id == ctx.tau_star_base.id || it.w < ctx.tau_star_base.w) continue;
+            const Profit delta = it.p - static_cast<Profit>(it.w);
+            const Weight copies = it.w / ctx.tau_star_base.w;
+            if (copies <= 0) continue;
+            const __int128 den = static_cast<__int128>(copies) * ctx.delta1;
+            if (static_cast<__int128>(delta) * alpha_den >
+                static_cast<__int128>(alpha_num) * den) {
+                alpha_num = delta;
+                alpha_den = floor_div(den, 1);
+                alpha_item_id = it.id;
+            }
+        }
+        ctx.alpha_num = alpha_num;
+        ctx.alpha_den = alpha_den;
+        ctx.alpha_item_id = alpha_item_id;
+    }
+    ctx.preferred = static_cast<__int128>(ctx.alpha_num) <= ctx.alpha_den
+        ? BoundType::V : BoundType::Both;
+    ctx.no_multiple_dominance = has_previous_subset && previous_no_multiple_dominance
+        ? true : has_no_multiple_dominance(ctx.items);
     for (const BoundType type : {BoundType::U3, BoundType::V, BoundType::TauStar,
                                  BoundType::BestItemStar}) {
         if (is_bound_certified(ctx, type))
             ctx.certified_types[ctx.certified_type_count++] = type;
     }
+}
+} // namespace
+
+BoundContext make_bound_context(const std::vector<Item>& items) {
+    BoundContext ctx;
+    populate_bound_context(ctx, items, false);
     return ctx;
+}
+
+void rebuild_bound_context_ratio_ordered(BoundContext& context,
+                                         const std::vector<Item>& ratio_ordered_items) {
+    populate_bound_context(context, ratio_ordered_items, true);
 }
 
 bool is_bound_applicable(const BoundContext& ctx, BoundType type) {

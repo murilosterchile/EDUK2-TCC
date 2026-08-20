@@ -40,14 +40,17 @@ struct BoundContext {
     // Exact q* values, independent of the residual capacity.
     Profit tau_star_q_star_num = 0;
     Weight tau_star_q_star_den = 1;
+    int tau_star_q_star_item_id = -1;
     Profit best_item_star_q_star_num = 0;
     Weight best_item_star_q_star_den = 1;
+    int best_item_star_q_star_item_id = -1;
     bool has_three = false;
     bool has_lightest_positive = false;
     bool tau_normalized = false;
     // alpha is kept as an exact non-negative rational alpha_num/alpha_den.
     Profit alpha_num = 0;
     Weight alpha_den = 1;
+    int alpha_item_id = -1;
     int psi = 1;
     Profit delta1 = 0;
     BoundType preferred = BoundType::Both;
@@ -59,6 +62,12 @@ struct BoundContext {
 };
 
 BoundContext make_bound_context(const std::vector<Item>& items);
+// Rebuilds an existing context for a monotonically shrinking residual subset,
+// retaining vector storage and cached witnesses that are still present.  The
+// caller guarantees exact better_ratio order; multiplying every profit by the
+// same positive psi preserves that order.
+void rebuild_bound_context_ratio_ordered(BoundContext& context,
+                                         const std::vector<Item>& ratio_ordered_items);
 BoundValue compute_u3(const BoundContext& ctx, Weight c);
 BoundValue compute_v(const BoundContext& ctx, Weight c);
 BoundValue compute_tau_star(const BoundContext& ctx, Weight c);

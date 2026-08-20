@@ -2,8 +2,9 @@
 
 #include "ukp/types.hpp"
 
+#include <algorithm>
 #include <cstddef>
-#include <functional>
+#include <limits>
 #include <vector>
 
 namespace ukp::faithful::detail {
@@ -40,22 +41,24 @@ public:
     // Processes ]ya, yb].  The visitor decides whether an accepted state may
     // expand; this leaves bounds and other solver policy outside the DP data
     // structure.  Returning false preserves the state but emits no successors.
+    template <typename ShouldExpand>
     SliceBuildResult process_slice(Weight ya, Weight yb, Weight compute_limit,
                                    const std::vector<Item>& items,
-                                   const std::function<bool(PointId)>& should_expand);
+                                   ShouldExpand&& should_expand);
 
     // PYAsUKP's Select.next_lightest + Init.introduce counterpart.  Items are
     // supplied in nondecreasing weight order.  At weight wi, an item is made
     // active only when pi strictly raises the envelope built without it and
     // the contextual predicate accepts it.  Its transitions from earlier
     // expandable states are then backfilled before the scan advances.
+    template <typename ShouldIntroduce, typename ShouldExpand>
     SliceBuildResult process_slice_incremental(
         Weight ya, Weight yb, Weight compute_limit,
         std::vector<Item>& active_items,
         const std::vector<Item>& items_by_weight,
         std::size_t& next_item,
-        const std::function<bool(const Item&, Profit)>& should_introduce,
-        const std::function<bool(PointId)>& should_expand);
+        ShouldIntroduce&& should_introduce,
+        ShouldExpand&& should_expand);
 
     // Establishes PYAsUKP's ratio-order tie priority independently of the
     // order in which weight-selected items become active.
@@ -78,8 +81,10 @@ private:
     };
 
     // All successors of the weight currently being visited are at most the
-    // largest item weight ahead.  A circular window of that width therefore
-    // retains every pending candidate without a capacity-sized table.
+    // largest item weight ahead.  A circular window of at least that width
+    // therefore retains every pending candidate without a capacity-sized
+    // table.  Power-of-two growth makes indexing a mask operation and
+    // amortizes the cost of introducing successively heavier items.
     class ComputedWindow {
     public:
         void configure(Weight largest_item_weight);
@@ -92,13 +97,13 @@ private:
         struct Slot {
             Candidate candidate{};
             Weight weight = -1;
-            bool occupied = false;
         };
 
         [[nodiscard]] std::size_t index(Weight weight) const;
 
         std::vector<Slot> slots_;
         Weight largest_item_weight_ = 0;
+        std::size_t index_mask_ = 0;
     };
 
     void schedule_successors(PointId parent, Weight compute_limit,
@@ -115,5 +120,122 @@ private:
     bool root_processed_ = false;
     long long generated_candidates_ = 0;
 };
+
+template <typename ShouldExpand>
+SliceBuildResult CriticalSequence::process_slice(
+    Weight ya, Weight yb, Weight compute_limit, const std::vector<Item>& items,
+    ShouldExpand&& should_expand) {
+    SliceBuildResult result;
+    if (yb < ya || compute_limit < 0) return result;
+
+    reserve_storage(compute_limit, items);
+
+    if (!root_processed_ && ya == 0) {
+        root_processed_ = true;
+        ++result.states_entered;
+        if (should_expand(0)) {
+            expandable_points_.push_back(0);
+            schedule_successors(0, compute_limit, items, result);
+        }
+    }
+
+    // Scan the slice in weight order.  Newly accepted states can enqueue a
+    // later position in this same slice, closing it transitively.
+    const Weight first_weight = ya == std::numeric_limits<Weight>::max() ? ya : ya + 1;
+    for (Weight weight = first_weight;; ++weight) {
+        if (pending_.contains(weight)) {
+            const Candidate candidate = pending_.take(weight);
+
+            const Profit previous_profit = state(skip_points_.back()).profit;
+            if (candidate.profit > previous_profit) {
+                states_.push_back(
+                    State{weight, candidate.profit, candidate.predecessor, candidate.item_id});
+                const PointId id = states_.size() - 1;
+                skip_points_.push_back(id);
+                ++result.states_created;
+                ++result.states_entered;
+                if (should_expand(id)) {
+                    expandable_points_.push_back(id);
+                    schedule_successors(id, compute_limit, items, result);
+                }
+            }
+        }
+        if (weight == yb) break;
+    }
+    return result;
+}
+
+template <typename ShouldIntroduce, typename ShouldExpand>
+SliceBuildResult CriticalSequence::process_slice_incremental(
+    Weight ya, Weight yb, Weight compute_limit, std::vector<Item>& active_items,
+    const std::vector<Item>& items_by_weight, std::size_t& next_item,
+    ShouldIntroduce&& should_introduce, ShouldExpand&& should_expand) {
+    SliceBuildResult result;
+    if (yb < ya || compute_limit < 0) return result;
+
+    reserve_storage(compute_limit, active_items);
+    if (!root_processed_ && ya == 0) {
+        root_processed_ = true;
+        ++result.states_entered;
+        if (should_expand(0)) {
+            expandable_points_.push_back(0);
+            schedule_successors(0, compute_limit, active_items, result);
+        }
+    }
+
+    const Weight first_weight = ya == std::numeric_limits<Weight>::max() ? ya : ya + 1;
+    for (Weight weight = first_weight;; ++weight) {
+        Candidate selected{};
+        bool has_selected = false;
+        const Profit previous_profit = state(skip_points_.back()).profit;
+        Profit envelope = previous_profit;
+
+        if (pending_.contains(weight)) {
+            selected = pending_.take(weight);
+            has_selected = true;
+            envelope = std::max(envelope, selected.profit);
+        }
+
+        while (next_item < items_by_weight.size() && items_by_weight[next_item].w == weight) {
+            const Item& item = items_by_weight[next_item++];
+            ++result.items_considered_for_introduction;
+            if (item.p <= envelope) {
+                ++result.items_rejected_by_envelope;
+                continue;
+            }
+            if (!should_introduce(item, envelope)) {
+                ++result.items_rejected_by_bound;
+                continue;
+            }
+
+            backfill_item(item, compute_limit, result);
+            const auto position = std::lower_bound(
+                active_items.begin(), active_items.end(), item,
+                [](const Item& existing, const Item& value) {
+                    return better_ratio(existing, value);
+                });
+            active_items.insert(position, item);
+            selected = Candidate{item.p, 0, item.id, tie_rank(item, 0)};
+            has_selected = true;
+            envelope = item.p;
+            ++result.items_introduced;
+        }
+
+        if (has_selected && selected.profit > previous_profit) {
+            states_.push_back(
+                State{weight, selected.profit, selected.predecessor, selected.item_id});
+            const PointId id = states_.size() - 1;
+            skip_points_.push_back(id);
+            ++result.states_created;
+            ++result.states_entered;
+            if (should_expand(id)) {
+                expandable_points_.push_back(id);
+                schedule_successors(id, compute_limit, active_items, result);
+            }
+        }
+        if (weight == yb) break;
+    }
+    return result;
+}
 
 }  // namespace ukp::faithful::detail

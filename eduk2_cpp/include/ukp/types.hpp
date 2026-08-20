@@ -131,28 +131,32 @@ inline bool better_ratio(const Item& a, const Item& b) {
 
 inline Profit floor_mul_div(Weight a, Profit b, Weight d) {
     if (d <= 0) throw std::invalid_argument("division by non-positive weight");
-    __int128 x = static_cast<__int128>(a) * b;
-    if (x > std::numeric_limits<Profit>::max()) {
+    Profit product = 0;
+    if (__builtin_mul_overflow(a, b, &product)) {
+        if ((a < 0) != (b < 0)) {
+            throw std::overflow_error("profit underflow in floor_mul_div");
+        }
         throw std::overflow_error("profit overflow in floor_mul_div");
     }
-    if (x < std::numeric_limits<Profit>::min()) {
-        throw std::overflow_error("profit underflow in floor_mul_div");
-    }
-    return static_cast<Profit>(x / d);
+    return product / d;
 }
 
 inline Profit safe_add(Profit a, Profit b) {
-    __int128 x = static_cast<__int128>(a) + b;
-    if (x > std::numeric_limits<Profit>::max()) throw std::overflow_error("profit overflow");
-    if (x < std::numeric_limits<Profit>::min()) throw std::overflow_error("profit underflow");
-    return static_cast<Profit>(x);
+    Profit result = 0;
+    if (__builtin_add_overflow(a, b, &result)) {
+        if (b < 0) throw std::overflow_error("profit underflow");
+        throw std::overflow_error("profit overflow");
+    }
+    return result;
 }
 
 inline Profit safe_mul(long long a, Profit b) {
-    __int128 x = static_cast<__int128>(a) * b;
-    if (x > std::numeric_limits<Profit>::max()) throw std::overflow_error("profit overflow");
-    if (x < std::numeric_limits<Profit>::min()) throw std::overflow_error("profit underflow");
-    return static_cast<Profit>(x);
+    Profit result = 0;
+    if (__builtin_mul_overflow(a, b, &result)) {
+        if ((a < 0) != (b < 0)) throw std::overflow_error("profit underflow");
+        throw std::overflow_error("profit overflow");
+    }
+    return result;
 }
 
 }  // namespace ukp

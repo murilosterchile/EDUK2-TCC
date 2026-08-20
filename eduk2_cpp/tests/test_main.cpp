@@ -4,11 +4,14 @@
 #include "ukp/generator.hpp"
 #include "ukp/io.hpp"
 #include "ukp/verify.hpp"
-#include "../src/faithful/preprocessing.hpp"
 #include "../src/faithful/critical_sequence.hpp"
+#include "../src/faithful/incumbent.hpp"
+#include "../src/faithful/preprocessing.hpp"
 
 #include <filesystem>
 #include <iostream>
+#include <limits>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -21,6 +24,82 @@ constexpr Weight kDenseCapacityLimit = 20'000;
 
 void require(bool condition, const std::string& message) {
     if (!condition) throw std::runtime_error(message);
+}
+
+template <typename Operation>
+void require_overflow(Operation&& operation, const std::string& message) {
+    try {
+        operation();
+    } catch (const std::overflow_error&) {
+        return;
+    }
+    throw std::runtime_error(message);
+}
+
+void check_safe_arithmetic() {
+    constexpr auto maximum = std::numeric_limits<long long>::max();
+    constexpr auto minimum = std::numeric_limits<long long>::min();
+    require(safe_add(17, 25) == 42 && safe_mul(6, 7) == 42 &&
+                floor_mul_div(6, 7, 5) == 8,
+            "safe arithmetic changed an in-range result");
+    require_overflow([&] { static_cast<void>(safe_add(maximum, 1)); },
+                     "safe_add did not detect overflow");
+    require_overflow([&] { static_cast<void>(safe_add(minimum, -1)); },
+                     "safe_add did not detect underflow");
+    require_overflow([&] { static_cast<void>(safe_mul(maximum, 2)); },
+                     "safe_mul did not detect overflow");
+    require_overflow([&] { static_cast<void>(floor_mul_div(maximum, 2, 2)); },
+                     "floor_mul_div changed intermediate-overflow semantics");
+}
+
+void check_input_parser_compatibility() {
+    std::istringstream pyasukp{
+        "# header comment\n"
+        " n: +3 # fallback spelling\n"
+        "c: 17\n"
+        "begin data\n"
+        "4 5.4\n"
+        "+6 +7.5\n"
+        "malformed item\n"
+        "3 8.49 ignored trailing fields\n"
+        "end data\n"};
+    const Instance parsed_pyasukp = read_instance(pyasukp);
+    require(parsed_pyasukp.capacity == 17 && parsed_pyasukp.items.size() == 3,
+            "fast PYAsUKP parser changed the header");
+    require(parsed_pyasukp.items[0].id == 0 && parsed_pyasukp.items[0].w == 4 &&
+                parsed_pyasukp.items[0].p == 5 &&
+                parsed_pyasukp.items[1].id == 1 && parsed_pyasukp.items[1].w == 6 &&
+                parsed_pyasukp.items[1].p == 8 &&
+                parsed_pyasukp.items[2].id == 2 && parsed_pyasukp.items[2].w == 3 &&
+                parsed_pyasukp.items[2].p == 8,
+            "fast PYAsUKP parser changed item parsing or rounding");
+
+    std::istringstream legacy{
+        "2 +20 # n and capacity\n"
+        "+5 4\n"
+        "7 +3 ignored trailing text\n"};
+    const Instance parsed_legacy = read_instance(legacy);
+    require(parsed_legacy.capacity == 20 && parsed_legacy.items.size() == 2 &&
+                parsed_legacy.items[0].id == 0 && parsed_legacy.items[0].p == 5 &&
+                parsed_legacy.items[0].w == 4 && parsed_legacy.items[1].id == 1 &&
+                parsed_legacy.items[1].p == 7 && parsed_legacy.items[1].w == 3,
+            "fast legacy parser changed stream-compatible parsing");
+}
+
+void check_sparse_incumbent_updates() {
+    faithful::detail::Incumbent incumbent(6);
+    std::vector<long long> dense{0, 2, 0, 0, 3, 0};
+    require(incumbent.consider(10, 9, dense), "dense incumbent setup was rejected");
+
+    dense[1] = 0;
+    dense[4] = 0;
+    dense[2] = 5;
+    require(incumbent.consider_sparse(11, 10, dense, {2}),
+            "sparse incumbent improvement was rejected");
+    const Solution solution = incumbent.solution("test");
+    require(solution.profit == 11 && solution.weight == 10 &&
+                solution.multiplicity_by_id == dense,
+            "sparse incumbent retained stale multiplicities");
 }
 
 struct Configuration {
@@ -537,6 +616,68 @@ bool same_items(const std::vector<Item>& left, const std::vector<Item>& right) {
     return left.size() == right.size() && std::equal(left.begin(), left.end(), right.begin(), same_item);
 }
 
+void check_ratio_ordered_context_rebuild() {
+    std::vector<Item> ordered{{9, 8, 17}, {4, 3, 6}, {7, 11, 21},
+                              {1, 5, 9}, {3, 13, 22}, {6, 2, 3}};
+    std::sort(ordered.begin(), ordered.end(), better_ratio);
+    BoundContext persistent;
+    std::vector<Item> residual = ordered;
+
+    for (std::size_t step = 0; !residual.empty(); ++step) {
+        const BoundContext expected = make_bound_context(residual);
+        rebuild_bound_context_ratio_ordered(persistent, residual);
+        require(same_items(persistent.items, expected.items) &&
+                    same_items(persistent.normalized_ratio_items,
+                               expected.normalized_ratio_items) &&
+                    persistent.psi == expected.psi &&
+                    persistent.tau_star_q_star_num == expected.tau_star_q_star_num &&
+                    persistent.tau_star_q_star_den == expected.tau_star_q_star_den &&
+                    persistent.tau_star_q_star_item_id == expected.tau_star_q_star_item_id &&
+                    persistent.best_item_star_q_star_num ==
+                        expected.best_item_star_q_star_num &&
+                    persistent.best_item_star_q_star_den ==
+                        expected.best_item_star_q_star_den &&
+                    persistent.best_item_star_q_star_item_id ==
+                        expected.best_item_star_q_star_item_id &&
+                    persistent.alpha_num == expected.alpha_num &&
+                    persistent.alpha_den == expected.alpha_den &&
+                    persistent.alpha_item_id == expected.alpha_item_id &&
+                    persistent.no_multiple_dominance == expected.no_multiple_dominance &&
+                    persistent.certified_type_count == expected.certified_type_count &&
+                    std::equal(persistent.certified_types.begin(),
+                               persistent.certified_types.begin() +
+                                   persistent.certified_type_count,
+                               expected.certified_types.begin()),
+                "persistent ratio-ordered context changed cached fields");
+        for (const Weight capacity : {Weight{0}, Weight{1}, Weight{17}, Weight{61}}) {
+            for (const BoundPolicy policy : {BoundPolicy::U3, BoundPolicy::V,
+                                              BoundPolicy::TauStar,
+                                              BoundPolicy::BestItemStar,
+                                              BoundPolicy::BestCertified}) {
+                const BoundValue actual = compute_bound(persistent, capacity, policy);
+                const BoundValue oracle = compute_bound(expected, capacity, policy);
+                require(actual.upper == oracle.upper && actual.lower == oracle.lower &&
+                            actual.type == oracle.type,
+                        "persistent ratio-ordered context changed a bound");
+            }
+        }
+
+        if (residual.size() == 1) break;
+        const std::array<int, 3> cached_witnesses{
+            persistent.tau_star_q_star_item_id,
+            persistent.best_item_star_q_star_item_id,
+            persistent.alpha_item_id};
+        const int witness = cached_witnesses[step % cached_witnesses.size()];
+        auto removal = std::find_if(residual.begin(), residual.end(), [&](const Item& item) {
+            return item.id == witness;
+        });
+        if (removal == residual.end()) {
+            removal = residual.begin() + static_cast<std::ptrdiff_t>(residual.size() / 2);
+        }
+        residual.erase(removal);
+    }
+}
+
 // Regression oracle for the pre-optimization selection: it intentionally
 // performs the old full ratio sort, while production selects the same prefix
 // in one pass.
@@ -874,6 +1015,9 @@ void check_exnsds12_incremental_regression() {
 
 int main() {
     try {
+        check_safe_arithmetic();
+        check_input_parser_compatibility();
+        check_sparse_incumbent_updates();
         check_greedy_completion_equivalence();
         check_article_examples();
         check_generated_families();
@@ -881,6 +1025,7 @@ int main() {
         check_faithful_extended_prefix_regression();
         check_exnsds12_incremental_regression();
         check_precomputed_q_star();
+        check_ratio_ordered_context_rebuild();
         check_linear_ratio_selection_equivalence();
         check_certified_bound_cache_and_policies();
         check_faithful_switches();
