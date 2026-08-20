@@ -57,6 +57,8 @@ int main(int argc, char** argv) {
     std::cout << "items_original " << res.stats.original_items << '\n';
     std::cout << "items_after_preprocess " << res.stats.after_preprocess_items << '\n';
     std::cout << "states_scanned " << res.stats.states_scanned << '\n';
+    std::cout << "successor_item_scans " << res.stats.successor_item_scans << '\n';
+    std::cout << "backfill_attempts " << res.stats.backfill_attempts << '\n';
     std::cout << "states_fathomed " << res.stats.states_fathomed << '\n';
     std::cout << "bound_calls " << res.stats.bound_calls << '\n';
     std::cout << "bb_nodes " << res.stats.bb_nodes << '\n';
@@ -72,6 +74,11 @@ int main(int argc, char** argv) {
     std::cout << "incumbent_improvements_bb " << res.stats.incumbent_improvements_bb << '\n';
     std::cout << "incumbent_improvements_dp " << res.stats.incumbent_improvements_dp << '\n';
     std::cout << "active_items_final " << res.stats.active_items_final << '\n';
+    std::cout << "items_considered_for_introduction "
+              << res.stats.items_considered_for_introduction << '\n';
+    std::cout << "items_introduced " << res.stats.items_introduced << '\n';
+    std::cout << "items_rejected_by_envelope " << res.stats.items_rejected_by_envelope << '\n';
+    std::cout << "items_rejected_by_bound " << res.stats.items_rejected_by_bound << '\n';
     std::cout << "bound_winner " << res.stats.bound_winner << '\n';
     std::cout << "paper_faithful_mode " << (opt.paper_faithful_mode ? 1 : 0) << '\n';
     std::cout << "global_bound_used " << res.stats.global_bound_used << '\n';
@@ -84,12 +91,19 @@ int main(int argc, char** argv) {
             std::cout << "slice begin=" << slice.begin << " end=" << slice.end
                       << " states_entered=" << slice.states_entered
                       << " successor_attempts=" << slice.successor_attempts
+                      << " successor_item_scans=" << slice.successor_item_scans
+                      << " backfill_attempts=" << slice.backfill_attempts
                       << " states_created=" << slice.states_created
                       << " states_kept=" << slice.states_kept
                       << " states_fathomed_by_bound=" << slice.states_fathomed_by_bound
                       << " items_removed_threshold=" << slice.items_removed_threshold
                       << " active_items_before=" << slice.active_items_before
                       << " active_items_after=" << slice.active_items_after
+                      << " items_considered_for_introduction="
+                      << slice.items_considered_for_introduction
+                      << " items_introduced=" << slice.items_introduced
+                      << " items_rejected_by_envelope=" << slice.items_rejected_by_envelope
+                      << " items_rejected_by_bound=" << slice.items_rejected_by_bound
                       << " contextual_bound_used=" << slice.contextual_bound_used << '\n';
         }
     }

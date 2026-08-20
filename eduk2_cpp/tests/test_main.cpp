@@ -64,13 +64,36 @@ void check_faithful(const Instance& instance, Profit oracle, const std::string& 
             require(!result.stats.slices.empty(), prefix + "DP telemetry has no slices");
             long long fathomed = 0;
             long long threshold = 0;
+            long long successor_item_scans = 0;
+            long long backfill_attempts = 0;
+            long long considered_for_introduction = 0;
+            long long introduced = 0;
+            long long rejected_by_envelope = 0;
+            long long rejected_by_bound = 0;
             for (const SliceStats& slice : result.stats.slices) {
                 require(slice.begin <= slice.end, prefix + "invalid slice range");
                 fathomed += slice.states_fathomed_by_bound;
                 threshold += slice.items_removed_threshold;
+                successor_item_scans += slice.successor_item_scans;
+                backfill_attempts += slice.backfill_attempts;
+                considered_for_introduction += slice.items_considered_for_introduction;
+                introduced += slice.items_introduced;
+                rejected_by_envelope += slice.items_rejected_by_envelope;
+                rejected_by_bound += slice.items_rejected_by_bound;
             }
             require(fathomed == result.stats.states_fathomed, prefix + "slice fathoming mismatch");
             require(threshold == result.stats.items_removed_threshold, prefix + "slice threshold mismatch");
+            require(successor_item_scans == result.stats.successor_item_scans,
+                    prefix + "slice item-scan mismatch");
+            require(backfill_attempts == result.stats.backfill_attempts,
+                    prefix + "slice backfill mismatch");
+            require(considered_for_introduction == result.stats.items_considered_for_introduction &&
+                        introduced == result.stats.items_introduced &&
+                        rejected_by_envelope == result.stats.items_rejected_by_envelope &&
+                        rejected_by_bound == result.stats.items_rejected_by_bound,
+                    prefix + "slice introduction mismatch");
+            require(considered_for_introduction == introduced + rejected_by_envelope + rejected_by_bound,
+                    prefix + "introduction decisions do not partition the candidates");
             require(result.stats.slices.back().active_items_after == result.stats.active_items_final,
                     prefix + "final active-item mismatch");
         }
@@ -159,6 +182,72 @@ void check_equal_profit_predecessor_order() {
             "equal-profit candidate was not retained");
     require(chosen.predecessor == 0 && chosen.item_id == 41,
             "equal-profit tie did not retain the first predecessor");
+}
+
+void check_incremental_item_introduction() {
+    const std::vector<Item> all_items{{10, 2, 3}, {11, 3, 5}, {12, 4, 6},
+                                      {13, 5, 9}, {14, 6, 10}};
+    std::vector<Item> ratio_order = all_items;
+    std::sort(ratio_order.begin(), ratio_order.end(), better_ratio);
+    std::vector<Item> weight_order = ratio_order;
+    std::stable_sort(weight_order.begin(), weight_order.end(), [](const Item& left, const Item& right) {
+        if (left.w != right.w) return left.w < right.w;
+        return better_ratio(left, right);
+    });
+
+    faithful::detail::CriticalSequence sequence;
+    sequence.configure_item_order(ratio_order);
+    std::vector<Item> active;
+    std::size_t next_item = 0;
+    faithful::detail::SliceBuildResult total;
+    constexpr Weight limit = 30;
+    for (Weight ya = 0; ya < limit; ya += 4) {
+        const auto part = sequence.process_slice_incremental(
+            ya, std::min(limit, ya + 4), limit, active, weight_order, next_item,
+            [](const Item&, Profit) { return true; },
+            [](faithful::detail::PointId) { return true; });
+        total.successor_attempts += part.successor_attempts;
+        total.backfill_attempts += part.backfill_attempts;
+        total.items_considered_for_introduction += part.items_considered_for_introduction;
+        total.items_introduced += part.items_introduced;
+        total.items_rejected_by_envelope += part.items_rejected_by_envelope;
+        total.items_rejected_by_bound += part.items_rejected_by_bound;
+    }
+
+    require(next_item == weight_order.size() && total.items_considered_for_introduction == 5,
+            "incremental selector did not visit every item");
+    require(total.items_introduced == 3 && total.items_rejected_by_envelope == 2 &&
+                total.items_rejected_by_bound == 0,
+            "incremental envelope accepted the wrong item set");
+    require(total.backfill_attempts > 0 && total.successor_attempts >= total.backfill_attempts,
+            "incremental introduction did not backfill prior states");
+    require(active.size() == 3 && active[0].id == 13 && active[1].id == 11 && active[2].id == 10,
+            "introduced items did not retain decreasing ratio order");
+
+    const Instance dense_instance{limit, all_items};
+    for (Weight capacity = 0; capacity <= limit; ++capacity) {
+        Instance prefix = dense_instance;
+        prefix.capacity = capacity;
+        require(sequence.value_at(capacity) == dense_dp_value(prefix),
+                "incremental sequence differs from dense DP");
+    }
+
+    // At weight five, A+B can be generated with either last item.  The later
+    // introduced, higher-ratio B must win independently of generation order.
+    const std::vector<Item> tie_ratio_order{{11, 3, 5}, {10, 2, 3}};
+    std::vector<Item> tie_weight_order{{10, 2, 3}, {11, 3, 5}};
+    faithful::detail::CriticalSequence tie_sequence;
+    tie_sequence.configure_item_order(tie_ratio_order);
+    std::vector<Item> tie_active;
+    std::size_t tie_next = 0;
+    tie_sequence.process_slice_incremental(
+        0, 5, 5, tie_active, tie_weight_order, tie_next,
+        [](const Item&, Profit) { return true; },
+        [](faithful::detail::PointId) { return true; });
+    const auto& tied = tie_sequence.state(tie_sequence.state_at_or_before(5));
+    require(tied.weight == 5 && tied.profit == 8 && tied.item_id == 11 &&
+                tie_sequence.state(tied.predecessor).weight == 2,
+            "incremental equal-profit tie did not retain ratio priority");
 }
 
 struct GreedyCompletion {
@@ -766,6 +855,21 @@ void check_faithful_extended_prefix_regression() {
             "extended-prefix regression: faithful selected the wrong solution");
 }
 
+void check_exnsds12_incremental_regression() {
+    const auto path = std::filesystem::path(UKP_SOURCE_DIR) / "data" / "exnsds12.ukp";
+    const Instance instance = read_instance_file(path.string());
+    const SolverResult result = faithful::Solver(SolverOptions{}).solve(instance);
+    require(verify_solution(instance, result.solution) && result.solution.profit == 3'793'952,
+            "exnsds12 incremental regression changed the optimum");
+    require(result.stats.items_considered_for_introduction == result.stats.after_preprocess_items,
+            "exnsds12 did not consider the full residual item set by weight");
+    require(result.stats.items_introduced <= 250 &&
+                result.stats.items_introduced * 10 < result.stats.after_preprocess_items,
+            "exnsds12 reactivated the eager full-item DP");
+    require(result.stats.successor_item_scans < 3'000'000,
+            "exnsds12 successor fan-out regressed");
+}
+
 }  // namespace
 
 int main() {
@@ -775,6 +879,7 @@ int main() {
         check_generated_families();
         check_pyasukp_corpus();
         check_faithful_extended_prefix_regression();
+        check_exnsds12_incremental_regression();
         check_precomputed_q_star();
         check_linear_ratio_selection_equivalence();
         check_certified_bound_cache_and_policies();
@@ -782,6 +887,7 @@ int main() {
         check_faithful_core_selection();
         check_skip_point_sequence();
         check_equal_profit_predecessor_order();
+        check_incremental_item_introduction();
         check_faithful_unordered_valid_ids();
         std::cout << "faithful correctness suite passed\n";
         return 0;

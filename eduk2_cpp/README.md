@@ -23,6 +23,22 @@ fixed 10,000-node limit.  B&B works on a local core copy; the DP keeps the
 global list unchanged.  Remainder ordering (`capacity % weight`) is only an
 experimental, non-faithful option.
 
+The sparse DP does not activate that complete global list at its root.  It
+traverses candidates by nondecreasing weight, reproducing PYAsUKP's
+`Select.next_lightest`/`Init.introduce` behavior: item `i` becomes active only
+when `p_i` strictly improves the envelope already known at `w_i` and it passes
+contextual bound dominance.  A newly accepted item is inserted in decreasing
+ratio order and backfilled from earlier expandable skip-points.  Threshold
+dominance subsequently removes it from the active recurrence when its last
+contribution expires.  The default slice height is PYAsUKP's executable
+default `max(100, w_min)`; an explicit `SolverOptions::slice_height` overrides
+it.
+
+`ukp_solve` reports `items_introduced`, envelope/bound rejection counts,
+`successor_item_scans`, and `backfill_attempts`.  These counters are guarded by
+the `exnsds12.ukp` regression test so an eager all-items recurrence is detected
+without relying on wall-clock timing.
+
 ## Build
 
 ```bash

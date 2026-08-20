@@ -40,12 +40,18 @@ struct SliceStats {
     Weight end = 0;
     long long states_entered = 0;
     long long successor_attempts = 0;
+    long long successor_item_scans = 0;
+    long long backfill_attempts = 0;
     long long states_created = 0;
     long long states_kept = 0;
     long long states_fathomed_by_bound = 0;
     long long items_removed_threshold = 0;
     long long active_items_before = 0;
     long long active_items_after = 0;
+    long long items_considered_for_introduction = 0;
+    long long items_introduced = 0;
+    long long items_rejected_by_envelope = 0;
+    long long items_rejected_by_bound = 0;
     std::string contextual_bound_used = "none";
 };
 
@@ -53,6 +59,8 @@ struct Stats {
     long long original_items = 0;
     long long after_preprocess_items = 0;
     long long states_scanned = 0;
+    long long successor_item_scans = 0;
+    long long backfill_attempts = 0;
     long long states_kept = 0;
     long long states_fathomed = 0;
     long long bound_calls = 0;
@@ -69,6 +77,10 @@ struct Stats {
     long long incumbent_improvements_bb = 0;
     long long incumbent_improvements_dp = 0;
     long long active_items_final = 0;
+    long long items_considered_for_introduction = 0;
+    long long items_introduced = 0;
+    long long items_rejected_by_envelope = 0;
+    long long items_rejected_by_bound = 0;
     long long estimated_state_bytes = 0;
     std::string bound_winner = "none";
     std::string global_bound_used = "none";
@@ -100,6 +112,7 @@ struct SolverOptions {
     // Experimental-only.  In paper_faithful_mode B&B always uses 10,000
     // nodes and this value is ignored.
     long long bb_node_limit = 10000;
+    // Zero uses PYAsUKP's executable default max(100, lightest weight).
     Weight slice_height = 0;
 };
 

@@ -5,6 +5,7 @@
 #include "preprocessing.hpp"
 #include "incumbent.hpp"
 #include <algorithm>
+#include <array>
 #include <iostream>
 #include <map>
 #include <numeric>
@@ -19,6 +20,21 @@ struct Cell {
     int last_item = -1;
     Weight prev_capacity = 0;
 };
+
+constexpr std::size_t bound_type_index(BoundType type) {
+    switch (type) {
+        case BoundType::U3: return 0;
+        case BoundType::V: return 1;
+        case BoundType::TauStar: return 2;
+        case BoundType::BestItemStar: return 3;
+        case BoundType::Both: return 4;
+    }
+    return 4;
+}
+
+constexpr std::array<BoundType, 5> kBoundTypes{
+    BoundType::U3, BoundType::V, BoundType::TauStar,
+    BoundType::BestItemStar, BoundType::Both};
 
 Profit run_core_bb_rec(const std::vector<Item>& core, Weight c, size_t k,
                        Profit cur_profit, Weight cur_weight,
@@ -46,7 +62,7 @@ Profit run_core_bb_rec(const std::vector<Item>& core, Weight c, size_t k,
                                     long long node_limit, long long& nodes) {
     std::sort(items.begin(), items.end(), better_ratio);
     const int default_core_size = std::min<int>(static_cast<int>(items.size()),
-                                                std::max(500, static_cast<int>(items.size() / 100)));
+                                                std::max(100, static_cast<int>(items.size() / 100)));
     int core_size = requested_core > 0 ? requested_core : default_core_size;
     core_size = std::max(1, std::min<int>(core_size, static_cast<int>(items.size())));
     items.resize(static_cast<size_t>(core_size));
@@ -228,7 +244,7 @@ CoreSearchResult traverse_core(const std::vector<Item>& dp_items, const BoundCon
         // The faithful core is exactly its prefix: no local ordering or
         // filtering is permitted on this path.
         const std::size_t n = dp_items.size();
-        const std::size_t core_size = std::min(n, std::max<std::size_t>(500, n / 100));
+        const std::size_t core_size = std::min(n, std::max<std::size_t>(100, n / 100));
         core_items.assign(dp_items.begin(), dp_items.begin() + core_size);
     } else {
         core_items = dp_items;
@@ -416,33 +432,67 @@ SolverResult Solver::solve(const Instance& inst) {
         }
     }
 
-    // The DP may maintain a changing active set for its recurrence, but it
-    // starts from the unchanged global list selected above.
-    items = dp_items;
+    // Select.next_lightest traverses the residual items by nondecreasing
+    // weight.  Equal-weight candidates retain the ratio/id order already
+    // prescribed by better_ratio, so an inferior duplicate is never made
+    // active before its dominating peer.
+    std::vector<Item> items_by_weight;
+    items_by_weight.reserve(dp_items.size());
+    for (const Item& item : dp_items) {
+        if (item.w <= inst.capacity) items_by_weight.push_back(item);
+    }
+    std::stable_sort(items_by_weight.begin(), items_by_weight.end(),
+        [](const Item& left, const Item& right) {
+            if (left.w != right.w) return left.w < right.w;
+            return better_ratio(left, right);
+        });
+    std::size_t next_item = 0;
+
+    // `items` now has the same role as PYAsUKP's decreasingS: it contains
+    // only introduced, threshold-undominated items and stays ratio ordered.
+    items.clear();
 
     // The sequence is the DP representation: it stores only strict increases
     // of f(N, y), in topological weight order.
     detail::CriticalSequence sequence;
+    sequence.configure_item_order(dp_items);
     std::unordered_map<int, Weight> last_contribution;
-    Weight wmin = std::min_element(items.begin(), items.end(),
-        [](const Item& a, const Item& b) { return a.w < b.w; })->w;
-    Weight h = options_.slice_height > 0 ? options_.slice_height : wmin;
+    const Weight wmin = items_by_weight.empty() ? Weight{1} : items_by_weight.front().w;
+    // PYAsUKP's executable defaults layer_height to 100 and then takes the
+    // maximum with the lightest weight during reduction.
+    Weight h = options_.slice_height > 0 ? options_.slice_height : std::max<Weight>(100, wmin);
     if (h <= 0) h = 1;
     const Weight half_capacity = (inst.capacity + 1) / 2;
-    // EDUK2 first computes through c/2, then extends the recurrence once by
-    // the largest item still active after threshold dominance.  Candidates
-    // must nevertheless be retained up to c before that extension is known.
+    const Weight introduction_limit = items_by_weight.empty() ? Weight{0} : items_by_weight.back().w;
+    // EDUK first finishes its reduction through the heaviest candidate item;
+    // EDUK2 then reaches c/2 and extends once by the heaviest item that
+    // survived threshold dominance.
+    const Weight initial_process_limit = std::max(half_capacity, introduction_limit);
     const Weight candidate_limit = inst.capacity;
-    Weight process_limit = half_capacity;
+    Weight process_limit = initial_process_limit;
     bool half_capacity_extension_done = false;
     bool closed_by_bound = false;
+    std::array<long long, kBoundTypes.size()> contextual_bound_counts{};
+    auto record_contextual_bound = [&](BoundType type, SliceStats& slice) {
+        ++contextual_bound_counts[bound_type_index(type)];
+        const char* name = bound_type_name(type);
+        if (slice.contextual_bound_used != name) slice.contextual_bound_used = name;
+    };
+    auto publish_contextual_bound_counts = [&]() {
+        for (std::size_t index = 0; index < kBoundTypes.size(); ++index) {
+            if (contextual_bound_counts[index] != 0) {
+                result.stats.contextual_bound_calls[bound_type_name(kBoundTypes[index])] =
+                    contextual_bound_counts[index];
+            }
+        }
+    };
 
     // Most greedy completions do not improve the incumbent.  Keep one
     // reconstruction buffer for the rare candidates that do, and remember the
     // positions written so clearing it does not become another O(n) pass.
     std::vector<long long> reconstruction_multiplicity;
     std::vector<int> reconstruction_touched_ids;
-    reconstruction_touched_ids.reserve(items.size());
+    reconstruction_touched_ids.reserve(dp_items.size());
 
     // Greedy completion retains the active-item order.  This suffix minimum
     // only lets it stop once no remaining item can fit; it never changes
@@ -450,6 +500,7 @@ SolverResult Solver::solve(const Instance& inst) {
     std::vector<Weight> active_suffix_min_weight;
     auto rebuild_active_suffix_min_weight = [&]() {
         active_suffix_min_weight.resize(items.size());
+        if (items.empty()) return;
         Weight minimum_weight = items.back().w;
         for (std::size_t index = items.size(); index-- > 0;) {
             minimum_weight = std::min(minimum_weight, items[index].w);
@@ -458,7 +509,14 @@ SolverResult Solver::solve(const Instance& inst) {
     };
     rebuild_active_suffix_min_weight();
 
+    auto ensure_active_suffix_min_weight = [&]() {
+        if (active_suffix_min_weight.size() != items.size()) {
+            rebuild_active_suffix_min_weight();
+        }
+    };
+
     auto consider_greedy_completion = [&](detail::PointId state_index) {
+        ensure_active_suffix_min_weight();
         const detail::State& state = sequence.state(state_index);
         Weight used_weight = state.weight;
         Weight remaining = inst.capacity - used_weight;
@@ -529,15 +587,26 @@ SolverResult Solver::solve(const Instance& inst) {
         slice.begin = ya;
         slice.end = yb;
         slice.active_items_before = static_cast<long long>(items.size());
-        const detail::SliceBuildResult build = sequence.process_slice(
-            ya, yb, candidate_limit, items, [&](detail::PointId state_index) {
+        const detail::SliceBuildResult build = sequence.process_slice_incremental(
+            ya, yb, candidate_limit, items, items_by_weight, next_item,
+            [&](const Item& item, Profit) {
+                if (options_.use_bounds) {
+                    const BoundValue residual = compute_bound(
+                        ctx, inst.capacity - item.w, options_.bound_policy);
+                    ++result.stats.bound_calls;
+                    record_contextual_bound(residual.type, slice);
+                    if (safe_add(item.p, residual.upper) <= incumbent) return false;
+                }
+                last_contribution[item.id] = item.w;
+                return true;
+            },
+            [&](detail::PointId state_index) {
             const detail::State& state = sequence.state(state_index);
             ++slice.states_entered;
             if (options_.use_bounds) {
                 const BoundValue residual = compute_bound(ctx, inst.capacity - state.weight, options_.bound_policy);
                 ++result.stats.bound_calls;
-                ++result.stats.contextual_bound_calls[bound_type_name(residual.type)];
-                slice.contextual_bound_used = bound_type_name(residual.type);
+                record_contextual_bound(residual.type, slice);
                 if (safe_add(state.profit, residual.upper) <= incumbent) {
                     ++result.stats.states_fathomed;
                     ++slice.states_fathomed_by_bound;
@@ -554,12 +623,24 @@ SolverResult Solver::solve(const Instance& inst) {
             return true;
         });
         result.stats.states_scanned += build.successor_attempts;
+        result.stats.successor_item_scans += build.successor_item_scans;
+        result.stats.backfill_attempts += build.backfill_attempts;
+        result.stats.items_considered_for_introduction += build.items_considered_for_introduction;
+        result.stats.items_introduced += build.items_introduced;
+        result.stats.items_rejected_by_envelope += build.items_rejected_by_envelope;
+        result.stats.items_rejected_by_bound += build.items_rejected_by_bound;
         slice.successor_attempts += build.successor_attempts;
+        slice.successor_item_scans += build.successor_item_scans;
+        slice.backfill_attempts += build.backfill_attempts;
         slice.states_created += build.states_created;
+        slice.items_considered_for_introduction += build.items_considered_for_introduction;
+        slice.items_introduced += build.items_introduced;
+        slice.items_rejected_by_envelope += build.items_rejected_by_envelope;
+        slice.items_rejected_by_bound += build.items_rejected_by_bound;
         result.stats.points_generated += build.points_generated;
         if (options_.use_bounds && incumbent >= global_bound.upper) {
             closed_by_bound = true;
-            slice.active_items_after = slice.active_items_before;
+            slice.active_items_after = static_cast<long long>(items.size());
             result.stats.slices.push_back(std::move(slice));
             break;
         }
@@ -567,18 +648,17 @@ SolverResult Solver::solve(const Instance& inst) {
         // Dynamic threshold dominance from EDUK/PYAsUKP:
         // last_contribution(i) + w_i <= yb.  Run it only at a completed
         // slice, and keep one item so the active recurrence is never empty.
-        const Weight introduced_through = std::max_element(items.begin(), items.end(),
-            [](const Item& left, const Item& right) { return left.w < right.w; })->w;
-        if (yb < introduced_through) {
-            slice.active_items_after = slice.active_items_before;
-            result.stats.slices.push_back(std::move(slice));
-        } else {
+        if (!items.empty()) {
             std::vector<Item> next_items;
             next_items.reserve(items.size());
             std::size_t remaining_active = items.size();
             for (const Item& item : items) {
+                const auto contribution = last_contribution.find(item.id);
+                if (contribution == last_contribution.end()) {
+                    throw std::logic_error("active item has no introduction contribution");
+                }
                 if (remaining_active > 1 &&
-                    safe_add(last_contribution[item.id], item.w) <= yb) {
+                    safe_add(contribution->second, item.w) <= yb) {
                     --remaining_active;
                     ++result.stats.items_removed_threshold;
                     ++slice.items_removed_threshold;
@@ -586,20 +666,32 @@ SolverResult Solver::solve(const Instance& inst) {
                     next_items.push_back(item);
                 }
             }
-            // Threshold removal changes the actual residual instance. Rebuild
-            // so q* certification and BestCertified selection stay current.
+            // Threshold removal changes the active recurrence.  Rebuild the
+            // greedy suffix now; the valid residual bound context is rebuilt
+            // below together with the not-yet-introduced candidates.
             if (next_items.size() != items.size()) {
                 items = std::move(next_items);
-                ctx = make_bound_context(items);
                 rebuild_active_suffix_min_weight();
             }
-            slice.active_items_after = static_cast<long long>(items.size());
-            result.stats.slices.push_back(std::move(slice));
         }
+        if (build.items_considered_for_introduction > 0 || slice.items_removed_threshold > 0) {
+            // Remove collectively/context/threshold dominated items from the
+            // bound instance, but retain every item whose introduction weight
+            // has not been reached yet.  This keeps the bound valid while it
+            // tightens monotonically toward the active residual problem.
+            std::vector<Item> residual_items = items;
+            residual_items.insert(residual_items.end(),
+                                  items_by_weight.begin() + static_cast<std::ptrdiff_t>(next_item),
+                                  items_by_weight.end());
+            if (!residual_items.empty()) ctx = make_bound_context(residual_items);
+        }
+        slice.active_items_after = static_cast<long long>(items.size());
+        result.stats.slices.push_back(std::move(slice));
         const std::size_t active_count = items.size();
-        if (!half_capacity_extension_done && yb >= half_capacity) {
-            const Weight active_wmax = std::max_element(items.begin(), items.end(),
-                [](const Item& left, const Item& right) { return left.w < right.w; })->w;
+        if (!half_capacity_extension_done && yb >= initial_process_limit) {
+            const Weight active_wmax = items.empty() ? Weight{0} :
+                std::max_element(items.begin(), items.end(),
+                    [](const Item& left, const Item& right) { return left.w < right.w; })->w;
             process_limit = std::min(inst.capacity, safe_add(yb, active_wmax));
             half_capacity_extension_done = true;
         }
@@ -624,6 +716,7 @@ SolverResult Solver::solve(const Instance& inst) {
     }
 
     if (split_profit <= incumbent_solution.profit) {
+        publish_contextual_bound_counts();
         result.solution = incumbent_solution.solution("faithful");
         result.stats.estimated_state_bytes = static_cast<long long>(sequence.estimated_bytes());
         const std::size_t active_count = items.size();
@@ -676,6 +769,7 @@ SolverResult Solver::solve(const Instance& inst) {
     add_trace(second_index);
 
     result.solution = std::move(sol);
+    publish_contextual_bound_counts();
     result.stats.estimated_state_bytes = static_cast<long long>(sequence.estimated_bytes());
     const std::size_t active_count = items.size();
     result.stats.active_items_final = static_cast<long long>(active_count);
