@@ -143,10 +143,62 @@ long long CriticalSequence::computed_window_index_collisions() const noexcept {
 std::size_t CriticalSequence::estimated_bytes() const noexcept {
     return states_.size() * sizeof(State) + pending_.estimated_bytes() +
            expandable_points_.capacity() * sizeof(PointId) +
+           retired_items_.capacity() * sizeof(ActiveItem) +
+           item_cursors_.capacity() * sizeof(ItemCursor) +
            item_tie_rank_by_id_.capacity() * sizeof(int);
 }
 
+std::size_t CriticalSequence::unprocessed_historical_states(
+    const ActiveItem& item, Weight target_limit) const {
+    const ItemCursor& cursor_state = cursor_for(item);
+    if (target_limit < item.w) return 0;
+    const std::size_t represented_end = std::min(cursor_state.built_upon_end,
+                                                 expandable_points_.size());
+    const Weight maximum_parent_weight = target_limit - item.w;
+    const auto eligible_end_position = std::upper_bound(
+        expandable_points_.begin(),
+        expandable_points_.begin() + static_cast<std::ptrdiff_t>(represented_end),
+        maximum_parent_weight,
+        [this](Weight maximum, PointId point) {
+            return maximum < states_[point].weight;
+        });
+    const std::size_t eligible_end = static_cast<std::size_t>(
+        eligible_end_position - expandable_points_.begin());
+    const std::size_t cursor = std::min(cursor_state.next_built_upon, eligible_end);
+    return eligible_end - cursor;
+}
+
+long long CriticalSequence::item_backfill_attempts(
+    const ActiveItem& item) const {
+    return cursor_for(item).backfill_attempts;
+}
+
+bool CriticalSequence::item_was_introduced(const ActiveItem& item) const {
+    return cursor_for(item).introduced;
+}
+
+void CriticalSequence::retire_item(ActiveItem item, Weight target_limit) {
+    ItemCursor& cursor_state = cursor_for(item);
+    if (target_limit < item.w) {
+        cursor_state.built_upon_end = 0;
+    } else {
+        const Weight maximum_parent_weight = target_limit - item.w;
+        const auto position = std::upper_bound(
+            expandable_points_.begin(), expandable_points_.end(),
+            maximum_parent_weight,
+            [this](Weight maximum, PointId point) {
+                return maximum < states_[point].weight;
+            });
+        cursor_state.built_upon_end = static_cast<std::size_t>(
+            position - expandable_points_.begin());
+    }
+    if (cursor_state.next_built_upon < cursor_state.built_upon_end) {
+        retired_items_.push_back(item);
+    }
+}
+
 void CriticalSequence::configure_item_order(const std::vector<Item>& ratio_ordered_items) {
+    item_cursors_.assign(ratio_ordered_items.size(), ItemCursor{});
     int maximum_id = -1;
     for (const Item& item : ratio_ordered_items) maximum_id = std::max(maximum_id, item.id);
     if (maximum_id < 0 ||
@@ -161,6 +213,33 @@ void CriticalSequence::configure_item_order(const std::vector<Item>& ratio_order
             item_tie_rank_by_id_[static_cast<std::size_t>(id)] = static_cast<int>(rank);
         }
     }
+}
+
+CriticalSequence::ItemCursor& CriticalSequence::cursor_for(const ActiveItem& item) {
+    if (item.tie_rank < 0 ||
+        static_cast<std::size_t>(item.tie_rank) >= item_cursors_.size()) {
+        throw std::logic_error("active item tie rank is outside cursor table");
+    }
+    return item_cursors_[static_cast<std::size_t>(item.tie_rank)];
+}
+
+const CriticalSequence::ItemCursor& CriticalSequence::cursor_for(
+    const ActiveItem& item) const {
+    if (item.tie_rank < 0 ||
+        static_cast<std::size_t>(item.tie_rank) >= item_cursors_.size()) {
+        throw std::logic_error("active item tie rank is outside cursor table");
+    }
+    return item_cursors_[static_cast<std::size_t>(item.tie_rank)];
+}
+
+void CriticalSequence::initialize_item_cursor(const ActiveItem& item) {
+    pending_.configure(item.w);
+    ItemCursor& cursor_state = cursor_for(item);
+    cursor_state.next_built_upon = std::min<std::size_t>(1, expandable_points_.size());
+    cursor_state.historical_end = expandable_points_.size();
+    cursor_state.built_upon_end = std::numeric_limits<std::size_t>::max();
+    cursor_state.backfill_attempts = 0;
+    cursor_state.introduced = true;
 }
 
 int CriticalSequence::tie_rank(const Item& item, std::size_t fallback) const noexcept {
@@ -232,47 +311,100 @@ void CriticalSequence::schedule_successors(PointId parent, Weight compute_limit,
     result.points_generated += generated;
 }
 
-void CriticalSequence::schedule_active_successors(
-    PointId parent, Weight compute_limit, const std::vector<ActiveItem>& items,
-    SliceBuildResult& result) {
-    const State& base = state(parent);
-    const Weight remaining_capacity = compute_limit - base.weight;
-    long long generated = 0;
+void CriticalSequence::sample_active_items(const std::vector<ActiveItem>& items,
+                                           SliceBuildResult& result) {
     ++result.active_item_samples;
     result.active_items_sum += static_cast<long long>(items.size());
     result.active_items_max = std::max(
         result.active_items_max, static_cast<long long>(items.size()));
-    result.successor_item_scans += static_cast<long long>(items.size());
-    for (const ActiveItem& item : items) {
-        if (item.w > remaining_capacity) continue;
-        const Weight weight = base.weight + item.w;
-        ++generated;
-        pending_.store(weight, Candidate{
-            safe_add(base.profit, item.p), parent, item.id, item.tie_rank});
-    }
-    generated_candidates_ += generated;
-    result.successor_attempts += generated;
-    result.points_generated += generated;
 }
 
-void CriticalSequence::backfill_item(const ActiveItem& item, Weight compute_limit,
-                                     SliceBuildResult& result) {
-    pending_.configure(item.w);
-    const int rank = item.tie_rank;
-    // The direct root + item transition is installed at the introduction
-    // weight itself.  Backfill starts at the first positive state, matching
-    // Init.introduce's next_built_upon = (0,1).
-    for (const PointId parent : expandable_points_) {
-        if (parent == 0) continue;
-        const State& base = state(parent);
+void CriticalSequence::advance_item_cursor(const ActiveItem& item, Weight target_limit,
+                                           SliceBuildResult& result) {
+    ItemCursor& cursor_state = cursor_for(item);
+    if (target_limit < item.w) return;
+    const Weight maximum_parent_weight = target_limit - item.w;
+    const std::size_t available_end = std::min(cursor_state.built_upon_end,
+                                               expandable_points_.size());
+    while (cursor_state.next_built_upon < available_end) {
+        const std::size_t cursor = cursor_state.next_built_upon;
+        const PointId parent = expandable_points_[cursor];
+        const State& base = states_[parent];
+        if (base.weight > maximum_parent_weight) break;
+
+        ++cursor_state.next_built_upon;
+        ++result.cursor_advances;
         ++result.successor_item_scans;
-        if (item.w > compute_limit - base.weight) continue;
         const Weight weight = base.weight + item.w;
         ++generated_candidates_;
         ++result.successor_attempts;
-        ++result.backfill_attempts;
         ++result.points_generated;
-        pending_.store(weight, Candidate{safe_add(base.profit, item.p), parent, item.id, rank});
+        if (cursor < cursor_state.historical_end) {
+            ++cursor_state.backfill_attempts;
+            ++result.backfill_attempts;
+        }
+        pending_.store(weight, Candidate{
+            safe_add(base.profit, item.p), parent, item.id, item.tie_rank});
+    }
+}
+
+void CriticalSequence::advance_active_cursors(const std::vector<ActiveItem>& items,
+                                              Weight target_limit,
+                                              SliceBuildResult& result) {
+    // decreasingS/active_items order is the immutable ratio tie priority.
+    for (const ActiveItem& item : items) {
+        advance_item_cursor(item, target_limit, result);
+    }
+}
+
+void CriticalSequence::advance_retired_cursors(Weight target_limit,
+                                               SliceBuildResult& result) {
+    std::size_t kept = 0;
+    for (std::size_t index = 0; index < retired_items_.size(); ++index) {
+        ActiveItem item = retired_items_[index];
+        advance_item_cursor(item, target_limit, result);
+        const ItemCursor& cursor_state = cursor_for(item);
+        if (cursor_state.next_built_upon < cursor_state.built_upon_end) {
+            retired_items_[kept++] = item;
+        }
+    }
+    retired_items_.resize(kept);
+}
+
+void CriticalSequence::schedule_current_active_successors(
+    PointId parent, Weight target_limit, const std::vector<ActiveItem>& items,
+    SliceBuildResult& result) {
+    sample_active_items(items, result);
+    const State& base = states_[parent];
+    if (base.weight > target_limit) return;
+    const Weight remaining = target_limit - base.weight;
+    for (const ActiveItem& item : items) {
+        if (item.w > remaining) continue;
+        ++result.cursor_advances;
+        ++result.successor_item_scans;
+        ++generated_candidates_;
+        ++result.successor_attempts;
+        ++result.points_generated;
+        pending_.store(base.weight + item.w, Candidate{
+            safe_add(base.profit, item.p), parent, item.id, item.tie_rank});
+    }
+}
+
+void CriticalSequence::synchronize_active_cursors(
+    const std::vector<ActiveItem>& items, Weight target_limit) {
+    for (const ActiveItem& item : items) {
+        ItemCursor& cursor_state = cursor_for(item);
+        if (target_limit < item.w) continue;
+        const Weight maximum_parent_weight = target_limit - item.w;
+        const auto first = expandable_points_.begin() +
+            static_cast<std::ptrdiff_t>(cursor_state.next_built_upon);
+        const auto position = std::upper_bound(
+            first, expandable_points_.end(), maximum_parent_weight,
+            [this](Weight maximum, PointId point) {
+                return maximum < states_[point].weight;
+            });
+        cursor_state.next_built_upon = static_cast<std::size_t>(
+            position - expandable_points_.begin());
     }
 }
 

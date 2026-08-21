@@ -36,6 +36,7 @@ struct SliceBuildResult {
     long long successor_attempts = 0;
     long long successor_item_scans = 0;
     long long backfill_attempts = 0;
+    long long cursor_advances = 0;
     long long states_created = 0;
     long long points_generated = 0;
     long long items_considered_for_introduction = 0;
@@ -91,6 +92,12 @@ public:
     [[nodiscard]] long long computed_window_rejections() const noexcept;
     [[nodiscard]] long long computed_window_index_collisions() const noexcept;
     [[nodiscard]] std::size_t estimated_bytes() const noexcept;
+    [[nodiscard]] std::size_t unprocessed_historical_states(
+        const ActiveItem& item, Weight target_limit) const;
+    [[nodiscard]] long long item_backfill_attempts(
+        const ActiveItem& item) const;
+    [[nodiscard]] bool item_was_introduced(const ActiveItem& item) const;
+    void retire_item(ActiveItem item, Weight target_limit);
 
 private:
     struct Candidate {
@@ -98,6 +105,18 @@ private:
         PointId predecessor;
         int item_id;
         int tie_rank;
+    };
+
+    struct ItemCursor {
+        // Index in expandable_points_ corresponding to next_built_upon.
+        std::size_t next_built_upon = 1;
+        // Exclusive end of the prefix present at introduction.
+        std::size_t historical_end = 1;
+        // Threshold retirement freezes the set of parents that eager C++ had
+        // already scheduled.  Active cursors retain the unbounded sentinel.
+        std::size_t built_upon_end = std::numeric_limits<std::size_t>::max();
+        long long backfill_attempts = 0;
+        bool introduced = false;
     };
 
     // All successors of the weight currently being visited are at most the
@@ -138,11 +157,21 @@ private:
 
     void schedule_successors(PointId parent, Weight compute_limit,
                              const std::vector<Item>& items, SliceBuildResult& result);
-    void schedule_active_successors(PointId parent, Weight compute_limit,
-                                    const std::vector<ActiveItem>& items,
+    void advance_item_cursor(const ActiveItem& item, Weight target_limit,
+                             SliceBuildResult& result);
+    void advance_active_cursors(const std::vector<ActiveItem>& items, Weight target_limit,
+                                SliceBuildResult& result);
+    void advance_retired_cursors(Weight target_limit, SliceBuildResult& result);
+    void schedule_current_active_successors(PointId parent, Weight target_limit,
+                                            const std::vector<ActiveItem>& items,
+                                            SliceBuildResult& result);
+    void synchronize_active_cursors(const std::vector<ActiveItem>& items,
+                                    Weight target_limit);
+    static void sample_active_items(const std::vector<ActiveItem>& items,
                                     SliceBuildResult& result);
-    void backfill_item(const ActiveItem& item, Weight compute_limit,
-                       SliceBuildResult& result);
+    void initialize_item_cursor(const ActiveItem& item);
+    [[nodiscard]] ItemCursor& cursor_for(const ActiveItem& item);
+    [[nodiscard]] const ItemCursor& cursor_for(const ActiveItem& item) const;
     void reserve_storage(Weight compute_limit, const std::vector<Item>& items);
     void reserve_active_storage(Weight compute_limit,
                                 const std::vector<ActiveItem>& items);
@@ -151,6 +180,8 @@ private:
     std::vector<State> states_;
     ComputedWindow pending_;
     std::vector<PointId> expandable_points_;
+    std::vector<ActiveItem> retired_items_;
+    std::vector<ItemCursor> item_cursors_;
     std::vector<int> item_tie_rank_by_id_;
     bool root_processed_ = false;
     long long generated_candidates_ = 0;
@@ -211,15 +242,26 @@ SliceBuildResult CriticalSequence::process_slice_incremental(
     if (yb < ya || compute_limit < 0) return result;
 
     reserve_active_storage(compute_limit, active_items);
+    // Cursor batches only contain targets in this slice.  Include its width in
+    // the circular window so all live targets have distinct slots even when a
+    // custom slice height exceeds every active item weight.
+    pending_.configure(yb - ya);
     if (!root_processed_ && ya == 0) {
         root_processed_ = true;
         ++result.states_entered;
         if (should_expand(0)) {
             ++result.states_expanded;
             expandable_points_.push_back(0);
-            schedule_active_successors(0, compute_limit, active_items, result);
+            sample_active_items(active_items, result);
         }
     }
+
+    const Weight target_limit = std::min(yb, compute_limit);
+    // Resume each OCaml-style item cursor before visiting the slice.  Every
+    // candidate needed in ]ya, yb] is therefore present before its target
+    // weight is consumed.
+    advance_retired_cursors(target_limit, result);
+    advance_active_cursors(active_items, target_limit, result);
 
     const Weight first_weight = ya == std::numeric_limits<Weight>::max() ? ya : ya + 1;
     for (Weight weight = first_weight;; ++weight) {
@@ -235,7 +277,7 @@ SliceBuildResult CriticalSequence::process_slice_incremental(
         }
 
         while (next_item < items_by_weight.size() && items_by_weight[next_item].w == weight) {
-            const ActiveItem& item = items_by_weight[next_item++];
+            ActiveItem item = items_by_weight[next_item++];
             ++result.items_considered_for_introduction;
             if (item.p <= envelope) {
                 ++result.items_rejected_by_envelope;
@@ -246,7 +288,8 @@ SliceBuildResult CriticalSequence::process_slice_incremental(
                 continue;
             }
 
-            backfill_item(item, compute_limit, result);
+            initialize_item_cursor(item);
+            advance_item_cursor(item, target_limit, result);
             const auto position = std::lower_bound(
                 active_items.begin(), active_items.end(), item,
                 [](const ActiveItem& existing, const ActiveItem& value) {
@@ -281,11 +324,13 @@ SliceBuildResult CriticalSequence::process_slice_incremental(
             if (should_expand(id)) {
                 ++result.states_expanded;
                 expandable_points_.push_back(id);
-                schedule_active_successors(id, compute_limit, active_items, result);
+                schedule_current_active_successors(
+                    id, target_limit, active_items, result);
             }
         }
         if (weight == yb) break;
     }
+    synchronize_active_cursors(active_items, target_limit);
     return result;
 }
 

@@ -34,8 +34,20 @@ contribution expires.  The default slice height is PYAsUKP's executable
 default `max(100, w_min)`; an explicit `SolverOptions::slice_height` overrides
 it.
 
+Backfill progress is stored per introduced item, separately from the hot
+`ActiveItem` record.  A cursor is the index of the next expandable skip-point
+upon which that item must build.  A slice advances cursors only far enough to
+make targets through its upper bound available.  When threshold dominance
+removes an item, its cursor is frozen at the expandable prefix that existed at
+removal and drains that prefix in later slices.  This preserves the candidate
+set of the former eager C++ scheduler while avoiding work for targets beyond
+the solver's stopping certificate.
+
 `ukp_solve` reports `items_introduced`, envelope/bound rejection counts,
-`successor_item_scans`, and `backfill_attempts`.  These counters are guarded by
+`successor_item_scans`, `backfill_attempts`, `cursor_advances`, and
+`historical_states_avoided`.  With `--verbose` it also reports backfill attempts
+by original item id.  Candidate stores and `ComputedWindow` collisions remain
+separate counters.  These counters are guarded by
 the `exnsds12.ukp` regression test so an eager all-items recurrence is detected
 without relying on wall-clock timing.
 

@@ -147,6 +147,8 @@ void check_faithful(const Instance& instance, Profit oracle, const std::string& 
             long long threshold = 0;
             long long successor_item_scans = 0;
             long long backfill_attempts = 0;
+            long long cursor_advances = 0;
+            long long historical_states_avoided = 0;
             long long considered_for_introduction = 0;
             long long introduced = 0;
             long long rejected_by_envelope = 0;
@@ -157,6 +159,8 @@ void check_faithful(const Instance& instance, Profit oracle, const std::string& 
                 threshold += slice.items_removed_threshold;
                 successor_item_scans += slice.successor_item_scans;
                 backfill_attempts += slice.backfill_attempts;
+                cursor_advances += slice.cursor_advances;
+                historical_states_avoided += slice.historical_states_avoided;
                 considered_for_introduction += slice.items_considered_for_introduction;
                 introduced += slice.items_introduced;
                 rejected_by_envelope += slice.items_rejected_by_envelope;
@@ -168,6 +172,10 @@ void check_faithful(const Instance& instance, Profit oracle, const std::string& 
                     prefix + "slice item-scan mismatch");
             require(backfill_attempts == result.stats.backfill_attempts,
                     prefix + "slice backfill mismatch");
+            require(cursor_advances == result.stats.cursor_advances,
+                    prefix + "slice cursor-advance mismatch");
+            require(historical_states_avoided == result.stats.historical_states_avoided,
+                    prefix + "slice avoided-history mismatch");
             require(considered_for_introduction == result.stats.items_considered_for_introduction &&
                         introduced == result.stats.items_introduced &&
                         rejected_by_envelope == result.stats.items_rejected_by_envelope &&
@@ -186,6 +194,8 @@ void check_faithful(const Instance& instance, Profit oracle, const std::string& 
                     prefix + "active-item sampling does not match expansions");
             require(result.stats.successor_attempts == result.stats.points_generated,
                     prefix + "successor attempts differ from generated points");
+            require(result.stats.cursor_advances == result.stats.successor_attempts,
+                    prefix + "cursor advances differ from incremental successors");
             require(result.stats.successor_attempts ==
                         result.stats.candidates_stored +
                             result.stats.computed_window_rejections,
@@ -206,6 +216,17 @@ void check_faithful(const Instance& instance, Profit oracle, const std::string& 
                 result.stats.items_introduced_by_reduction_decile.end(), 0LL);
             require(introduced_by_reduction == result.stats.items_introduced,
                     prefix + "introduction reduction-range histogram mismatch");
+            long long per_item_backfills = 0;
+            long long per_item_entries = 0;
+            for (const long long attempts : result.stats.backfill_attempts_by_item) {
+                if (attempts < 0) continue;
+                per_item_backfills += attempts;
+                ++per_item_entries;
+            }
+            require(per_item_entries == result.stats.items_introduced,
+                    prefix + "per-item backfill entries differ from introductions");
+            require(per_item_backfills == result.stats.backfill_attempts,
+                    prefix + "per-item backfills differ from aggregate");
             long long contextual_wins = 0;
             for (const auto& [_, count] : result.stats.contextual_bound_wins) {
                 contextual_wins += count;
@@ -354,6 +375,7 @@ void check_incremental_item_introduction() {
             [](faithful::detail::PointId) { return true; });
         total.successor_attempts += part.successor_attempts;
         total.backfill_attempts += part.backfill_attempts;
+        total.cursor_advances += part.cursor_advances;
         total.items_considered_for_introduction += part.items_considered_for_introduction;
         total.items_introduced += part.items_introduced;
         total.items_rejected_by_envelope += part.items_rejected_by_envelope;
@@ -367,6 +389,8 @@ void check_incremental_item_introduction() {
             "incremental envelope accepted the wrong item set");
     require(total.backfill_attempts > 0 && total.successor_attempts >= total.backfill_attempts,
             "incremental introduction did not backfill prior states");
+    require(total.cursor_advances == total.successor_attempts,
+            "incremental cursors did not account for every successor");
     require(active.size() == 3 && active[0].id == 13 && active[1].id == 11 && active[2].id == 10,
             "introduced items did not retain decreasing ratio order");
 
@@ -1163,6 +1187,37 @@ void check_exnsds12_incremental_regression() {
             "periodic fill changed the exnsds12 optimum or reconstruction");
 }
 
+void check_moderate_cursor_regression() {
+    const auto path = std::filesystem::path(UKP_SOURCE_DIR) / "data" /
+        "ukp_moderate_bb_2000_900k.ukp";
+    const Instance instance = read_instance_file(path.string());
+    const SolverResult result = faithful::Solver(SolverOptions{}).solve(instance);
+    require(verify_solution(instance, result.solution) &&
+                result.solution.profit == 928'539 &&
+                result.solution.weight == 900'000,
+            "moderate cursor regression changed the optimum");
+    std::vector<long long> expected_multiplicity(instance.items.size(), 0);
+    expected_multiplicity[10] = 1;
+    expected_multiplicity[14] = 1;
+    expected_multiplicity[18] = 11;
+    expected_multiplicity[1996] = 11;
+    require(result.solution.multiplicity_by_id == expected_multiplicity,
+            "moderate cursor regression changed reconstruction");
+    require(result.stats.states_scanned == 49'135 &&
+                result.stats.states_expanded == 47'491 &&
+                result.stats.periodicity_level == 180'720,
+            "moderate cursor regression changed states or periodicity");
+    require(result.stats.backfill_attempts == 12'295'333 &&
+                result.stats.successor_attempts == 18'576'637 &&
+                result.stats.cursor_advances == result.stats.successor_attempts &&
+                result.stats.historical_states_avoided == 4'932'363 &&
+                result.stats.successor_attempts +
+                    result.stats.historical_states_avoided == 23'509'000,
+            "moderate cursor regression changed cursor work");
+    require(result.stats.successor_attempts < 23'509'000,
+            "moderate cursor scheduling reverted to eager future successors");
+}
+
 }  // namespace
 
 int main() {
@@ -1176,6 +1231,7 @@ int main() {
         check_pyasukp_corpus();
         check_faithful_extended_prefix_regression();
         check_exnsds12_incremental_regression();
+        check_moderate_cursor_regression();
         check_precomputed_q_star();
         check_ratio_ordered_context_rebuild();
         check_multiple_dominance_witness_persistence();

@@ -49,6 +49,33 @@ faithful path.
 
 The exact solution is certified by a dynamic-programming sequence of skip-points. `value_at(y)` returns the last point whose weight is at most `y`; items eliminated by threshold dominance do not participate in recurrences of later slices.
 
+### Incremental backfill correspondence
+
+PYAsUKP stores `next_built_upon` per introduced item. `Slice.one` resumes that
+index in `sequence_result` and consumes parents only while the shifted target
+is at most `bsup`. The faithful C++ mapping is:
+
+- `sequence_result` parents that survive contextual fathoming map to
+  `expandable_points_`;
+- an `ItemCursor::next_built_upon` is an index in that append-only vector;
+- the C++ slice upper bound `yb` maps to `bsup` and limits cursor advancement to
+  parents of weight at most `yb - w_i`;
+- candidates are still consumed in increasing target weight, while immutable
+  `tie_rank` implements the OCaml decreasing-ratio priority independently of
+  physical generation order;
+- a threshold-removed item retains a retired cursor whose terminal index is the
+  expandable prefix present at removal. It emits no transitions from later
+  states, but finishes the prefix that the old eager C++ implementation had
+  already scheduled. This preserves its candidates, predecessors, and
+  periodicity while deferring work past the stopping boundary.
+
+Cursor metadata is kept in a cold table indexed by immutable `tie_rank`, so the
+24-byte hot `ActiveItem` layout is unchanged. `cursor_advances` counts shifted
+parents actually visited; `backfill_attempts` is the subset belonging to the
+prefix present at introduction; `historical_states_avoided` counts represented
+cursor parents whose capacity-feasible successor remains deferred at the exact
+stop.
+
 ## Optimized implementation
 
 The optimized implementation changes the data layout:

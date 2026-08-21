@@ -344,6 +344,7 @@ SolverResult Solver::solve(const Instance& inst) {
     SolverResult result;
     const EffectiveOptions effective = effective_options(options_);
     result.stats.original_items = static_cast<long long>(inst.items.size());
+    result.stats.backfill_attempts_by_item.assign(inst.items.size(), -1);
     if (inst.items.empty() || inst.capacity == 0) {
         result.solution.multiplicity_by_id.assign(inst.items.size(), 0);
         result.solution.optimal = true;
@@ -787,6 +788,7 @@ SolverResult Solver::solve(const Instance& inst) {
         result.stats.successor_attempts += build.successor_attempts;
         result.stats.successor_item_scans += build.successor_item_scans;
         result.stats.backfill_attempts += build.backfill_attempts;
+        result.stats.cursor_advances += build.cursor_advances;
         result.stats.active_item_samples += build.active_item_samples;
         result.stats.active_items_sum += build.active_items_sum;
         result.stats.active_items_max = std::max(
@@ -813,6 +815,7 @@ SolverResult Solver::solve(const Instance& inst) {
         slice.states_expanded += build.states_expanded;
         slice.successor_item_scans += build.successor_item_scans;
         slice.backfill_attempts += build.backfill_attempts;
+        slice.cursor_advances += build.cursor_advances;
         slice.states_created += build.states_created;
         slice.items_considered_for_introduction += build.items_considered_for_introduction;
         slice.items_introduced += build.items_introduced;
@@ -842,6 +845,10 @@ SolverResult Solver::solve(const Instance& inst) {
                     safe_add(contribution, item.w) <= yb) {
                     --remaining_active;
                     residual_slot(item) = 0;
+                    // Eager scheduling had already emitted transitions from
+                    // every currently expandable state.  Freeze that prefix
+                    // and let its cursor drain lazily in later slices.
+                    sequence.retire_item(item, candidate_limit);
                     ++result.stats.items_removed_threshold;
                     ++slice.items_removed_threshold;
                 } else {
@@ -913,6 +920,24 @@ SolverResult Solver::solve(const Instance& inst) {
         }
         if (active_count == 1 && half_capacity_extension_done && yb >= process_limit) break;
         ya = yb;
+    }
+
+    // Cursor suffixes still represented when the exact stopping certificate
+    // fires are work the eager implementation had already materialized.
+    // Publish per-item totals and the capacity-feasible deferred suffix.
+    long long final_historical_avoided = 0;
+    for (const detail::ActiveItem& item : items_by_weight) {
+        if (sequence.item_was_introduced(item)) {
+            result.stats.backfill_attempts_by_item[static_cast<std::size_t>(item.id)] =
+                sequence.item_backfill_attempts(item);
+            final_historical_avoided += static_cast<long long>(
+                sequence.unprocessed_historical_states(item, candidate_limit));
+        }
+    }
+    result.stats.historical_states_avoided += final_historical_avoided;
+    if (!result.stats.slices.empty()) {
+        result.stats.slices.back().historical_states_avoided +=
+            final_historical_avoided;
     }
 
     if (periodicity_detected) {

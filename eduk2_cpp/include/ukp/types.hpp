@@ -44,6 +44,8 @@ struct SliceStats {
     long long successor_attempts = 0;
     long long successor_item_scans = 0;
     long long backfill_attempts = 0;
+    long long cursor_advances = 0;
+    long long historical_states_avoided = 0;
     long long states_created = 0;
     long long states_kept = 0;
     long long states_fathomed_by_bound = 0;
@@ -65,6 +67,8 @@ struct Stats {
     long long successor_attempts = 0;
     long long successor_item_scans = 0;
     long long backfill_attempts = 0;
+    long long cursor_advances = 0;
+    long long historical_states_avoided = 0;
     long long candidates_stored = 0;
     long long computed_window_collisions = 0;
     long long computed_window_replacements = 0;
@@ -131,6 +135,10 @@ struct Stats {
     // reduction DP list and the local B&B core selected from it.
     std::vector<int> dp_item_ids;
     std::vector<int> core_item_ids;
+    // Indexed by the original item id.  Entries for items that never become
+    // active remain -1, distinguishing them from an introduced item that did
+    // not need historical backfill.
+    std::vector<long long> backfill_attempts_by_item;
 };
 
 struct SolverOptions {

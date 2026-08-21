@@ -69,6 +69,9 @@ int main(int argc, char** argv) {
     std::cout << std::fixed << std::setprecision(6)
               << "successor_scans_per_expanded_state " << scans_per_expanded << '\n';
     std::cout << "backfill_attempts " << res.stats.backfill_attempts << '\n';
+    std::cout << "cursor_advances " << res.stats.cursor_advances << '\n';
+    std::cout << "historical_states_avoided "
+              << res.stats.historical_states_avoided << '\n';
     std::cout << "candidates_stored " << res.stats.candidates_stored << '\n';
     std::cout << "computed_window_collisions "
               << res.stats.computed_window_collisions << '\n';
@@ -179,6 +182,14 @@ int main(int argc, char** argv) {
     std::cout << "bound_context_dominance_pair_checks "
               << res.stats.bound_context_dominance_pair_checks << '\n';
     if (verbose) {
+        for (std::size_t item_id = 0;
+             item_id < res.stats.backfill_attempts_by_item.size(); ++item_id) {
+            const long long attempts = res.stats.backfill_attempts_by_item[item_id];
+            if (attempts >= 0) {
+                std::cout << "backfill_attempts_item " << item_id << ' '
+                          << attempts << '\n';
+            }
+        }
         for (const SliceStats& slice : res.stats.slices) {
             std::cout << "slice begin=" << slice.begin << " end=" << slice.end
                       << " states_entered=" << slice.states_entered
@@ -186,6 +197,9 @@ int main(int argc, char** argv) {
                       << " successor_attempts=" << slice.successor_attempts
                       << " successor_item_scans=" << slice.successor_item_scans
                       << " backfill_attempts=" << slice.backfill_attempts
+                      << " cursor_advances=" << slice.cursor_advances
+                      << " historical_states_avoided="
+                      << slice.historical_states_avoided
                       << " states_created=" << slice.states_created
                       << " states_kept=" << slice.states_kept
                       << " states_fathomed_by_bound=" << slice.states_fathomed_by_bound
