@@ -29,10 +29,14 @@ PreprocessResult preprocess_items(const Instance& instance, bool use_simple_domi
     return result;
 }
 
-std::vector<Item> reduce_variables_by_bound(const std::vector<Item>& items,
-                                            const BoundContext& context,
-                                            Weight capacity, Profit incumbent,
-                                            long long& bound_calls, BoundPolicy policy) {
+std::vector<Item> reduce_variables_by_bound(
+    const std::vector<Item>& items,
+    const BoundContext& context,
+    Weight capacity,
+    Profit incumbent,
+    long long& bound_calls,
+    BoundPolicy policy,
+    BoundDecisionTelemetry* decision_telemetry) {
     std::vector<Item> reduced;
     reduced.reserve(items.size());
     for (const Item& item : items) {
@@ -41,10 +45,12 @@ std::vector<Item> reduce_variables_by_bound(const std::vector<Item>& items,
             continue;
         }
         if (item.w > capacity) continue;
-        ++bound_calls;
-        if (safe_add(item.p, compute_bound(context, capacity - item.w, policy).upper) > incumbent) {
-            reduced.push_back(item);
-        }
+
+        const BoundDecision decision = evaluate_candidate(
+            context, item.w, item.p, capacity, incumbent, policy);
+        accumulate_bound_decision_telemetry(decision_telemetry, decision);
+        if (decision.evaluated_mask != 0) ++bound_calls;
+        if (!decision.can_fathom) reduced.push_back(item);
     }
     return reduced;
 }

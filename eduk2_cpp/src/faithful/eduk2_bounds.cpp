@@ -14,6 +14,17 @@ constexpr std::uint8_t bound_mask(BoundType type) {
     return 0;
 }
 
+constexpr std::size_t bound_index(BoundType type) {
+    switch (type) {
+        case BoundType::U3: return 0;
+        case BoundType::V: return 1;
+        case BoundType::TauStar: return 2;
+        case BoundType::BestItemStar: return 3;
+        case BoundType::Both: return 4;
+    }
+    return 4;
+}
+
 Profit floor_div(__int128 numerator, __int128 denominator) {
     if (denominator <= 0) {
         throw std::invalid_argument("non-positive rational denominator");
@@ -176,6 +187,93 @@ ContextualBound compute_contextual_bound(const BoundContext& context,
         }
     }
     return result;
+}
+
+BoundDecision evaluate_candidate(const BoundContext& context,
+                                 Weight prefix_weight,
+                                 Profit prefix_profit,
+                                 Weight total_capacity,
+                                 Profit incumbent,
+                                 BoundPolicy policy) {
+    if (context.items.empty() || context.best.w <= 0) {
+        throw std::invalid_argument("invalid bound context");
+    }
+    if (prefix_weight < 0 || prefix_weight > total_capacity) {
+        throw std::invalid_argument("candidate prefix weight is outside capacity");
+    }
+
+    BoundDecision decision;
+    const Weight residual_capacity = total_capacity - prefix_weight;
+    const long long best_copies = residual_capacity / context.best.w;
+    const Profit feasible_profit = safe_add(
+        prefix_profit, safe_mul(best_copies, context.best.p));
+
+    // Any valid upper bound must be at least this feasible completion. If it
+    // already improves the incumbent, no certified upper bound can fathom the
+    // candidate, so all expensive formulas are skipped exactly.
+    if (feasible_profit > incumbent) {
+        decision.lower_filter_hit = true;
+        return decision;
+    }
+
+    if (residual_capacity <= 0) {
+        decision.can_fathom = prefix_profit <= incumbent;
+        decision.upper = 0;
+        decision.witness = BoundType::U3;
+        return decision;
+    }
+
+    const BoundType requested = requested_type(policy);
+    const bool best_certified = requested == BoundType::Both;
+    if (context.certified_type_count == 0) {
+        throw std::logic_error("no certified bound");
+    }
+
+    auto evaluate_one = [&](BoundType type, bool has_remaining) {
+        const ContextualBound bound = compute_individual_contextual(
+            context, residual_capacity, type, best_copies);
+        decision.evaluated_mask |= bound.evaluated_mask;
+        if (decision.witness == BoundType::Both || bound.upper < decision.upper) {
+            decision.upper = bound.upper;
+            decision.witness = bound.type;
+        }
+        if (safe_add(prefix_profit, bound.upper) <= incumbent) {
+            decision.can_fathom = true;
+            decision.upper = bound.upper;
+            decision.witness = bound.type;
+            decision.short_circuited = has_remaining;
+            return true;
+        }
+        return false;
+    };
+
+    if (!best_certified) {
+        const BoundType selected = is_bound_certified(context, requested)
+            ? requested : context.certified_types.front();
+        evaluate_one(selected, false);
+        return decision;
+    }
+
+    for (std::size_t index = 0; index < context.certified_type_count; ++index) {
+        const bool has_remaining = index + 1 < context.certified_type_count;
+        if (evaluate_one(context.certified_types[index], has_remaining)) break;
+    }
+    return decision;
+}
+
+void accumulate_bound_decision_telemetry(
+    BoundDecisionTelemetry* telemetry, const BoundDecision& decision) noexcept {
+    if (telemetry == nullptr) return;
+    if (decision.lower_filter_hit) ++telemetry->lower_filter_hits;
+    for (const BoundType type : {BoundType::U3, BoundType::V,
+                                 BoundType::TauStar,
+                                 BoundType::BestItemStar}) {
+        const std::size_t index = bound_index(type);
+        if ((decision.evaluated_mask & bound_mask(type)) != 0) {
+            ++telemetry->bounds_evaluated[index];
+        }
+    }
+    if (decision.short_circuited) ++telemetry->bounds_short_circuited;
 }
 
 }  // namespace ukp::faithful::detail

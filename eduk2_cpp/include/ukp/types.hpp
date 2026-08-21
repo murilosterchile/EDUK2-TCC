@@ -106,6 +106,16 @@ struct Stats {
     long long contextual_bound_calls_avoided_by_lower = 0;
     long long contextual_bound_state_calls_avoided_by_lower = 0;
     long long contextual_bound_item_calls_avoided_by_lower = 0;
+    // Unified bound-decision telemetry (Full mode).
+    long long lower_filter_hits = 0;
+    std::map<std::string, long long> bounds_evaluated;
+    long long bounds_short_circuited = 0;
+    long long active_items_checked = 0;
+    long long active_items_removed_by_bound = 0;
+    // Conservative lower bounds: already-existing cursor transitions known at
+    // the instant an active item is fathomed. Future states are not counted.
+    long long successor_attempts_avoided = 0;
+    long long cursor_advances_avoided = 0;
     std::map<std::string, long long> contextual_bound_evaluations;
     std::map<std::string, long long> contextual_bound_wins;
     std::map<std::string, long long> contextual_bound_state_wins;

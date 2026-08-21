@@ -8,7 +8,6 @@
 #include <array>
 #include <cassert>
 #include <chrono>
-#include <iostream>
 #include <map>
 #include <numeric>
 #include <type_traits>
@@ -102,16 +101,21 @@ public:
 struct ResidualDelta {
     explicit ResidualDelta(std::size_t item_count)
         : removal_requested_by_id(item_count, 0),
+          active_removal_requested_by_id(item_count, 0),
           retirement_requested_by_id(item_count, 0) {}
 
     void begin_slice() {
         for (const int item_id : removed_ids) {
             removal_requested_by_id[static_cast<std::size_t>(item_id)] = 0;
         }
+        for (const detail::ActiveItem& item : active_items_to_remove) {
+            active_removal_requested_by_id[static_cast<std::size_t>(item.id)] = 0;
+        }
         for (const detail::ActiveItem& item : active_items_to_retire) {
             retirement_requested_by_id[static_cast<std::size_t>(item.id)] = 0;
         }
         removed_ids.clear();
+        active_items_to_remove.clear();
         active_items_to_retire.clear();
         incumbent_changed = false;
         had_item_decisions = false;
@@ -134,16 +138,38 @@ struct ResidualDelta {
         return true;
     }
 
-    void request_active_removal(const detail::ActiveItem& item) {
+    void request_active_removal(const detail::ActiveItem& item,
+                                bool retire_cursor) {
         request_removal(item.id);
-        unsigned char& requested = retirement_requested_by_id[
+        unsigned char& active_requested = active_removal_requested_by_id[
             static_cast<std::size_t>(item.id)];
-        if (requested != 0) {
+        if (active_requested == 0) {
+            active_requested = 1;
+            active_items_to_remove.push_back(item);
+        } else {
             ++duplicate_requests;
-            return;
         }
-        requested = 1;
-        active_items_to_retire.push_back(item);
+
+        if (!retire_cursor) return;
+        unsigned char& retirement_requested = retirement_requested_by_id[
+            static_cast<std::size_t>(item.id)];
+        if (retirement_requested == 0) {
+            retirement_requested = 1;
+            active_items_to_retire.push_back(item);
+        } else {
+            ++duplicate_requests;
+        }
+    }
+
+    void request_threshold_removal(const detail::ActiveItem& item) {
+        request_active_removal(item, true);
+    }
+
+    void request_bound_removal(const detail::ActiveItem& item) {
+        // A context-fathomed item must stop producing new candidates.  It is
+        // removed from the active list but deliberately not placed in the
+        // retired-cursor queue used to preserve threshold-removal semantics.
+        request_active_removal(item, false);
     }
 
     [[nodiscard]] bool contains(int item_id) const {
@@ -154,14 +180,21 @@ struct ResidualDelta {
         return removal_requested_by_id[static_cast<std::size_t>(item_id)] != 0;
     }
 
+    [[nodiscard]] bool has_removals() const noexcept {
+        return !removed_ids.empty();
+    }
+
     [[nodiscard]] bool requested() const noexcept {
-        return had_item_decisions || !removed_ids.empty() ||
+        return had_item_decisions || has_removals() ||
+               !active_items_to_remove.empty() ||
                !active_items_to_retire.empty();
     }
 
     std::vector<int> removed_ids;
+    std::vector<detail::ActiveItem> active_items_to_remove;
     std::vector<detail::ActiveItem> active_items_to_retire;
     std::vector<unsigned char> removal_requested_by_id;
+    std::vector<unsigned char> active_removal_requested_by_id;
     std::vector<unsigned char> retirement_requested_by_id;
     bool incumbent_changed = false;
     bool had_item_decisions = false;
@@ -527,7 +560,12 @@ SolverResult Solver::solve(const Instance& inst) {
 
     BoundContextTelemetry context_telemetry;
     BoundContextTelemetry* context_telemetry_ptr = nullptr;
-    if constexpr (kFullStats) context_telemetry_ptr = &context_telemetry;
+    detail::BoundDecisionTelemetry bound_decision_telemetry;
+    detail::BoundDecisionTelemetry* bound_decision_telemetry_ptr = nullptr;
+    if constexpr (kFullStats) {
+        context_telemetry_ptr = &context_telemetry;
+        bound_decision_telemetry_ptr = &bound_decision_telemetry;
+    }
     auto publish_context_telemetry = [&]() {
         if constexpr (kFullStats) {
             result.stats.bound_context_rebuilds = context_telemetry.rebuilds;
@@ -552,6 +590,17 @@ SolverResult Solver::solve(const Instance& inst) {
                 context_telemetry.dominance_witness_invalidations;
             result.stats.bound_context_dominance_pair_checks =
                 context_telemetry.dominance_pair_checks;
+            result.stats.lower_filter_hits =
+                bound_decision_telemetry.lower_filter_hits;
+            result.stats.bounds_short_circuited =
+                bound_decision_telemetry.bounds_short_circuited;
+            for (std::size_t index = 0; index < 4; ++index) {
+                if (bound_decision_telemetry.bounds_evaluated[index] != 0) {
+                    result.stats.bounds_evaluated[
+                        ::ukp::bound_type_name(kBoundTypes[index])] =
+                            bound_decision_telemetry.bounds_evaluated[index];
+                }
+            }
         }
     };
     PhaseTimer<kFullStats> global_bounds_phase(result.stats.phase_global_bounds_ns);
@@ -574,7 +623,7 @@ SolverResult Solver::solve(const Instance& inst) {
         incumbent = bound_phase.incumbent;
         UKP_BASIC_STATS(
             ++result.stats.bound_calls;
-            result.stats.global_bound_used = bound_type_name(global_bound.type);
+            result.stats.global_bound_used = ::ukp::bound_type_name(global_bound.type);
             result.stats.bound_winner = result.stats.global_bound_used;
         );
     } else {
@@ -606,8 +655,9 @@ SolverResult Solver::solve(const Instance& inst) {
 #ifndef NDEBUG
         assert(std::is_sorted(items.begin(), items.end(), better_ratio));
 #endif
-        items = detail::reduce_variables_by_bound(items, ctx, inst.capacity, incumbent,
-                                                  bound_calls_counter, options_.bound_policy);
+        items = detail::reduce_variables_by_bound(
+            items, ctx, inst.capacity, incumbent, bound_calls_counter,
+            options_.bound_policy, bound_decision_telemetry_ptr);
         // reduce_variables_by_bound is a stable filter, so survivors retain
         // the exact better_ratio order of the input.
 #ifndef NDEBUG
@@ -763,20 +813,31 @@ SolverResult Solver::solve(const Instance& inst) {
     std::array<long long, kBoundTypes.size()> contextual_bound_state_wins{};
     std::array<long long, kBoundTypes.size()> contextual_bound_item_wins{};
     std::array<long long, kBoundTypes.size()> contextual_bound_fathoms{};
-    auto record_contextual_bound = [&](const detail::ContextualBound& bound,
+    auto record_contextual_bound = [&](const detail::BoundDecision& decision,
                                        auto& slice) {
         if constexpr (kFullStats) {
             for (std::size_t index = 0; index < 4; ++index) {
-                if ((bound.evaluated_mask & (std::uint8_t{1} << index)) != 0) {
+                if ((decision.evaluated_mask & (std::uint8_t{1} << index)) != 0) {
                     ++contextual_bound_evaluations[index];
                 }
             }
-            ++contextual_bound_counts[bound_type_index(bound.type)];
-            const char* name = bound_type_name(bound.type);
+            if (decision.evaluated_mask == 0 || decision.witness == BoundType::Both) {
+                return;
+            }
+            ++contextual_bound_counts[bound_type_index(decision.witness)];
+            const char* name = ::ukp::bound_type_name(decision.witness);
             if (slice.contextual_bound_used != name) slice.contextual_bound_used = name;
         } else {
-            (void)bound;
+            (void)decision;
             (void)slice;
+        }
+    };
+    auto record_bound_decision = [&](const detail::BoundDecision& decision) {
+        if constexpr (kFullStats) {
+            detail::accumulate_bound_decision_telemetry(
+                bound_decision_telemetry_ptr, decision);
+        } else {
+            (void)decision;
         }
     };
     auto publish_dp_telemetry = [&]() {
@@ -784,30 +845,30 @@ SolverResult Solver::solve(const Instance& inst) {
             for (std::size_t index = 0; index < kBoundTypes.size(); ++index) {
                 if (contextual_bound_counts[index] != 0) {
                     result.stats.contextual_bound_calls[
-                        bound_type_name(kBoundTypes[index])] =
+                        ::ukp::bound_type_name(kBoundTypes[index])] =
                             contextual_bound_counts[index];
                     result.stats.contextual_bound_wins[
-                        bound_type_name(kBoundTypes[index])] =
+                        ::ukp::bound_type_name(kBoundTypes[index])] =
                             contextual_bound_counts[index];
                 }
                 if (contextual_bound_evaluations[index] != 0) {
                     result.stats.contextual_bound_evaluations[
-                        bound_type_name(kBoundTypes[index])] =
+                        ::ukp::bound_type_name(kBoundTypes[index])] =
                             contextual_bound_evaluations[index];
                 }
                 if (contextual_bound_state_wins[index] != 0) {
                     result.stats.contextual_bound_state_wins[
-                        bound_type_name(kBoundTypes[index])] =
+                        ::ukp::bound_type_name(kBoundTypes[index])] =
                             contextual_bound_state_wins[index];
                 }
                 if (contextual_bound_item_wins[index] != 0) {
                     result.stats.contextual_bound_item_wins[
-                        bound_type_name(kBoundTypes[index])] =
+                        ::ukp::bound_type_name(kBoundTypes[index])] =
                             contextual_bound_item_wins[index];
                 }
                 if (contextual_bound_fathoms[index] != 0) {
                     result.stats.contextual_bound_fathoms[
-                        bound_type_name(kBoundTypes[index])] =
+                        ::ukp::bound_type_name(kBoundTypes[index])] =
                             contextual_bound_fathoms[index];
                 }
             }
@@ -823,13 +884,6 @@ SolverResult Solver::solve(const Instance& inst) {
             publish_context_telemetry();
         }
     };
-    auto feasible_residual_exceeds_incumbent =
-        [&](Profit prefix_profit, long long best_copies) {
-            const Profit feasible_profit = safe_add(
-                prefix_profit, safe_mul(best_copies, periodic_best.p));
-            return feasible_profit > incumbent;
-        };
-
     // Most greedy completions do not improve the incumbent.  Keep one
     // reconstruction buffer for the rare candidates that do, and remember the
     // positions written so clearing it does not become another O(n) pass.
@@ -949,13 +1003,14 @@ SolverResult Solver::solve(const Instance& inst) {
         }
         UKP_FULL_STATS(result.stats.residual_items_removed += removed_now;);
 
-        // Cursor retirement and active-list compaction are committed together,
-        // after all threshold decisions for this slice are known.
+        // Threshold removals preserve the existing retired-cursor behavior;
+        // context-fathomed removals stop immediately and are never queued for
+        // later generation. Active-list compaction still happens only once.
         for (const detail::ActiveItem& item :
              residual_delta.active_items_to_retire) {
             sequence.retire_item(item, candidate_limit);
         }
-        if (!residual_delta.active_items_to_retire.empty()) {
+        if (!residual_delta.active_items_to_remove.empty()) {
             residual_survivors.clear();
             for (const detail::ActiveItem& item : active_items) {
                 if (!residual_delta.contains(item.id)) {
@@ -1011,32 +1066,28 @@ SolverResult Solver::solve(const Instance& inst) {
         const detail::SliceBuildResult build = sequence.process_slice_incremental(
             ya, yb, candidate_limit, active_items, items_by_weight, next_item,
             [&](const detail::ActiveItem& item, Profit) {
-                if (options_.use_bounds) {
-                    const Weight residual_capacity = inst.capacity - item.w;
-                    const long long periodic_best_copies =
-                        residual_capacity / periodic_best.w;
-                    if (feasible_residual_exceeds_incumbent(
-                            item.p, periodic_best_copies)) {
+                if (options_.use_bounds && item.id != periodic_best.id) {
+                    const detail::BoundDecision decision =
+                        detail::evaluate_candidate(
+                            ctx, item.w, item.p, inst.capacity, incumbent,
+                            options_.bound_policy);
+                    record_bound_decision(decision);
+                    if (decision.lower_filter_hit) {
                         UKP_FULL_STATS(
                             ++result.stats.contextual_bound_calls_avoided_by_lower;
                             ++result.stats.contextual_bound_item_calls_avoided_by_lower;
                         );
-                    } else {
-                        const long long context_best_copies =
-                            ctx.best.id == periodic_best.id ? periodic_best_copies :
-                            residual_capacity / ctx.best.w;
-                        const detail::ContextualBound residual =
-                            detail::compute_contextual_bound(
-                                ctx, residual_capacity, options_.bound_policy,
-                                context_best_copies);
+                    }
+                    if (decision.evaluated_mask != 0) {
                         UKP_BASIC_STATS(++result.stats.bound_calls;);
                         UKP_FULL_STATS(++result.stats.contextual_bound_item_queries;);
-                        record_contextual_bound(residual, slice);
+                        record_contextual_bound(decision, slice);
                         UKP_FULL_STATS(
-                            ++contextual_bound_item_wins[bound_type_index(residual.type)];
+                            ++contextual_bound_item_wins[
+                                bound_type_index(decision.witness)];
                         );
-                        if (safe_add(item.p, residual.upper) <= incumbent) return false;
                     }
+                    if (decision.can_fathom) return false;
                 }
                 contribution_slot(item.id) = item.w;
                 return true;
@@ -1049,37 +1100,36 @@ SolverResult Solver::solve(const Instance& inst) {
             // whose last item is b.  Preserving that chain is an invariant of
             // the threshold-based periodicity certificate and of fill_with_best.
             if (options_.use_bounds && state_item_id != periodic_best.id) {
-                const Weight residual_capacity = inst.capacity - state.weight;
-                const long long periodic_best_copies =
-                    residual_capacity / periodic_best.w;
-                if (feasible_residual_exceeds_incumbent(
-                        state.profit, periodic_best_copies)) {
+                const detail::BoundDecision decision =
+                    detail::evaluate_candidate(
+                        ctx, state.weight, state.profit, inst.capacity,
+                        incumbent, options_.bound_policy);
+                record_bound_decision(decision);
+                if (decision.lower_filter_hit) {
                     UKP_FULL_STATS(
                         ++result.stats.contextual_bound_calls_avoided_by_lower;
                         ++result.stats.contextual_bound_state_calls_avoided_by_lower;
                     );
-                } else {
-                    const long long context_best_copies =
-                        ctx.best.id == periodic_best.id ? periodic_best_copies :
-                        residual_capacity / ctx.best.w;
-                    const detail::ContextualBound residual =
-                        detail::compute_contextual_bound(
-                            ctx, residual_capacity, options_.bound_policy,
-                            context_best_copies);
+                }
+                if (decision.evaluated_mask != 0) {
                     UKP_BASIC_STATS(++result.stats.bound_calls;);
                     UKP_FULL_STATS(++result.stats.contextual_bound_state_queries;);
-                    record_contextual_bound(residual, slice);
+                    record_contextual_bound(decision, slice);
                     UKP_FULL_STATS(
-                        ++contextual_bound_state_wins[bound_type_index(residual.type)];
+                        ++contextual_bound_state_wins[
+                            bound_type_index(decision.witness)];
                     );
-                    if (safe_add(state.profit, residual.upper) <= incumbent) {
-                        UKP_FULL_STATS(
-                            ++contextual_bound_fathoms[bound_type_index(residual.type)];
-                            ++slice.states_fathomed_by_bound;
-                        );
-                        UKP_BASIC_STATS(++result.stats.states_fathomed;);
-                        return false;
-                    }
+                }
+                if (decision.can_fathom) {
+                    UKP_FULL_STATS(
+                        if (decision.evaluated_mask != 0) {
+                            ++contextual_bound_fathoms[
+                                bound_type_index(decision.witness)];
+                        }
+                        ++slice.states_fathomed_by_bound;
+                    );
+                    UKP_BASIC_STATS(++result.stats.states_fathomed;);
+                    return false;
                 }
             }
             // Listing 1's fathoming improves z by greedily completing every
@@ -1154,7 +1204,7 @@ SolverResult Solver::solve(const Instance& inst) {
             break;
         }
 
-        // Dynamic threshold dominance from EDUK/PYAsUKP.  Record every
+        // Dynamic threshold dominance from EDUK/PYAsUKP. Record every
         // decision first; the transaction below updates membership, cursors,
         // active_items, suffix minima, and BoundContext exactly once.
         if (!active_items.empty()) {
@@ -1167,12 +1217,21 @@ SolverResult Solver::solve(const Instance& inst) {
                 if (remaining_active > 1 &&
                     safe_add(contribution, item.w) <= yb) {
                     --remaining_active;
-                    residual_delta.request_active_removal(item);
+                    residual_delta.request_threshold_removal(item);
                     UKP_BASIC_STATS(++result.stats.items_removed_threshold;);
                     UKP_FULL_STATS(++slice.items_removed_threshold;);
                 }
             }
         }
+
+        // Active-item bound fathoming is intentionally disabled. A residual
+        // BoundContext does not cover every historical continuation already
+        // materialized in CriticalSequence, so using it to eliminate an
+        // already-active item can underestimate that item's true remaining
+        // potential. The unified bound engine remains enabled for the safe
+        // call sites (initial reduction, item introduction, and state
+        // fathoming).
+
         commit_residual_delta(true);
         UKP_FULL_STATS(
             slice.active_items_after = static_cast<long long>(active_items.size());

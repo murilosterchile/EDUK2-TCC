@@ -143,6 +143,18 @@ void print_full_stats(const SolverResult& res, bool verbose) {
               << res.stats.contextual_bound_state_calls_avoided_by_lower << '\n';
     std::cout << "contextual_bound_item_calls_avoided_by_lower "
               << res.stats.contextual_bound_item_calls_avoided_by_lower << '\n';
+    std::cout << "lower_filter_hits "
+              << res.stats.lower_filter_hits << '\n';
+    std::cout << "bounds_short_circuited "
+              << res.stats.bounds_short_circuited << '\n';
+    std::cout << "active_items_checked "
+              << res.stats.active_items_checked << '\n';
+    std::cout << "active_items_removed_by_bound "
+              << res.stats.active_items_removed_by_bound << '\n';
+    std::cout << "successor_attempts_avoided "
+              << res.stats.successor_attempts_avoided << '\n';
+    std::cout << "cursor_advances_avoided "
+              << res.stats.cursor_advances_avoided << '\n';
 
     constexpr std::array<const char*, 4> contextual_types{
         "U3", "V", "TauStar", "BestItemStar"};
@@ -151,6 +163,8 @@ void print_full_stats(const SolverResult& res, bool verbose) {
             const auto found = values.find(type);
             return found == values.end() ? 0LL : found->second;
         };
+        std::cout << "bounds_evaluated " << type << ' '
+                  << value_or_zero(res.stats.bounds_evaluated) << '\n';
         std::cout << "contextual_bound_evaluations " << type << ' '
                   << value_or_zero(res.stats.contextual_bound_evaluations) << '\n';
         std::cout << "contextual_bound_wins " << type << ' '
