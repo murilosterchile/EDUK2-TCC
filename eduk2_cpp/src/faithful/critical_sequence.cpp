@@ -151,7 +151,6 @@ long long CriticalSequence::computed_window_index_collisions() const noexcept {
 std::size_t CriticalSequence::estimated_bytes() const noexcept {
     return states_.size() * sizeof(State) + pending_.estimated_bytes() +
            expandable_points_.capacity() * sizeof(PointId) +
-           retired_items_.capacity() * sizeof(ActiveItem) +
            item_cursors_.capacity() * sizeof(ItemCursor) +
            item_tie_rank_by_id_.capacity() * sizeof(int);
 }
@@ -185,24 +184,9 @@ bool CriticalSequence::item_was_introduced(const ActiveItem& item) const {
     return cursor_for(item).introduced;
 }
 
-void CriticalSequence::retire_item(ActiveItem item, Weight target_limit) {
+void CriticalSequence::stop_item_after_slice(const ActiveItem& item) {
     ItemCursor& cursor_state = cursor_for(item);
-    if (target_limit < item.w) {
-        cursor_state.built_upon_end = 0;
-    } else {
-        const Weight maximum_parent_weight = target_limit - item.w;
-        const auto position = std::upper_bound(
-            expandable_points_.begin(), expandable_points_.end(),
-            maximum_parent_weight,
-            [this](Weight maximum, PointId point) {
-                return maximum < states_[point].weight;
-            });
-        cursor_state.built_upon_end = static_cast<std::size_t>(
-            position - expandable_points_.begin());
-    }
-    if (cursor_state.next_built_upon < cursor_state.built_upon_end) {
-        retired_items_.push_back(item);
-    }
+    cursor_state.built_upon_end = cursor_state.next_built_upon;
 }
 
 void CriticalSequence::configure_item_order(const std::vector<Item>& ratio_ordered_items) {
@@ -382,20 +366,6 @@ void CriticalSequence::advance_active_cursors(const std::vector<ActiveItem>& ite
     for (const ActiveItem& item : items) {
         advance_item_cursor(item, target_limit, result);
     }
-}
-
-void CriticalSequence::advance_retired_cursors(Weight target_limit,
-                                               SliceBuildResult& result) {
-    std::size_t kept = 0;
-    for (std::size_t index = 0; index < retired_items_.size(); ++index) {
-        ActiveItem item = retired_items_[index];
-        advance_item_cursor(item, target_limit, result);
-        const ItemCursor& cursor_state = cursor_for(item);
-        if (cursor_state.next_built_upon < cursor_state.built_upon_end) {
-            retired_items_[kept++] = item;
-        }
-    }
-    retired_items_.resize(kept);
 }
 
 void CriticalSequence::schedule_current_active_successors(

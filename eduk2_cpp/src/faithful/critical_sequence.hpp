@@ -97,7 +97,7 @@ public:
     [[nodiscard]] long long item_backfill_attempts(
         const ActiveItem& item) const;
     [[nodiscard]] bool item_was_introduced(const ActiveItem& item) const;
-    void retire_item(ActiveItem item, Weight target_limit);
+    void stop_item_after_slice(const ActiveItem& item);
 
 private:
     struct Candidate {
@@ -112,8 +112,8 @@ private:
         std::size_t next_built_upon = 1;
         // Exclusive end of the prefix present at introduction.
         std::size_t historical_end = 1;
-        // Threshold retirement freezes the set of parents that eager C++ had
-        // already scheduled.  Active cursors retain the unbounded sentinel.
+        // Exclusive parent frontier represented by this cursor. Active cursors
+        // are unbounded; threshold removal seals the frontier after the slice.
         std::size_t built_upon_end = std::numeric_limits<std::size_t>::max();
         long long backfill_attempts = 0;
         bool introduced = false;
@@ -161,7 +161,6 @@ private:
                              SliceBuildResult& result);
     void advance_active_cursors(const std::vector<ActiveItem>& items, Weight target_limit,
                                 SliceBuildResult& result);
-    void advance_retired_cursors(Weight target_limit, SliceBuildResult& result);
     void schedule_current_active_successors(PointId parent, Weight target_limit,
                                             const std::vector<ActiveItem>& items,
                                             SliceBuildResult& result);
@@ -180,7 +179,6 @@ private:
     std::vector<State> states_;
     ComputedWindow pending_;
     std::vector<PointId> expandable_points_;
-    std::vector<ActiveItem> retired_items_;
     std::vector<ItemCursor> item_cursors_;
     std::vector<int> item_tie_rank_by_id_;
     bool root_processed_ = false;
@@ -274,7 +272,6 @@ SliceBuildResult CriticalSequence::process_slice_incremental(
     // Resume each OCaml-style item cursor before visiting the slice.  Every
     // candidate needed in ]ya, yb] is therefore present before its target
     // weight is consumed.
-    advance_retired_cursors(target_limit, result);
     advance_active_cursors(active_items, target_limit, result);
 
     const Weight first_weight = ya == std::numeric_limits<Weight>::max() ? ya : ya + 1;

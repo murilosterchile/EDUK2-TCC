@@ -1208,13 +1208,13 @@ void check_moderate_cursor_regression() {
                 result.stats.periodicity_level == 180'720,
             "moderate cursor regression changed states or periodicity");
     require(result.stats.backfill_attempts == 12'295'333 &&
-                result.stats.successor_attempts == 18'576'637 &&
+                result.stats.successor_attempts == 12'433'800 &&
                 result.stats.cursor_advances == result.stats.successor_attempts &&
-                result.stats.historical_states_avoided == 4'932'363 &&
+                result.stats.historical_states_avoided == 20'632 &&
                 result.stats.successor_attempts +
-                    result.stats.historical_states_avoided == 23'509'000,
+                    result.stats.historical_states_avoided == 12'454'432,
             "moderate cursor regression changed cursor work");
-    require(result.stats.successor_attempts < 23'509'000,
+    require(result.stats.successor_attempts < 18'576'637,
             "moderate cursor scheduling reverted to eager future successors");
 }
 

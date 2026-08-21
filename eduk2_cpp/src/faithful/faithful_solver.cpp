@@ -101,8 +101,7 @@ public:
 struct ResidualDelta {
     explicit ResidualDelta(std::size_t item_count)
         : removal_requested_by_id(item_count, 0),
-          active_removal_requested_by_id(item_count, 0),
-          retirement_requested_by_id(item_count, 0) {}
+          active_removal_requested_by_id(item_count, 0) {}
 
     void begin_slice() {
         for (const int item_id : removed_ids) {
@@ -111,12 +110,8 @@ struct ResidualDelta {
         for (const detail::ActiveItem& item : active_items_to_remove) {
             active_removal_requested_by_id[static_cast<std::size_t>(item.id)] = 0;
         }
-        for (const detail::ActiveItem& item : active_items_to_retire) {
-            retirement_requested_by_id[static_cast<std::size_t>(item.id)] = 0;
-        }
         removed_ids.clear();
         active_items_to_remove.clear();
-        active_items_to_retire.clear();
         incumbent_changed = false;
         had_item_decisions = false;
         duplicate_requests = 0;
@@ -138,8 +133,7 @@ struct ResidualDelta {
         return true;
     }
 
-    void request_active_removal(const detail::ActiveItem& item,
-                                bool retire_cursor) {
+    void request_threshold_removal(const detail::ActiveItem& item) {
         request_removal(item.id);
         unsigned char& active_requested = active_removal_requested_by_id[
             static_cast<std::size_t>(item.id)];
@@ -150,26 +144,6 @@ struct ResidualDelta {
             ++duplicate_requests;
         }
 
-        if (!retire_cursor) return;
-        unsigned char& retirement_requested = retirement_requested_by_id[
-            static_cast<std::size_t>(item.id)];
-        if (retirement_requested == 0) {
-            retirement_requested = 1;
-            active_items_to_retire.push_back(item);
-        } else {
-            ++duplicate_requests;
-        }
-    }
-
-    void request_threshold_removal(const detail::ActiveItem& item) {
-        request_active_removal(item, true);
-    }
-
-    void request_bound_removal(const detail::ActiveItem& item) {
-        // A context-fathomed item must stop producing new candidates.  It is
-        // removed from the active list but deliberately not placed in the
-        // retired-cursor queue used to preserve threshold-removal semantics.
-        request_active_removal(item, false);
     }
 
     [[nodiscard]] bool contains(int item_id) const {
@@ -186,16 +160,13 @@ struct ResidualDelta {
 
     [[nodiscard]] bool requested() const noexcept {
         return had_item_decisions || has_removals() ||
-               !active_items_to_remove.empty() ||
-               !active_items_to_retire.empty();
+               !active_items_to_remove.empty();
     }
 
     std::vector<int> removed_ids;
     std::vector<detail::ActiveItem> active_items_to_remove;
-    std::vector<detail::ActiveItem> active_items_to_retire;
     std::vector<unsigned char> removal_requested_by_id;
     std::vector<unsigned char> active_removal_requested_by_id;
-    std::vector<unsigned char> retirement_requested_by_id;
     bool incumbent_changed = false;
     bool had_item_decisions = false;
     long long duplicate_requests = 0;
@@ -1003,14 +974,15 @@ SolverResult Solver::solve(const Instance& inst) {
         }
         UKP_FULL_STATS(result.stats.residual_items_removed += removed_now;);
 
-        // Threshold removals preserve the existing retired-cursor behavior;
-        // context-fathomed removals stop immediately and are never queued for
-        // later generation. Active-list compaction still happens only once.
-        for (const detail::ActiveItem& item :
-             residual_delta.active_items_to_retire) {
-            sequence.retire_item(item, candidate_limit);
-        }
+        // Threshold dominance is decided only after the slice has been fully
+        // materialized. Removing the item from active_items here preserves all
+        // candidates from this slice and permanently stops its cursor before
+        // the next one.
         if (!residual_delta.active_items_to_remove.empty()) {
+            for (const detail::ActiveItem& item :
+                 residual_delta.active_items_to_remove) {
+                sequence.stop_item_after_slice(item);
+            }
             residual_survivors.clear();
             for (const detail::ActiveItem& item : active_items) {
                 if (!residual_delta.contains(item.id)) {
