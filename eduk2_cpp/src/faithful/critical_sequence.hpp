@@ -21,8 +21,18 @@ struct State {
     int item_id = -1;
 };
 
+// Hot DP representation.  tie_rank is assigned once from the immutable
+// better_ratio order, avoiding an indirect id lookup for every successor.
+struct ActiveItem {
+    int id = -1;
+    int tie_rank = 0;
+    Weight w = 0;
+    Profit p = 0;
+};
+
 struct SliceBuildResult {
     long long states_entered = 0;
+    long long states_expanded = 0;
     long long successor_attempts = 0;
     long long successor_item_scans = 0;
     long long backfill_attempts = 0;
@@ -32,6 +42,11 @@ struct SliceBuildResult {
     long long items_introduced = 0;
     long long items_rejected_by_envelope = 0;
     long long items_rejected_by_bound = 0;
+    long long active_item_samples = 0;
+    long long active_items_sum = 0;
+    long long active_items_max = 0;
+    std::array<long long, 10> items_introduced_by_capacity_decile{};
+    std::array<long long, 10> items_introduced_by_reduction_decile{};
 };
 
 class CriticalSequence {
@@ -54,8 +69,8 @@ public:
     template <typename ShouldIntroduce, typename ShouldExpand>
     SliceBuildResult process_slice_incremental(
         Weight ya, Weight yb, Weight compute_limit,
-        std::vector<Item>& active_items,
-        const std::vector<Item>& items_by_weight,
+        std::vector<ActiveItem>& active_items,
+        const std::vector<ActiveItem>& items_by_weight,
         std::size_t& next_item,
         ShouldIntroduce&& should_introduce,
         ShouldExpand&& should_expand);
@@ -67,9 +82,14 @@ public:
     [[nodiscard]] PointId state_at_or_before(Weight y) const;
     [[nodiscard]] Profit value_at(Weight y) const;
     [[nodiscard]] const State& state(PointId id) const;
-    [[nodiscard]] const std::vector<PointId>& skip_points() const noexcept;
+    [[nodiscard]] const std::vector<State>& states() const noexcept;
     [[nodiscard]] std::size_t stored_states() const noexcept;
     [[nodiscard]] long long generated_candidates() const noexcept;
+    [[nodiscard]] long long candidates_stored() const noexcept;
+    [[nodiscard]] long long computed_window_collisions() const noexcept;
+    [[nodiscard]] long long computed_window_replacements() const noexcept;
+    [[nodiscard]] long long computed_window_rejections() const noexcept;
+    [[nodiscard]] long long computed_window_index_collisions() const noexcept;
     [[nodiscard]] std::size_t estimated_bytes() const noexcept;
 
 private:
@@ -92,6 +112,11 @@ private:
         [[nodiscard]] bool contains(Weight weight) const;
         [[nodiscard]] Candidate take(Weight weight);
         [[nodiscard]] std::size_t estimated_bytes() const noexcept;
+        [[nodiscard]] long long candidates_stored() const noexcept;
+        [[nodiscard]] long long collisions() const noexcept;
+        [[nodiscard]] long long replacements() const noexcept;
+        [[nodiscard]] long long rejections() const noexcept;
+        [[nodiscard]] long long index_collisions() const noexcept;
 
     private:
         struct Slot {
@@ -104,16 +129,26 @@ private:
         std::vector<Slot> slots_;
         Weight largest_item_weight_ = 0;
         std::size_t index_mask_ = 0;
+        long long candidates_stored_ = 0;
+        long long collisions_ = 0;
+        long long replacements_ = 0;
+        long long rejections_ = 0;
+        long long index_collisions_ = 0;
     };
 
     void schedule_successors(PointId parent, Weight compute_limit,
                              const std::vector<Item>& items, SliceBuildResult& result);
-    void backfill_item(const Item& item, Weight compute_limit, SliceBuildResult& result);
+    void schedule_active_successors(PointId parent, Weight compute_limit,
+                                    const std::vector<ActiveItem>& items,
+                                    SliceBuildResult& result);
+    void backfill_item(const ActiveItem& item, Weight compute_limit,
+                       SliceBuildResult& result);
     void reserve_storage(Weight compute_limit, const std::vector<Item>& items);
+    void reserve_active_storage(Weight compute_limit,
+                                const std::vector<ActiveItem>& items);
     [[nodiscard]] int tie_rank(const Item& item, std::size_t fallback) const noexcept;
 
     std::vector<State> states_;
-    std::vector<PointId> skip_points_;
     ComputedWindow pending_;
     std::vector<PointId> expandable_points_;
     std::vector<int> item_tie_rank_by_id_;
@@ -134,6 +169,7 @@ SliceBuildResult CriticalSequence::process_slice(
         root_processed_ = true;
         ++result.states_entered;
         if (should_expand(0)) {
+            ++result.states_expanded;
             expandable_points_.push_back(0);
             schedule_successors(0, compute_limit, items, result);
         }
@@ -146,15 +182,15 @@ SliceBuildResult CriticalSequence::process_slice(
         if (pending_.contains(weight)) {
             const Candidate candidate = pending_.take(weight);
 
-            const Profit previous_profit = state(skip_points_.back()).profit;
+            const Profit previous_profit = states_.back().profit;
             if (candidate.profit > previous_profit) {
                 states_.push_back(
                     State{weight, candidate.profit, candidate.predecessor, candidate.item_id});
                 const PointId id = states_.size() - 1;
-                skip_points_.push_back(id);
                 ++result.states_created;
                 ++result.states_entered;
                 if (should_expand(id)) {
+                    ++result.states_expanded;
                     expandable_points_.push_back(id);
                     schedule_successors(id, compute_limit, items, result);
                 }
@@ -167,19 +203,21 @@ SliceBuildResult CriticalSequence::process_slice(
 
 template <typename ShouldIntroduce, typename ShouldExpand>
 SliceBuildResult CriticalSequence::process_slice_incremental(
-    Weight ya, Weight yb, Weight compute_limit, std::vector<Item>& active_items,
-    const std::vector<Item>& items_by_weight, std::size_t& next_item,
+    Weight ya, Weight yb, Weight compute_limit,
+    std::vector<ActiveItem>& active_items,
+    const std::vector<ActiveItem>& items_by_weight, std::size_t& next_item,
     ShouldIntroduce&& should_introduce, ShouldExpand&& should_expand) {
     SliceBuildResult result;
     if (yb < ya || compute_limit < 0) return result;
 
-    reserve_storage(compute_limit, active_items);
+    reserve_active_storage(compute_limit, active_items);
     if (!root_processed_ && ya == 0) {
         root_processed_ = true;
         ++result.states_entered;
         if (should_expand(0)) {
+            ++result.states_expanded;
             expandable_points_.push_back(0);
-            schedule_successors(0, compute_limit, active_items, result);
+            schedule_active_successors(0, compute_limit, active_items, result);
         }
     }
 
@@ -187,7 +225,7 @@ SliceBuildResult CriticalSequence::process_slice_incremental(
     for (Weight weight = first_weight;; ++weight) {
         Candidate selected{};
         bool has_selected = false;
-        const Profit previous_profit = state(skip_points_.back()).profit;
+        const Profit previous_profit = states_.back().profit;
         Profit envelope = previous_profit;
 
         if (pending_.contains(weight)) {
@@ -197,7 +235,7 @@ SliceBuildResult CriticalSequence::process_slice_incremental(
         }
 
         while (next_item < items_by_weight.size() && items_by_weight[next_item].w == weight) {
-            const Item& item = items_by_weight[next_item++];
+            const ActiveItem& item = items_by_weight[next_item++];
             ++result.items_considered_for_introduction;
             if (item.p <= envelope) {
                 ++result.items_rejected_by_envelope;
@@ -211,26 +249,39 @@ SliceBuildResult CriticalSequence::process_slice_incremental(
             backfill_item(item, compute_limit, result);
             const auto position = std::lower_bound(
                 active_items.begin(), active_items.end(), item,
-                [](const Item& existing, const Item& value) {
-                    return better_ratio(existing, value);
+                [](const ActiveItem& existing, const ActiveItem& value) {
+                    return existing.tie_rank < value.tie_rank;
                 });
             active_items.insert(position, item);
-            selected = Candidate{item.p, 0, item.id, tie_rank(item, 0)};
+            selected = Candidate{item.p, 0, item.id, item.tie_rank};
             has_selected = true;
             envelope = item.p;
             ++result.items_introduced;
+            if (compute_limit > 0) {
+                const auto scaled = static_cast<__int128>(item.w) * 10;
+                const auto raw_decile = static_cast<std::size_t>(scaled / compute_limit);
+                const std::size_t decile = std::min<std::size_t>(9, raw_decile);
+                ++result.items_introduced_by_capacity_decile[decile];
+            }
+            if (!items_by_weight.empty() && items_by_weight.back().w > 0) {
+                const auto scaled = static_cast<__int128>(item.w) * 10;
+                const auto raw_decile = static_cast<std::size_t>(
+                    scaled / items_by_weight.back().w);
+                const std::size_t decile = std::min<std::size_t>(9, raw_decile);
+                ++result.items_introduced_by_reduction_decile[decile];
+            }
         }
 
         if (has_selected && selected.profit > previous_profit) {
             states_.push_back(
                 State{weight, selected.profit, selected.predecessor, selected.item_id});
             const PointId id = states_.size() - 1;
-            skip_points_.push_back(id);
             ++result.states_created;
             ++result.states_entered;
             if (should_expand(id)) {
+                ++result.states_expanded;
                 expandable_points_.push_back(id);
-                schedule_successors(id, compute_limit, active_items, result);
+                schedule_active_successors(id, compute_limit, active_items, result);
             }
         }
         if (weight == yb) break;

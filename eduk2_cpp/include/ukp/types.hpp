@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <limits>
 #include <map>
@@ -39,6 +40,7 @@ struct SliceStats {
     Weight begin = 0;
     Weight end = 0;
     long long states_entered = 0;
+    long long states_expanded = 0;
     long long successor_attempts = 0;
     long long successor_item_scans = 0;
     long long backfill_attempts = 0;
@@ -59,8 +61,18 @@ struct Stats {
     long long original_items = 0;
     long long after_preprocess_items = 0;
     long long states_scanned = 0;
+    long long states_expanded = 0;
+    long long successor_attempts = 0;
     long long successor_item_scans = 0;
     long long backfill_attempts = 0;
+    long long candidates_stored = 0;
+    long long computed_window_collisions = 0;
+    long long computed_window_replacements = 0;
+    long long computed_window_rejections = 0;
+    long long computed_window_index_collisions = 0;
+    long long active_item_samples = 0;
+    long long active_items_sum = 0;
+    long long active_items_max = 0;
     long long states_kept = 0;
     long long states_fathomed = 0;
     long long bound_calls = 0;
@@ -81,6 +93,30 @@ struct Stats {
     long long items_introduced = 0;
     long long items_rejected_by_envelope = 0;
     long long items_rejected_by_bound = 0;
+    std::array<long long, 10> items_introduced_by_capacity_decile{};
+    std::array<long long, 10> items_introduced_by_reduction_decile{};
+    long long contextual_bound_state_queries = 0;
+    long long contextual_bound_item_queries = 0;
+    long long contextual_bound_calls_avoided_by_lower = 0;
+    long long contextual_bound_state_calls_avoided_by_lower = 0;
+    long long contextual_bound_item_calls_avoided_by_lower = 0;
+    std::map<std::string, long long> contextual_bound_evaluations;
+    std::map<std::string, long long> contextual_bound_wins;
+    std::map<std::string, long long> contextual_bound_state_wins;
+    std::map<std::string, long long> contextual_bound_item_wins;
+    std::map<std::string, long long> contextual_bound_fathoms;
+    long long bound_context_rebuilds = 0;
+    long long bound_context_items_processed = 0;
+    long long bound_context_tau_q_recomputations = 0;
+    long long bound_context_tau_q_items_scanned = 0;
+    long long bound_context_best_q_recomputations = 0;
+    long long bound_context_best_q_items_scanned = 0;
+    long long bound_context_alpha_recomputations = 0;
+    long long bound_context_alpha_items_scanned = 0;
+    long long bound_context_dominance_full_searches = 0;
+    long long bound_context_dominance_searches_avoided_by_witness = 0;
+    long long bound_context_dominance_witness_invalidations = 0;
+    long long bound_context_dominance_pair_checks = 0;
     long long estimated_state_bytes = 0;
     std::string bound_winner = "none";
     std::string global_bound_used = "none";
@@ -88,6 +124,8 @@ struct Stats {
     std::vector<SliceStats> slices;
     std::string dp_stop_reason = "not_started";
     Weight periodicity_level = -1;
+    Weight dp_capacity_processed = 0;
+    long long active_items_at_periodicity = 0;
     std::string stop_reason = "uninitialized";
     // Test/debug telemetry.  These identify the immutable post-global-
     // reduction DP list and the local B&B core selected from it.

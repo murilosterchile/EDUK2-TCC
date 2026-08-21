@@ -20,3 +20,13 @@ Para executar o solver `faithful` com a instância de exemplo:
 Substitua `eduk2_cpp/data/example.ukp` pelo caminho da instância que deseja
 resolver. Para exibir o diagnóstico detalhado de cada `slice`, acrescente
 `--verbose` ao final do comando.
+
+
+cd  ~/TCC/EDUK2-TCC
+
+
+./eduk2_cpp/scripts/run_all_solvers.sh \
+  --runs 5 \
+  --ocaml-dir /home/aprix/TCC/EDUK2-TCC/pyasukp_mail/pyasukp \
+  --data-dir /home/aprix/TCC/EDUK2-TCC/eduk2_cpp/data \
+  --output-file /home/aprix/TCC/EDUK2-TCC/eduk2_cpp/results/all_solvers_mean_5.tsv

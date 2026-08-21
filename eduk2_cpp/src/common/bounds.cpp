@@ -54,12 +54,25 @@ BoundValue normalized_bound_from_q(const Item& normalized_base, const Item& orig
     return {floor_div(normalized_upper, static_cast<__int128>(q.denominator) * psi),
             safe_mul(copies, original_base.p), type};
 }
-bool has_no_multiple_dominance(const std::vector<Item>& items) {
+bool has_no_multiple_dominance(const std::vector<Item>& items,
+                               int& dominator_id,
+                               int& dominated_id,
+                               BoundContextTelemetry* telemetry) {
+    dominator_id = -1;
+    dominated_id = -1;
+    long long pair_checks = 0;
     for (std::size_t i = 0; i < items.size(); ++i) for (std::size_t j = 0; j < items.size(); ++j) {
+        ++pair_checks;
         if (i == j || items[i].w > items[j].w) continue;
         const Weight copies = items[j].w / items[i].w;
-        if (copies > 0 && static_cast<__int128>(copies) * items[i].p >= items[j].p) return false;
+        if (copies > 0 && static_cast<__int128>(copies) * items[i].p >= items[j].p) {
+            dominator_id = items[i].id;
+            dominated_id = items[j].id;
+            if (telemetry != nullptr) telemetry->dominance_pair_checks += pair_checks;
+            return false;
+        }
     }
+    if (telemetry != nullptr) telemetry->dominance_pair_checks += pair_checks;
     return true;
 }
 Profit diff(const Item& it) { return it.p - static_cast<Profit>(it.w); }
@@ -87,8 +100,13 @@ BoundType policy_type(BoundPolicy p) {
 
 namespace {
 void populate_bound_context(BoundContext& ctx, const std::vector<Item>& items,
-                            bool items_are_ratio_ordered) {
+                            bool items_are_ratio_ordered,
+                            BoundContextTelemetry* telemetry) {
     if (items.empty()) throw std::invalid_argument("empty item set");
+    if (telemetry != nullptr) {
+        ++telemetry->rebuilds;
+        telemetry->items_processed += static_cast<long long>(items.size());
+    }
     const bool has_previous_subset = items_are_ratio_ordered && !ctx.items.empty();
     const Item previous_tau_base = ctx.tau_star_base;
     const Item previous_best_base = ctx.best_item_star_base;
@@ -103,6 +121,10 @@ void populate_bound_context(BoundContext& ctx, const std::vector<Item>& items,
     const Weight previous_alpha_den = ctx.alpha_den;
     const int previous_alpha_item_id = ctx.alpha_item_id;
     const bool previous_no_multiple_dominance = ctx.no_multiple_dominance;
+    const int previous_multiple_dominance_dominator_id =
+        ctx.multiple_dominance_dominator_id;
+    const int previous_multiple_dominance_dominated_id =
+        ctx.multiple_dominance_dominated_id;
     // Contexts are rebuilt repeatedly while the residual item set shrinks.
     // Preserve the two largest buffers instead of allocating fresh copies.
     std::vector<Item> item_storage = std::move(ctx.items);
@@ -160,11 +182,17 @@ void populate_bound_context(BoundContext& ctx, const std::vector<Item>& items,
     bool previous_tau_q_item_present = previous_tau_q_item_id < 0;
     bool previous_best_q_item_present = previous_best_q_item_id < 0;
     bool previous_alpha_item_present = previous_alpha_item_id < 0;
+    bool previous_multiple_dominance_dominator_present = false;
+    bool previous_multiple_dominance_dominated_present = false;
     for (std::size_t index = 0; index < items.size(); ++index) {
         const Item& original = items[index];
         previous_tau_q_item_present |= original.id == previous_tau_q_item_id;
         previous_best_q_item_present |= original.id == previous_best_q_item_id;
         previous_alpha_item_present |= original.id == previous_alpha_item_id;
+        previous_multiple_dominance_dominator_present |=
+            original.id == previous_multiple_dominance_dominator_id;
+        previous_multiple_dominance_dominated_present |=
+            original.id == previous_multiple_dominance_dominated_id;
         Item& normalized = ctx.normalized_ratio_items[index];
         normalized.p = floor_div(static_cast<__int128>(normalized.p) * ctx.psi, 1);
     }
@@ -182,6 +210,10 @@ void populate_bound_context(BoundContext& ctx, const std::vector<Item>& items,
         ctx.tau_star_q_star_den = previous_tau_q_den;
         ctx.tau_star_q_star_item_id = previous_tau_q_item_id;
     } else {
+        if (telemetry != nullptr) {
+            ++telemetry->tau_q_recomputations;
+            telemetry->tau_q_items_scanned += static_cast<long long>(items.size());
+        }
         const RationalWitness tau_q =
             q_star(ctx.normalized_ratio_items, ctx.normalized_tau_star_base);
         ctx.tau_star_q_star_num = tau_q.value.numerator;
@@ -195,6 +227,10 @@ void populate_bound_context(BoundContext& ctx, const std::vector<Item>& items,
         ctx.best_item_star_q_star_den = previous_best_q_den;
         ctx.best_item_star_q_star_item_id = previous_best_q_item_id;
     } else {
+        if (telemetry != nullptr) {
+            ++telemetry->best_q_recomputations;
+            telemetry->best_q_items_scanned += static_cast<long long>(items.size());
+        }
         const RationalWitness best_item_q =
             q_star(ctx.normalized_ratio_items, ctx.normalized_best_item_star_base);
         ctx.best_item_star_q_star_num = best_item_q.value.numerator;
@@ -207,6 +243,10 @@ void populate_bound_context(BoundContext& ctx, const std::vector<Item>& items,
         ctx.alpha_den = previous_alpha_den;
         ctx.alpha_item_id = previous_alpha_item_id;
     } else {
+        if (telemetry != nullptr) {
+            ++telemetry->alpha_recomputations;
+            telemetry->alpha_items_scanned += static_cast<long long>(items.size());
+        }
         Profit alpha_num = 0;
         Weight alpha_den = 1;
         int alpha_item_id = -1;
@@ -229,8 +269,34 @@ void populate_bound_context(BoundContext& ctx, const std::vector<Item>& items,
     }
     ctx.preferred = static_cast<__int128>(ctx.alpha_num) <= ctx.alpha_den
         ? BoundType::V : BoundType::Both;
-    ctx.no_multiple_dominance = has_previous_subset && previous_no_multiple_dominance
-        ? true : has_no_multiple_dominance(ctx.items);
+    if (has_previous_subset && previous_no_multiple_dominance) {
+        ctx.no_multiple_dominance = true;
+    } else if (has_previous_subset &&
+               previous_multiple_dominance_dominator_id >= 0 &&
+               previous_multiple_dominance_dominated_id >= 0 &&
+               previous_multiple_dominance_dominator_present &&
+               previous_multiple_dominance_dominated_present) {
+        ctx.no_multiple_dominance = false;
+        ctx.multiple_dominance_dominator_id =
+            previous_multiple_dominance_dominator_id;
+        ctx.multiple_dominance_dominated_id =
+            previous_multiple_dominance_dominated_id;
+        if (telemetry != nullptr) {
+            ++telemetry->dominance_searches_avoided_by_witness;
+        }
+    } else {
+        if (telemetry != nullptr) {
+            ++telemetry->dominance_full_searches;
+            if (has_previous_subset &&
+                previous_multiple_dominance_dominator_id >= 0 &&
+                previous_multiple_dominance_dominated_id >= 0) {
+                ++telemetry->dominance_witness_invalidations;
+            }
+        }
+        ctx.no_multiple_dominance = has_no_multiple_dominance(
+            ctx.items, ctx.multiple_dominance_dominator_id,
+            ctx.multiple_dominance_dominated_id, telemetry);
+    }
     for (const BoundType type : {BoundType::U3, BoundType::V, BoundType::TauStar,
                                  BoundType::BestItemStar}) {
         if (is_bound_certified(ctx, type))
@@ -239,15 +305,17 @@ void populate_bound_context(BoundContext& ctx, const std::vector<Item>& items,
 }
 } // namespace
 
-BoundContext make_bound_context(const std::vector<Item>& items) {
+BoundContext make_bound_context(const std::vector<Item>& items,
+                                BoundContextTelemetry* telemetry) {
     BoundContext ctx;
-    populate_bound_context(ctx, items, false);
+    populate_bound_context(ctx, items, false, telemetry);
     return ctx;
 }
 
 void rebuild_bound_context_ratio_ordered(BoundContext& context,
-                                         const std::vector<Item>& ratio_ordered_items) {
-    populate_bound_context(context, ratio_ordered_items, true);
+                                         const std::vector<Item>& ratio_ordered_items,
+                                         BoundContextTelemetry* telemetry) {
+    populate_bound_context(context, ratio_ordered_items, true, telemetry);
 }
 
 bool is_bound_applicable(const BoundContext& ctx, BoundType type) {

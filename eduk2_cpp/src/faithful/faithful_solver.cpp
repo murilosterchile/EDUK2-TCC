@@ -237,6 +237,7 @@ CoreSearchResult traverse_core(const std::vector<Item>& dp_items, const BoundCon
                                Weight capacity, Profit global_upper, int requested_core,
                                long long limit, std::size_t original_count,
                                const EffectiveOptions& effective, bool paper_faithful_mode,
+                               BoundContextTelemetry* context_telemetry,
                                std::vector<int>* selected_core_ids = nullptr) {
     std::vector<Item> core_items;
     if (paper_faithful_mode) {
@@ -309,7 +310,7 @@ CoreSearchResult traverse_core(const std::vector<Item>& dp_items, const BoundCon
     }
     // Bounds in the core must describe its locally filtered items, while the
     // global upper remains the global certificate used for closure.
-    BoundContext core_bounds = make_bound_context(filtered);
+    BoundContext core_bounds = make_bound_context(filtered, context_telemetry);
     CoreTraversal search{filtered, core_bounds, policy, capacity, global_upper, std::max<long long>(0, limit), {}, {},
                          lightest_worse(filtered)};
     search.result.multiple_removed = core_multiple_removed;
@@ -358,13 +359,39 @@ SolverResult Solver::solve(const Instance& inst) {
     result.stats.items_removed_multiple = preprocessing.multiple_removed;
     result.stats.after_preprocess_items = static_cast<long long>(items.size());
 
-    BoundContext ctx = make_bound_context(items);
+    BoundContextTelemetry context_telemetry;
+    auto publish_context_telemetry = [&]() {
+        result.stats.bound_context_rebuilds = context_telemetry.rebuilds;
+        result.stats.bound_context_items_processed = context_telemetry.items_processed;
+        result.stats.bound_context_tau_q_recomputations =
+            context_telemetry.tau_q_recomputations;
+        result.stats.bound_context_tau_q_items_scanned =
+            context_telemetry.tau_q_items_scanned;
+        result.stats.bound_context_best_q_recomputations =
+            context_telemetry.best_q_recomputations;
+        result.stats.bound_context_best_q_items_scanned =
+            context_telemetry.best_q_items_scanned;
+        result.stats.bound_context_alpha_recomputations =
+            context_telemetry.alpha_recomputations;
+        result.stats.bound_context_alpha_items_scanned =
+            context_telemetry.alpha_items_scanned;
+        result.stats.bound_context_dominance_full_searches =
+            context_telemetry.dominance_full_searches;
+        result.stats.bound_context_dominance_searches_avoided_by_witness =
+            context_telemetry.dominance_searches_avoided_by_witness;
+        result.stats.bound_context_dominance_witness_invalidations =
+            context_telemetry.dominance_witness_invalidations;
+        result.stats.bound_context_dominance_pair_checks =
+            context_telemetry.dominance_pair_checks;
+    };
+    BoundContext ctx = make_bound_context(items, &context_telemetry);
     BoundValue global_bound{};
     global_bound.upper = std::numeric_limits<Profit>::max();
     long long best_count = inst.capacity / ctx.best.w;
     Profit incumbent = safe_mul(best_count, ctx.best.p);
     if (options_.use_bounds) {
-        const detail::BoundPhase bound_phase = detail::initialize_bounds(items, inst.capacity, options_.bound_policy);
+        const detail::BoundPhase bound_phase = detail::initialize_bounds(
+            items, inst.capacity, options_.bound_policy, &context_telemetry);
         ctx = bound_phase.context;
         global_bound = bound_phase.global;
         best_count = bound_phase.best_count;
@@ -386,6 +413,7 @@ SolverResult Solver::solve(const Instance& inst) {
         result.solution = solution_from_best_item(inst, ctx.best, best_count);
         result.stats.active_items_final = static_cast<long long>(items.size());
         result.stats.stop_reason = "initial_bound";
+        publish_context_telemetry();
         return result;
     }
 
@@ -394,7 +422,7 @@ SolverResult Solver::solve(const Instance& inst) {
                                                   result.stats.bound_calls, options_.bound_policy);
         result.stats.items_removed_bound = result.stats.after_preprocess_items - static_cast<long long>(items.size());
         std::sort(items.begin(), items.end(), better_ratio);
-        ctx = make_bound_context(items);
+        ctx = make_bound_context(items, &context_telemetry);
         result.stats.after_preprocess_items = static_cast<long long>(items.size());
     }
 
@@ -414,7 +442,7 @@ SolverResult Solver::solve(const Instance& inst) {
     // and rebuild in dp_items' stable ratio order, avoiding the old active +
     // weight-ordered concatenation and its full sort on every change.
     std::vector<unsigned char> residual_item_alive(inst.items.size(), 0);
-    auto residual_slot = [&](const Item& item) -> unsigned char& {
+    auto residual_slot = [&](const auto& item) -> unsigned char& {
         if (item.id < 0 || static_cast<std::size_t>(item.id) >= residual_item_alive.size()) {
             throw std::logic_error("item id is outside residual bound membership");
         }
@@ -423,7 +451,6 @@ SolverResult Solver::solve(const Instance& inst) {
     for (const Item& item : dp_items) residual_slot(item) = 1;
     std::vector<Item> residual_items;
     residual_items.reserve(dp_items.size());
-
     if (options_.use_core_bb) {
         constexpr long long kFaithfulCoreNodeLimit = 10'000;
         const long long core_node_limit = options_.paper_faithful_mode
@@ -432,7 +459,8 @@ SolverResult Solver::solve(const Instance& inst) {
         CoreSearchResult core = traverse_core(dp_items, ctx, options_.bound_policy, inst.capacity,
                                                global_bound.upper, options_.core_size,
                                                core_node_limit, inst.items.size(), effective,
-                                               options_.paper_faithful_mode, &result.stats.core_item_ids);
+                                               options_.paper_faithful_mode, &context_telemetry,
+                                               &result.stats.core_item_ids);
         incumbent = std::max(incumbent, core.profit);
         if (core.profit > incumbent_solution.profit) ++result.stats.incumbent_improvements_bb;
         Weight core_weight = 0;
@@ -447,6 +475,7 @@ SolverResult Solver::solve(const Instance& inst) {
             result.solution = incumbent_solution.solution("faithful");
             result.stats.active_items_final = static_cast<long long>(dp_items.size());
             result.stats.stop_reason = "core_bound_closed";
+            publish_context_telemetry();
             return result;
         }
     }
@@ -455,21 +484,26 @@ SolverResult Solver::solve(const Instance& inst) {
     // weight.  Equal-weight candidates retain the ratio/id order already
     // prescribed by better_ratio, so an inferior duplicate is never made
     // active before its dominating peer.
-    std::vector<Item> items_by_weight;
+    std::vector<detail::ActiveItem> items_by_weight;
     items_by_weight.reserve(dp_items.size());
-    for (const Item& item : dp_items) {
-        if (item.w <= inst.capacity) items_by_weight.push_back(item);
+    for (std::size_t rank = 0; rank < dp_items.size(); ++rank) {
+        const Item& item = dp_items[rank];
+        if (item.w <= inst.capacity) {
+            items_by_weight.push_back(detail::ActiveItem{
+                item.id, static_cast<int>(rank), item.w, item.p});
+        }
     }
     std::stable_sort(items_by_weight.begin(), items_by_weight.end(),
-        [](const Item& left, const Item& right) {
+        [](const detail::ActiveItem& left, const detail::ActiveItem& right) {
             if (left.w != right.w) return left.w < right.w;
-            return better_ratio(left, right);
+            return left.tie_rank < right.tie_rank;
         });
     std::size_t next_item = 0;
 
-    // `items` now has the same role as PYAsUKP's decreasingS: it contains
+    // `active_items` has the same role as PYAsUKP's decreasingS: it contains
     // only introduced, threshold-undominated items and stays ratio ordered.
-    items.clear();
+    std::vector<detail::ActiveItem> active_items;
+    active_items.reserve(dp_items.size());
 
     // The sequence is the DP representation: it stores only strict increases
     // of f(N, y), in topological weight order.
@@ -510,19 +544,65 @@ SolverResult Solver::solve(const Instance& inst) {
     detail::PointId periodicity_base = detail::no_point;
     long long periodicity_best_copies = 0;
     std::array<long long, kBoundTypes.size()> contextual_bound_counts{};
-    auto record_contextual_bound = [&](BoundType type, SliceStats& slice) {
-        ++contextual_bound_counts[bound_type_index(type)];
-        const char* name = bound_type_name(type);
+    std::array<long long, kBoundTypes.size()> contextual_bound_evaluations{};
+    std::array<long long, kBoundTypes.size()> contextual_bound_state_wins{};
+    std::array<long long, kBoundTypes.size()> contextual_bound_item_wins{};
+    std::array<long long, kBoundTypes.size()> contextual_bound_fathoms{};
+    auto record_contextual_bound = [&](const detail::ContextualBound& bound,
+                                       SliceStats& slice) {
+        for (std::size_t index = 0; index < 4; ++index) {
+            if ((bound.evaluated_mask & (std::uint8_t{1} << index)) != 0) {
+                ++contextual_bound_evaluations[index];
+            }
+        }
+        ++contextual_bound_counts[bound_type_index(bound.type)];
+        const char* name = bound_type_name(bound.type);
         if (slice.contextual_bound_used != name) slice.contextual_bound_used = name;
     };
-    auto publish_contextual_bound_counts = [&]() {
+    auto publish_dp_telemetry = [&]() {
         for (std::size_t index = 0; index < kBoundTypes.size(); ++index) {
             if (contextual_bound_counts[index] != 0) {
                 result.stats.contextual_bound_calls[bound_type_name(kBoundTypes[index])] =
                     contextual_bound_counts[index];
+                result.stats.contextual_bound_wins[bound_type_name(kBoundTypes[index])] =
+                    contextual_bound_counts[index];
+            }
+            if (contextual_bound_evaluations[index] != 0) {
+                result.stats.contextual_bound_evaluations[
+                    bound_type_name(kBoundTypes[index])] = contextual_bound_evaluations[index];
+            }
+            if (contextual_bound_state_wins[index] != 0) {
+                result.stats.contextual_bound_state_wins[
+                    bound_type_name(kBoundTypes[index])] =
+                        contextual_bound_state_wins[index];
+            }
+            if (contextual_bound_item_wins[index] != 0) {
+                result.stats.contextual_bound_item_wins[
+                    bound_type_name(kBoundTypes[index])] =
+                        contextual_bound_item_wins[index];
+            }
+            if (contextual_bound_fathoms[index] != 0) {
+                result.stats.contextual_bound_fathoms[bound_type_name(kBoundTypes[index])] =
+                    contextual_bound_fathoms[index];
             }
         }
+        result.stats.candidates_stored = sequence.candidates_stored();
+        result.stats.computed_window_collisions =
+            sequence.computed_window_collisions();
+        result.stats.computed_window_replacements =
+            sequence.computed_window_replacements();
+        result.stats.computed_window_rejections =
+            sequence.computed_window_rejections();
+        result.stats.computed_window_index_collisions =
+            sequence.computed_window_index_collisions();
+        publish_context_telemetry();
     };
+    auto feasible_residual_exceeds_incumbent =
+        [&](Profit prefix_profit, long long best_copies) {
+            const Profit feasible_profit = safe_add(
+                prefix_profit, safe_mul(best_copies, periodic_best.p));
+            return feasible_profit > incumbent;
+        };
 
     // Most greedy completions do not improve the incumbent.  Keep one
     // reconstruction buffer for the rare candidates that do, and remember the
@@ -536,18 +616,18 @@ SolverResult Solver::solve(const Instance& inst) {
     // which item would be considered next.
     std::vector<Weight> active_suffix_min_weight;
     auto rebuild_active_suffix_min_weight = [&]() {
-        active_suffix_min_weight.resize(items.size());
-        if (items.empty()) return;
-        Weight minimum_weight = items.back().w;
-        for (std::size_t index = items.size(); index-- > 0;) {
-            minimum_weight = std::min(minimum_weight, items[index].w);
+        active_suffix_min_weight.resize(active_items.size());
+        if (active_items.empty()) return;
+        Weight minimum_weight = active_items.back().w;
+        for (std::size_t index = active_items.size(); index-- > 0;) {
+            minimum_weight = std::min(minimum_weight, active_items[index].w);
             active_suffix_min_weight[index] = minimum_weight;
         }
     };
     rebuild_active_suffix_min_weight();
 
     auto ensure_active_suffix_min_weight = [&]() {
-        if (active_suffix_min_weight.size() != items.size()) {
+        if (active_suffix_min_weight.size() != active_items.size()) {
             rebuild_active_suffix_min_weight();
         }
     };
@@ -558,9 +638,9 @@ SolverResult Solver::solve(const Instance& inst) {
         Weight used_weight = state.weight;
         Weight remaining = inst.capacity - used_weight;
         Profit candidate_profit = state.profit;
-        for (std::size_t index = 0; index < items.size(); ++index) {
+        for (std::size_t index = 0; index < active_items.size(); ++index) {
             if (remaining < active_suffix_min_weight[index]) break;
-            const Item& item = items[index];
+            const detail::ActiveItem& item = active_items[index];
             if (item.w > remaining) continue;
             const long long copies = remaining / item.w;
             const Weight added_weight = safe_mul(copies, item.w);
@@ -590,9 +670,9 @@ SolverResult Solver::solve(const Instance& inst) {
         }
         Weight reconstruction_weight = state.weight;
         Weight reconstruction_remaining = inst.capacity - reconstruction_weight;
-        for (std::size_t index = 0; index < items.size(); ++index) {
+        for (std::size_t index = 0; index < active_items.size(); ++index) {
             if (reconstruction_remaining < active_suffix_min_weight[index]) break;
-            const Item& item = items[index];
+            const detail::ActiveItem& item = active_items[index];
             if (item.w > reconstruction_remaining) continue;
             const long long copies = reconstruction_remaining / item.w;
             long long& count = reconstruction_multiplicity[static_cast<std::size_t>(item.id)];
@@ -620,68 +700,117 @@ SolverResult Solver::solve(const Instance& inst) {
     // apply threshold dominance at the completed boundary; then test stopping.
     // After crossing c/2, extend once through the largest active-item range,
     // as in EDUK2's `standard` recurrence.
-    std::vector<Item> threshold_survivors;
+    std::vector<detail::ActiveItem> threshold_survivors;
     threshold_survivors.reserve(dp_items.size());
     for (Weight ya = 0; ya < process_limit;) {
         const Weight yb = std::min(process_limit, ya + h);
         SliceStats slice;
         slice.begin = ya;
         slice.end = yb;
-        slice.active_items_before = static_cast<long long>(items.size());
+        slice.active_items_before = static_cast<long long>(active_items.size());
         const std::size_t previous_next_item = next_item;
         const detail::SliceBuildResult build = sequence.process_slice_incremental(
-            ya, yb, candidate_limit, items, items_by_weight, next_item,
-            [&](const Item& item, Profit) {
+            ya, yb, candidate_limit, active_items, items_by_weight, next_item,
+            [&](const detail::ActiveItem& item, Profit) {
                 if (options_.use_bounds) {
-                    const BoundValue residual = compute_bound(
-                        ctx, inst.capacity - item.w, options_.bound_policy);
-                    ++result.stats.bound_calls;
-                    record_contextual_bound(residual.type, slice);
-                    if (safe_add(item.p, residual.upper) <= incumbent) return false;
+                    const Weight residual_capacity = inst.capacity - item.w;
+                    const long long periodic_best_copies =
+                        residual_capacity / periodic_best.w;
+                    if (feasible_residual_exceeds_incumbent(
+                            item.p, periodic_best_copies)) {
+                        ++result.stats.contextual_bound_calls_avoided_by_lower;
+                        ++result.stats.contextual_bound_item_calls_avoided_by_lower;
+                    } else {
+                        const long long context_best_copies =
+                            ctx.best.id == periodic_best.id ? periodic_best_copies :
+                            residual_capacity / ctx.best.w;
+                        const detail::ContextualBound residual =
+                            detail::compute_contextual_bound(
+                                ctx, residual_capacity, options_.bound_policy,
+                                context_best_copies);
+                        ++result.stats.bound_calls;
+                        ++result.stats.contextual_bound_item_queries;
+                        record_contextual_bound(residual, slice);
+                        ++contextual_bound_item_wins[bound_type_index(residual.type)];
+                        if (safe_add(item.p, residual.upper) <= incumbent) return false;
+                    }
                 }
                 contribution_slot(item.id) = item.w;
                 return true;
             },
             [&](detail::PointId state_index) {
             const detail::State& state = sequence.state(state_index);
+            const int state_item_id = state.item_id;
             ++slice.states_entered;
             // PYAsUKP's transfert_in_sequence_result never fathoms a state
             // whose last item is b.  Preserving that chain is an invariant of
             // the threshold-based periodicity certificate and of fill_with_best.
-            if (options_.use_bounds && state.item_id != periodic_best.id) {
-                const BoundValue residual = compute_bound(
-                    ctx, inst.capacity - state.weight, options_.bound_policy);
-                ++result.stats.bound_calls;
-                record_contextual_bound(residual.type, slice);
-                if (safe_add(state.profit, residual.upper) <= incumbent) {
-                    ++result.stats.states_fathomed;
-                    ++slice.states_fathomed_by_bound;
-                    return false;
+            if (options_.use_bounds && state_item_id != periodic_best.id) {
+                const Weight residual_capacity = inst.capacity - state.weight;
+                const long long periodic_best_copies =
+                    residual_capacity / periodic_best.w;
+                if (feasible_residual_exceeds_incumbent(
+                        state.profit, periodic_best_copies)) {
+                    ++result.stats.contextual_bound_calls_avoided_by_lower;
+                    ++result.stats.contextual_bound_state_calls_avoided_by_lower;
+                } else {
+                    const long long context_best_copies =
+                        ctx.best.id == periodic_best.id ? periodic_best_copies :
+                        residual_capacity / ctx.best.w;
+                    const detail::ContextualBound residual =
+                        detail::compute_contextual_bound(
+                            ctx, residual_capacity, options_.bound_policy,
+                            context_best_copies);
+                    ++result.stats.bound_calls;
+                    ++result.stats.contextual_bound_state_queries;
+                    record_contextual_bound(residual, slice);
+                    ++contextual_bound_state_wins[bound_type_index(residual.type)];
+                    if (safe_add(state.profit, residual.upper) <= incumbent) {
+                        ++contextual_bound_fathoms[bound_type_index(residual.type)];
+                        ++result.stats.states_fathomed;
+                        ++slice.states_fathomed_by_bound;
+                        return false;
+                    }
                 }
             }
             // Listing 1's fathoming improves z by greedily completing every
             // surviving optimal state with the current dominance-free items.
             consider_greedy_completion(state_index);
             // Every state exposed by the sequence is a strict skip-point.
-            if (state.item_id >= 0) contribution_slot(state.item_id) = state.weight;
+            if (state_item_id >= 0) contribution_slot(state_item_id) = state.weight;
             ++result.stats.states_kept;
             ++slice.states_kept;
             return true;
         });
-        result.stats.states_scanned += build.successor_attempts;
+        result.stats.states_scanned += build.states_entered;
+        result.stats.states_expanded += build.states_expanded;
+        result.stats.successor_attempts += build.successor_attempts;
         result.stats.successor_item_scans += build.successor_item_scans;
         result.stats.backfill_attempts += build.backfill_attempts;
+        result.stats.active_item_samples += build.active_item_samples;
+        result.stats.active_items_sum += build.active_items_sum;
+        result.stats.active_items_max = std::max(
+            result.stats.active_items_max, build.active_items_max);
         result.stats.items_considered_for_introduction += build.items_considered_for_introduction;
         result.stats.items_introduced += build.items_introduced;
         result.stats.items_rejected_by_envelope += build.items_rejected_by_envelope;
         result.stats.items_rejected_by_bound += build.items_rejected_by_bound;
+        for (std::size_t decile = 0;
+             decile < result.stats.items_introduced_by_capacity_decile.size();
+             ++decile) {
+            result.stats.items_introduced_by_capacity_decile[decile] +=
+                build.items_introduced_by_capacity_decile[decile];
+            result.stats.items_introduced_by_reduction_decile[decile] +=
+                build.items_introduced_by_reduction_decile[decile];
+        }
         if (build.items_considered_for_introduction > 0) {
             for (std::size_t index = previous_next_item; index < next_item; ++index) {
                 residual_slot(items_by_weight[index]) = 0;
             }
-            for (const Item& item : items) residual_slot(item) = 1;
+            for (const detail::ActiveItem& item : active_items) residual_slot(item) = 1;
         }
         slice.successor_attempts += build.successor_attempts;
+        slice.states_expanded += build.states_expanded;
         slice.successor_item_scans += build.successor_item_scans;
         slice.backfill_attempts += build.backfill_attempts;
         slice.states_created += build.states_created;
@@ -690,9 +819,10 @@ SolverResult Solver::solve(const Instance& inst) {
         slice.items_rejected_by_envelope += build.items_rejected_by_envelope;
         slice.items_rejected_by_bound += build.items_rejected_by_bound;
         result.stats.points_generated += build.points_generated;
+        result.stats.dp_capacity_processed = yb;
         if (options_.use_bounds && incumbent >= global_bound.upper) {
             closed_by_bound = true;
-            slice.active_items_after = static_cast<long long>(items.size());
+            slice.active_items_after = static_cast<long long>(active_items.size());
             result.stats.slices.push_back(std::move(slice));
             break;
         }
@@ -700,10 +830,10 @@ SolverResult Solver::solve(const Instance& inst) {
         // Dynamic threshold dominance from EDUK/PYAsUKP:
         // last_contribution(i) + w_i <= yb.  Run it only at a completed
         // slice, and keep one item so the active recurrence is never empty.
-        if (!items.empty()) {
+        if (!active_items.empty()) {
             threshold_survivors.clear();
-            std::size_t remaining_active = items.size();
-            for (const Item& item : items) {
+            std::size_t remaining_active = active_items.size();
+            for (const detail::ActiveItem& item : active_items) {
                 const Weight contribution = contribution_slot(item.id);
                 if (contribution == kNoContribution) {
                     throw std::logic_error("active item has no introduction contribution");
@@ -721,8 +851,8 @@ SolverResult Solver::solve(const Instance& inst) {
             // Threshold removal changes the active recurrence.  Rebuild the
             // greedy suffix now; the valid residual bound context is rebuilt
             // below together with the not-yet-introduced candidates.
-            if (threshold_survivors.size() != items.size()) {
-                items.swap(threshold_survivors);
+            if (threshold_survivors.size() != active_items.size()) {
+                active_items.swap(threshold_survivors);
                 rebuild_active_suffix_min_weight();
             }
         }
@@ -732,28 +862,30 @@ SolverResult Solver::solve(const Instance& inst) {
                 if (residual_slot(item) != 0) residual_items.push_back(item);
             }
             if (!residual_items.empty()) {
-                rebuild_bound_context_ratio_ordered(ctx, residual_items);
+                rebuild_bound_context_ratio_ordered(
+                    ctx, residual_items, &context_telemetry);
             }
         }
-        slice.active_items_after = static_cast<long long>(items.size());
+        slice.active_items_after = static_cast<long long>(active_items.size());
         result.stats.slices.push_back(std::move(slice));
-        const std::size_t active_count = items.size();
+        const std::size_t active_count = active_items.size();
         // EDUK2 tests Chainlist.is_single only after reduction, i.e. after
         // Select.next_lightest has considered every item.  At that point a
         // singleton decreasingS containing b is the implementation's
         // threshold-dominance certificate for the paper's y+ level.
         const bool all_items_introduced = next_item == items_by_weight.size();
         if (options_.use_periodicity && all_items_introduced && active_count == 1 &&
-            items.front().id == periodic_best.id) {
+            active_items.front().id == periodic_best.id) {
             periodicity_detected = true;
             result.stats.periodicity_level = yb;
             ++result.stats.periodicity_hits;
+            result.stats.active_items_at_periodicity =
+                static_cast<long long>(active_count);
 
             // Direct counterpart of PYAsUKP's fill_with_best.  Select a
             // critical point in the capacity's residue class and complete it
             // with copies of b; no new DP states are required beyond y+.
-            const std::vector<detail::PointId>& points = sequence.skip_points();
-            periodicity_base = points.back();
+            periodicity_base = sequence.stored_states() - 1;
             const detail::State& last_state = sequence.state(periodicity_base);
             const Weight difference = inst.capacity - last_state.weight;
             const Weight remainder = difference % periodic_best.w;
@@ -772,9 +904,10 @@ SolverResult Solver::solve(const Instance& inst) {
             break;
         }
         if (!half_capacity_extension_done && yb >= initial_process_limit) {
-            const Weight active_wmax = items.empty() ? Weight{0} :
-                std::max_element(items.begin(), items.end(),
-                    [](const Item& left, const Item& right) { return left.w < right.w; })->w;
+            const Weight active_wmax = active_items.empty() ? Weight{0} :
+                std::max_element(active_items.begin(), active_items.end(),
+                    [](const detail::ActiveItem& left,
+                       const detail::ActiveItem& right) { return left.w < right.w; })->w;
             process_limit = std::min(inst.capacity, safe_add(yb, active_wmax));
             half_capacity_extension_done = true;
         }
@@ -807,7 +940,7 @@ SolverResult Solver::solve(const Instance& inst) {
         incumbent_solution.consider(periodic_profit, periodic_weight,
                                     std::move(multiplicity));
 
-        publish_contextual_bound_counts();
+        publish_dp_telemetry();
         result.solution = incumbent_solution.solution("faithful");
         result.stats.estimated_state_bytes =
             static_cast<long long>(sequence.estimated_bytes());
@@ -822,19 +955,19 @@ SolverResult Solver::solve(const Instance& inst) {
     detail::PointId first_index = 0;
     detail::PointId second_index = 0;
     Profit split_profit = 0;
-    const std::vector<detail::PointId>& skip_points = sequence.skip_points();
-    std::size_t partner_position = skip_points.size() - 1;
-    for (const detail::PointId index : skip_points) {
-        const detail::State& state = sequence.state(index);
+    const std::vector<detail::State>& states = sequence.states();
+    std::size_t partner_position = states.size() - 1;
+    for (detail::PointId index = 0; index < states.size(); ++index) {
+        const detail::State& state = states[index];
         const Weight residual_capacity = inst.capacity - state.weight;
         // State weights increase while the complementary capacity decreases,
         // so the best feasible partner moves only toward the sequence front.
         while (partner_position > 0 &&
-               sequence.state(skip_points[partner_position]).weight > residual_capacity) {
+               states[partner_position].weight > residual_capacity) {
             --partner_position;
         }
-        const detail::PointId partner = skip_points[partner_position];
-        const Profit candidate = safe_add(state.profit, sequence.state(partner).profit);
+        const detail::PointId partner = partner_position;
+        const Profit candidate = safe_add(state.profit, states[partner].profit);
         if (candidate > split_profit) {
             split_profit = candidate;
             first_index = index;
@@ -843,10 +976,10 @@ SolverResult Solver::solve(const Instance& inst) {
     }
 
     if (split_profit <= incumbent_solution.profit) {
-        publish_contextual_bound_counts();
+        publish_dp_telemetry();
         result.solution = incumbent_solution.solution("faithful");
         result.stats.estimated_state_bytes = static_cast<long long>(sequence.estimated_bytes());
-        const std::size_t active_count = items.size();
+        const std::size_t active_count = active_items.size();
         result.stats.active_items_final = static_cast<long long>(active_count);
         result.stats.dp_stop_reason = closed_by_bound ? "bound_closed" :
             (active_count == 1 ? "single_active_item" : "half_capacity_cut");
@@ -896,9 +1029,9 @@ SolverResult Solver::solve(const Instance& inst) {
     add_trace(second_index);
 
     result.solution = std::move(sol);
-    publish_contextual_bound_counts();
+    publish_dp_telemetry();
     result.stats.estimated_state_bytes = static_cast<long long>(sequence.estimated_bytes());
-    const std::size_t active_count = items.size();
+    const std::size_t active_count = active_items.size();
     result.stats.active_items_final = static_cast<long long>(active_count);
     result.stats.dp_stop_reason = closed_by_bound ? "bound_closed" :
         (active_count == 1 ? "single_active_item" : "half_capacity_cut");

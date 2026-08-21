@@ -55,19 +55,42 @@ struct BoundContext {
     Profit delta1 = 0;
     BoundType preferred = BoundType::Both;
     bool no_multiple_dominance = false;
+    // When multiple dominance is present, these stable item IDs retain the
+    // pair that certified it in the most recent full search.
+    int multiple_dominance_dominator_id = -1;
+    int multiple_dominance_dominated_id = -1;
     // Certified bounds in the stable selection order.  This avoids rebuilding
     // an allocating vector for every contextual BestCertified query.
     std::array<BoundType, 4> certified_types{};
     std::size_t certified_type_count = 0;
 };
 
-BoundContext make_bound_context(const std::vector<Item>& items);
+// Optional diagnostic sink. It records context-maintenance work without
+// changing any bound formula, witness selection, or cache-validity decision.
+struct BoundContextTelemetry {
+    long long rebuilds = 0;
+    long long items_processed = 0;
+    long long tau_q_recomputations = 0;
+    long long tau_q_items_scanned = 0;
+    long long best_q_recomputations = 0;
+    long long best_q_items_scanned = 0;
+    long long alpha_recomputations = 0;
+    long long alpha_items_scanned = 0;
+    long long dominance_full_searches = 0;
+    long long dominance_searches_avoided_by_witness = 0;
+    long long dominance_witness_invalidations = 0;
+    long long dominance_pair_checks = 0;
+};
+
+BoundContext make_bound_context(const std::vector<Item>& items,
+                                BoundContextTelemetry* telemetry = nullptr);
 // Rebuilds an existing context for a monotonically shrinking residual subset,
 // retaining vector storage and cached witnesses that are still present.  The
 // caller guarantees exact better_ratio order; multiplying every profit by the
 // same positive psi preserves that order.
 void rebuild_bound_context_ratio_ordered(BoundContext& context,
-                                         const std::vector<Item>& ratio_ordered_items);
+                                         const std::vector<Item>& ratio_ordered_items,
+                                         BoundContextTelemetry* telemetry = nullptr);
 BoundValue compute_u3(const BoundContext& ctx, Weight c);
 BoundValue compute_v(const BoundContext& ctx, Weight c);
 BoundValue compute_tau_star(const BoundContext& ctx, Weight c);

@@ -5,12 +5,14 @@
 #include "ukp/io.hpp"
 #include "ukp/verify.hpp"
 #include "../src/faithful/critical_sequence.hpp"
+#include "../src/faithful/eduk2_bounds.hpp"
 #include "../src/faithful/incumbent.hpp"
 #include "../src/faithful/preprocessing.hpp"
 
 #include <filesystem>
 #include <iostream>
 #include <limits>
+#include <numeric>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -175,6 +177,64 @@ void check_faithful(const Instance& instance, Profit oracle, const std::string& 
                     prefix + "introduction decisions do not partition the candidates");
             require(result.stats.slices.back().active_items_after == result.stats.active_items_final,
                     prefix + "final active-item mismatch");
+            require(result.stats.states_scanned ==
+                        result.stats.states_kept + result.stats.states_fathomed,
+                    prefix + "state decisions do not partition scanned states");
+            require(result.stats.states_expanded == result.stats.states_kept,
+                    prefix + "expanded-state count differs from surviving states");
+            require(result.stats.active_item_samples == result.stats.states_expanded,
+                    prefix + "active-item sampling does not match expansions");
+            require(result.stats.successor_attempts == result.stats.points_generated,
+                    prefix + "successor attempts differ from generated points");
+            require(result.stats.successor_attempts ==
+                        result.stats.candidates_stored +
+                            result.stats.computed_window_rejections,
+                    prefix + "window decisions do not partition successor attempts");
+            require(result.stats.computed_window_collisions ==
+                        result.stats.computed_window_replacements +
+                            result.stats.computed_window_rejections,
+                    prefix + "window collision decisions do not partition collisions");
+            require(result.stats.computed_window_index_collisions == 0,
+                    prefix + "live computed-window entries aliased");
+            const long long introduced_by_capacity = std::accumulate(
+                result.stats.items_introduced_by_capacity_decile.begin(),
+                result.stats.items_introduced_by_capacity_decile.end(), 0LL);
+            require(introduced_by_capacity == result.stats.items_introduced,
+                    prefix + "introduction capacity histogram mismatch");
+            const long long introduced_by_reduction = std::accumulate(
+                result.stats.items_introduced_by_reduction_decile.begin(),
+                result.stats.items_introduced_by_reduction_decile.end(), 0LL);
+            require(introduced_by_reduction == result.stats.items_introduced,
+                    prefix + "introduction reduction-range histogram mismatch");
+            long long contextual_wins = 0;
+            for (const auto& [_, count] : result.stats.contextual_bound_wins) {
+                contextual_wins += count;
+            }
+            require(contextual_wins == result.stats.contextual_bound_state_queries +
+                        result.stats.contextual_bound_item_queries,
+                    prefix + "contextual bound query/winner mismatch");
+            long long contextual_state_wins = 0;
+            for (const auto& [_, count] : result.stats.contextual_bound_state_wins) {
+                contextual_state_wins += count;
+            }
+            long long contextual_item_wins = 0;
+            for (const auto& [_, count] : result.stats.contextual_bound_item_wins) {
+                contextual_item_wins += count;
+            }
+            require(contextual_state_wins == result.stats.contextual_bound_state_queries &&
+                        contextual_item_wins == result.stats.contextual_bound_item_queries &&
+                        contextual_state_wins + contextual_item_wins == contextual_wins,
+                    prefix + "contextual query kinds do not partition winners");
+            long long contextual_fathoms = 0;
+            for (const auto& [_, count] : result.stats.contextual_bound_fathoms) {
+                contextual_fathoms += count;
+            }
+            require(contextual_fathoms == result.stats.states_fathomed,
+                    prefix + "contextual fathom attribution mismatch");
+            require(result.stats.contextual_bound_calls_avoided_by_lower ==
+                        result.stats.contextual_bound_state_calls_avoided_by_lower +
+                            result.stats.contextual_bound_item_calls_avoided_by_lower,
+                    prefix + "lower-bound avoidance mismatch");
         }
         if (!configuration.options.use_bounds) {
             require(result.stats.global_bound_used == "none", prefix + "disabled bounds reported a global bound");
@@ -210,17 +270,18 @@ void check_skip_point_sequence() {
                     "skip-point value differs from dense DP");
         }
 
-        const auto& points = sequence.skip_points();
-        require(!points.empty(), "skip-point sequence is empty");
-        const auto& root = sequence.state(points.front());
-        require(root.weight == 0 && root.profit == 0 && root.predecessor == faithful::detail::no_point,
+        const auto& states = sequence.states();
+        require(!states.empty(), "skip-point sequence is empty");
+        const auto& root = states.front();
+        require(root.weight == 0 && root.profit == 0 &&
+                    root.predecessor == faithful::detail::no_point,
                 "skip-point root is invalid");
-        for (std::size_t i = 1; i < points.size(); ++i) {
-            const auto& prior = sequence.state(points[i - 1]);
-            const auto& state = sequence.state(points[i]);
+        for (std::size_t i = 1; i < states.size(); ++i) {
+            const auto& prior = states[i - 1];
+            const auto& state = states[i];
             require(state.weight > prior.weight && state.profit > prior.profit,
                     "skip-points are not strictly ordered");
-            require(state.predecessor != faithful::detail::no_point && state.predecessor < points[i],
+            require(state.predecessor != faithful::detail::no_point && state.predecessor < i,
                     "skip-point predecessor is not preserved");
             const auto item = std::find_if(items.begin(), items.end(), [&](const Item& x) {
                 return x.id == state.item_id;
@@ -230,7 +291,7 @@ void check_skip_point_sequence() {
             require(parent.weight + item->w == state.weight && parent.profit + item->p == state.profit,
                     "skip-point transition is inconsistent");
         }
-        const auto chosen = points.back();
+        const faithful::detail::PointId chosen = states.size() - 1;
         Weight reconstructed_weight = 0;
         Profit reconstructed_profit = 0;
         for (auto cursor = chosen; cursor != faithful::detail::no_point;
@@ -268,22 +329,28 @@ void check_incremental_item_introduction() {
                                       {13, 5, 9}, {14, 6, 10}};
     std::vector<Item> ratio_order = all_items;
     std::sort(ratio_order.begin(), ratio_order.end(), better_ratio);
-    std::vector<Item> weight_order = ratio_order;
-    std::stable_sort(weight_order.begin(), weight_order.end(), [](const Item& left, const Item& right) {
+    std::vector<faithful::detail::ActiveItem> weight_order;
+    for (std::size_t rank = 0; rank < ratio_order.size(); ++rank) {
+        const Item& item = ratio_order[rank];
+        weight_order.push_back({item.id, static_cast<int>(rank), item.w, item.p});
+    }
+    std::stable_sort(weight_order.begin(), weight_order.end(),
+                     [](const faithful::detail::ActiveItem& left,
+                        const faithful::detail::ActiveItem& right) {
         if (left.w != right.w) return left.w < right.w;
-        return better_ratio(left, right);
+        return left.tie_rank < right.tie_rank;
     });
 
     faithful::detail::CriticalSequence sequence;
     sequence.configure_item_order(ratio_order);
-    std::vector<Item> active;
+    std::vector<faithful::detail::ActiveItem> active;
     std::size_t next_item = 0;
     faithful::detail::SliceBuildResult total;
     constexpr Weight limit = 30;
     for (Weight ya = 0; ya < limit; ya += 4) {
         const auto part = sequence.process_slice_incremental(
             ya, std::min(limit, ya + 4), limit, active, weight_order, next_item,
-            [](const Item&, Profit) { return true; },
+            [](const faithful::detail::ActiveItem&, Profit) { return true; },
             [](faithful::detail::PointId) { return true; });
         total.successor_attempts += part.successor_attempts;
         total.backfill_attempts += part.backfill_attempts;
@@ -314,14 +381,15 @@ void check_incremental_item_introduction() {
     // At weight five, A+B can be generated with either last item.  The later
     // introduced, higher-ratio B must win independently of generation order.
     const std::vector<Item> tie_ratio_order{{11, 3, 5}, {10, 2, 3}};
-    std::vector<Item> tie_weight_order{{10, 2, 3}, {11, 3, 5}};
+    std::vector<faithful::detail::ActiveItem> tie_weight_order{
+        {10, 1, 2, 3}, {11, 0, 3, 5}};
     faithful::detail::CriticalSequence tie_sequence;
     tie_sequence.configure_item_order(tie_ratio_order);
-    std::vector<Item> tie_active;
+    std::vector<faithful::detail::ActiveItem> tie_active;
     std::size_t tie_next = 0;
     tie_sequence.process_slice_incremental(
         0, 5, 5, tie_active, tie_weight_order, tie_next,
-        [](const Item&, Profit) { return true; },
+        [](const faithful::detail::ActiveItem&, Profit) { return true; },
         [](faithful::detail::PointId) { return true; });
     const auto& tied = tie_sequence.state(tie_sequence.state_at_or_before(5));
     require(tied.weight == 5 && tied.profit == 8 && tied.item_id == 11 &&
@@ -643,6 +711,10 @@ void check_ratio_ordered_context_rebuild() {
                     persistent.alpha_den == expected.alpha_den &&
                     persistent.alpha_item_id == expected.alpha_item_id &&
                     persistent.no_multiple_dominance == expected.no_multiple_dominance &&
+                    persistent.multiple_dominance_dominator_id ==
+                        expected.multiple_dominance_dominator_id &&
+                    persistent.multiple_dominance_dominated_id ==
+                        expected.multiple_dominance_dominated_id &&
                     persistent.certified_type_count == expected.certified_type_count &&
                     std::equal(persistent.certified_types.begin(),
                                persistent.certified_types.begin() +
@@ -676,6 +748,66 @@ void check_ratio_ordered_context_rebuild() {
         }
         residual.erase(removal);
     }
+}
+
+void check_multiple_dominance_witness_persistence() {
+    std::vector<Item> residual{{10, 2, 4}, {20, 5, 9}, {30, 6, 8}};
+    std::sort(residual.begin(), residual.end(), better_ratio);
+    BoundContext context;
+    BoundContextTelemetry telemetry;
+
+    rebuild_bound_context_ratio_ordered(context, residual, &telemetry);
+    require(!context.no_multiple_dominance &&
+                context.multiple_dominance_dominator_id == 10 &&
+                context.multiple_dominance_dominated_id == 30,
+            "multiple-dominance search did not retain its witness IDs");
+    require(telemetry.dominance_full_searches == 1 &&
+                telemetry.dominance_searches_avoided_by_witness == 0 &&
+                telemetry.dominance_witness_invalidations == 0 &&
+                telemetry.dominance_pair_checks == 3,
+            "initial multiple-dominance telemetry is inconsistent");
+
+    rebuild_bound_context_ratio_ordered(context, residual, &telemetry);
+    require(!context.no_multiple_dominance &&
+                context.multiple_dominance_dominator_id == 10 &&
+                context.multiple_dominance_dominated_id == 30 &&
+                telemetry.dominance_full_searches == 1 &&
+                telemetry.dominance_searches_avoided_by_witness == 1 &&
+                telemetry.dominance_witness_invalidations == 0 &&
+                telemetry.dominance_pair_checks == 3,
+            "live multiple-dominance witness was not reused");
+
+    residual.erase(std::find_if(residual.begin(), residual.end(),
+        [](const Item& item) { return item.id == 10; }));
+    rebuild_bound_context_ratio_ordered(context, residual, &telemetry);
+    require(!context.no_multiple_dominance &&
+                context.multiple_dominance_dominator_id == 20 &&
+                context.multiple_dominance_dominated_id == 30 &&
+                telemetry.dominance_full_searches == 2 &&
+                telemetry.dominance_searches_avoided_by_witness == 1 &&
+                telemetry.dominance_witness_invalidations == 1 &&
+                telemetry.dominance_pair_checks == 5,
+            "invalidated multiple-dominance witness was not replaced");
+
+    residual.erase(std::find_if(residual.begin(), residual.end(),
+        [](const Item& item) { return item.id == 30; }));
+    rebuild_bound_context_ratio_ordered(context, residual, &telemetry);
+    require(context.no_multiple_dominance &&
+                context.multiple_dominance_dominator_id == -1 &&
+                context.multiple_dominance_dominated_id == -1 &&
+                telemetry.dominance_full_searches == 3 &&
+                telemetry.dominance_searches_avoided_by_witness == 1 &&
+                telemetry.dominance_witness_invalidations == 2 &&
+                telemetry.dominance_pair_checks == 6,
+            "last removed multiple-dominance witness was not invalidated");
+
+    rebuild_bound_context_ratio_ordered(context, residual, &telemetry);
+    require(context.no_multiple_dominance &&
+                telemetry.dominance_full_searches == 3 &&
+                telemetry.dominance_searches_avoided_by_witness == 1 &&
+                telemetry.dominance_witness_invalidations == 2 &&
+                telemetry.dominance_pair_checks == 6,
+            "dominance-free shrinking context repeated the full search");
 }
 
 // Regression oracle for the pre-optimization selection: it intentionally
@@ -869,6 +1001,11 @@ void check_certified_bound_cache_and_policies() {
             for (const BoundPolicy policy : {BoundPolicy::U3, BoundPolicy::V, BoundPolicy::TauStar,
                                               BoundPolicy::BestItemStar, BoundPolicy::BestCertified}) {
                 const BoundValue actual = compute_bound(context, capacity, policy);
+                const faithful::detail::ContextualBound contextual =
+                    faithful::detail::compute_contextual_bound(
+                        context, capacity, policy, capacity / context.best.w);
+                require(contextual.upper == actual.upper && contextual.type == actual.type,
+                        "specialized contextual evaluator changed a bound");
                 require(actual.upper >= oracle && actual.lower <= oracle,
                         "bound policy disagrees with dense-DP oracle");
                 if (policy == BoundPolicy::BestCertified) {
@@ -1041,6 +1178,7 @@ int main() {
         check_exnsds12_incremental_regression();
         check_precomputed_q_star();
         check_ratio_ordered_context_rebuild();
+        check_multiple_dominance_witness_persistence();
         check_linear_ratio_selection_equivalence();
         check_certified_bound_cache_and_policies();
         check_faithful_switches();

@@ -8,7 +8,6 @@ namespace ukp::faithful::detail {
 
 CriticalSequence::CriticalSequence() {
     states_.push_back(State{0, 0, no_point, -1});
-    skip_points_.push_back(0);
 }
 
 std::size_t CriticalSequence::ComputedWindow::index(Weight weight) const {
@@ -51,11 +50,23 @@ void CriticalSequence::ComputedWindow::configure(Weight largest_item_weight) {
 
 void CriticalSequence::ComputedWindow::store(Weight weight, const Candidate& candidate) {
     Slot& slot = slots_[index(weight)];
-    if (slot.weight != weight || candidate.profit > slot.candidate.profit ||
+    if (slot.weight != weight) {
+        if (slot.weight >= 0) ++index_collisions_;
+        ++candidates_stored_;
+        slot = Slot{candidate, weight};
+        return;
+    }
+
+    ++collisions_;
+    if (candidate.profit > slot.candidate.profit ||
         (candidate.profit == slot.candidate.profit &&
          candidate.tie_rank < slot.candidate.tie_rank)) {
         // Equal-profit candidates retain the highest ratio-order priority.
+        ++candidates_stored_;
+        ++replacements_;
         slot = Slot{candidate, weight};
+    } else {
+        ++rejections_;
     }
 }
 
@@ -79,25 +90,59 @@ std::size_t CriticalSequence::ComputedWindow::estimated_bytes() const noexcept {
     return slots_.capacity() * sizeof(Slot);
 }
 
+long long CriticalSequence::ComputedWindow::candidates_stored() const noexcept {
+    return candidates_stored_;
+}
+long long CriticalSequence::ComputedWindow::collisions() const noexcept {
+    return collisions_;
+}
+long long CriticalSequence::ComputedWindow::replacements() const noexcept {
+    return replacements_;
+}
+long long CriticalSequence::ComputedWindow::rejections() const noexcept {
+    return rejections_;
+}
+long long CriticalSequence::ComputedWindow::index_collisions() const noexcept {
+    return index_collisions_;
+}
+
 const State& CriticalSequence::state(PointId id) const { return states_.at(id); }
 
 PointId CriticalSequence::state_at_or_before(Weight y) const {
-    if (y < 0) return skip_points_.front();
-    const auto position = std::upper_bound(skip_points_.begin(), skip_points_.end(), y,
-        [&](Weight value, PointId id) { return value < states_[id].weight; });
-    return position == skip_points_.begin() ? skip_points_.front() : *std::prev(position);
+    if (y < 0) return 0;
+    const auto position = std::upper_bound(
+        states_.begin(), states_.end(), y,
+        [](Weight value, const State& state) { return value < state.weight; });
+    return position == states_.begin()
+        ? PointId{0}
+        : static_cast<PointId>(std::prev(position) - states_.begin());
 }
 
 Profit CriticalSequence::value_at(Weight y) const {
     return state(state_at_or_before(y)).profit;
 }
 
-const std::vector<PointId>& CriticalSequence::skip_points() const noexcept { return skip_points_; }
+const std::vector<State>& CriticalSequence::states() const noexcept { return states_; }
 std::size_t CriticalSequence::stored_states() const noexcept { return states_.size(); }
 long long CriticalSequence::generated_candidates() const noexcept { return generated_candidates_; }
+long long CriticalSequence::candidates_stored() const noexcept {
+    return pending_.candidates_stored();
+}
+long long CriticalSequence::computed_window_collisions() const noexcept {
+    return pending_.collisions();
+}
+long long CriticalSequence::computed_window_replacements() const noexcept {
+    return pending_.replacements();
+}
+long long CriticalSequence::computed_window_rejections() const noexcept {
+    return pending_.rejections();
+}
+long long CriticalSequence::computed_window_index_collisions() const noexcept {
+    return pending_.index_collisions();
+}
 std::size_t CriticalSequence::estimated_bytes() const noexcept {
-    return states_.size() * sizeof(State) + skip_points_.size() * sizeof(PointId) +
-           pending_.estimated_bytes() + expandable_points_.capacity() * sizeof(PointId) +
+    return states_.size() * sizeof(State) + pending_.estimated_bytes() +
+           expandable_points_.capacity() * sizeof(PointId) +
            item_tie_rank_by_id_.capacity() * sizeof(int);
 }
 
@@ -133,7 +178,6 @@ void CriticalSequence::reserve_storage(Weight compute_limit, const std::vector<I
         const std::size_t estimate = compute_limit >= static_cast<Weight>(kMaximumInitialReserve - 1)
             ? kMaximumInitialReserve : static_cast<std::size_t>(compute_limit + 1);
         states_.reserve(estimate);
-        skip_points_.reserve(estimate);
         expandable_points_.reserve(estimate);
     }
 
@@ -145,37 +189,85 @@ void CriticalSequence::reserve_storage(Weight compute_limit, const std::vector<I
     pending_.configure(largest_weight);
 }
 
+void CriticalSequence::reserve_active_storage(
+    Weight compute_limit, const std::vector<ActiveItem>& items) {
+    if (compute_limit >= 0) {
+        constexpr std::size_t kMaximumInitialReserve = 1U << 18;
+        const std::size_t estimate = compute_limit >= static_cast<Weight>(kMaximumInitialReserve - 1)
+            ? kMaximumInitialReserve : static_cast<std::size_t>(compute_limit + 1);
+        states_.reserve(estimate);
+        expandable_points_.reserve(estimate);
+    }
+
+    if (items.empty()) return;
+    Weight largest_weight = items.front().w;
+    for (const ActiveItem& item : items) {
+        largest_weight = std::max(largest_weight, item.w);
+    }
+    pending_.configure(largest_weight);
+}
+
 void CriticalSequence::schedule_successors(PointId parent, Weight compute_limit,
                                            const std::vector<Item>& items,
                                            SliceBuildResult& result) {
     const State& base = state(parent);
+    const Weight remaining_capacity = compute_limit - base.weight;
+    long long generated = 0;
+    ++result.active_item_samples;
+    result.active_items_sum += static_cast<long long>(items.size());
+    result.active_items_max = std::max(
+        result.active_items_max, static_cast<long long>(items.size()));
+    result.successor_item_scans += static_cast<long long>(items.size());
     for (std::size_t index = 0; index < items.size(); ++index) {
         const Item& item = items[index];
-        ++result.successor_item_scans;
-        const Weight weight = safe_add(base.weight, item.w);
-        if (weight > compute_limit) continue;
-        ++generated_candidates_;
-        ++result.successor_attempts;
-        ++result.points_generated;
+        if (item.w > remaining_capacity) continue;
+        const Weight weight = base.weight + item.w;
+        ++generated;
         const Candidate candidate{safe_add(base.profit, item.p), parent, item.id,
                                   tie_rank(item, index)};
         pending_.store(weight, candidate);
     }
+    generated_candidates_ += generated;
+    result.successor_attempts += generated;
+    result.points_generated += generated;
 }
 
-void CriticalSequence::backfill_item(const Item& item, Weight compute_limit,
+void CriticalSequence::schedule_active_successors(
+    PointId parent, Weight compute_limit, const std::vector<ActiveItem>& items,
+    SliceBuildResult& result) {
+    const State& base = state(parent);
+    const Weight remaining_capacity = compute_limit - base.weight;
+    long long generated = 0;
+    ++result.active_item_samples;
+    result.active_items_sum += static_cast<long long>(items.size());
+    result.active_items_max = std::max(
+        result.active_items_max, static_cast<long long>(items.size()));
+    result.successor_item_scans += static_cast<long long>(items.size());
+    for (const ActiveItem& item : items) {
+        if (item.w > remaining_capacity) continue;
+        const Weight weight = base.weight + item.w;
+        ++generated;
+        pending_.store(weight, Candidate{
+            safe_add(base.profit, item.p), parent, item.id, item.tie_rank});
+    }
+    generated_candidates_ += generated;
+    result.successor_attempts += generated;
+    result.points_generated += generated;
+}
+
+void CriticalSequence::backfill_item(const ActiveItem& item, Weight compute_limit,
                                      SliceBuildResult& result) {
     pending_.configure(item.w);
-    const int rank = tie_rank(item, 0);
+    const int rank = item.tie_rank;
     // The direct root + item transition is installed at the introduction
     // weight itself.  Backfill starts at the first positive state, matching
     // Init.introduce's next_built_upon = (0,1).
     for (const PointId parent : expandable_points_) {
         if (parent == 0) continue;
-        ++result.successor_item_scans;
         const State& base = state(parent);
-        const Weight weight = safe_add(base.weight, item.w);
-        if (weight > compute_limit) continue;
+        ++result.successor_item_scans;
+        if (item.w > compute_limit - base.weight) continue;
+        const Weight weight = base.weight + item.w;
         ++generated_candidates_;
         ++result.successor_attempts;
         ++result.backfill_attempts;
