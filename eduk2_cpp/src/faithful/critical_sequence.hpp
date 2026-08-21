@@ -165,7 +165,13 @@ private:
     void schedule_current_active_successors(PointId parent, Weight target_limit,
                                             const std::vector<ActiveItem>& items,
                                             SliceBuildResult& result);
+    [[nodiscard]] static bool active_item_weight_less(
+        const ActiveItem& left, const ActiveItem& right) noexcept;
+    void add_active_item_by_weight(const ActiveItem& item);
+    void compact_active_items_by_weight();
 #ifndef NDEBUG
+    void assert_active_item_views_match(
+        const std::vector<ActiveItem>& active_items) const;
     void assert_active_cursors_match_legacy_sync(
         const std::vector<ActiveItem>& items, Weight target_limit,
         const std::vector<std::size_t>& legacy_sync_start_by_rank) const;
@@ -185,6 +191,12 @@ private:
     std::vector<PointId> expandable_points_;
     std::vector<ItemCursor> item_cursors_;
     std::vector<int> item_tie_rank_by_id_;
+    // Scheduling-only view.  The semantic active set remains `active_items`
+    // in immutable tie-rank order; this mirror exists solely to stop capacity
+    // checks at the first item that no longer fits.
+    std::vector<ActiveItem> active_items_by_weight_;
+    std::vector<unsigned char> active_item_alive_by_rank_;
+    bool active_items_by_weight_dirty_ = false;
     bool root_processed_ = false;
     long long generated_candidates_ = 0;
 };
@@ -252,6 +264,12 @@ SliceBuildResult CriticalSequence::process_slice_incremental(
     if (yb < ya || compute_limit < 0) return result;
 
     reserve_active_storage(compute_limit, active_items);
+    // Threshold removals are committed between slices.  Compact the
+    // scheduling-only weight view once before it can be used again.
+    compact_active_items_by_weight();
+#ifndef NDEBUG
+    assert_active_item_views_match(active_items);
+#endif
     // Cursor batches only contain targets in this slice.  Include its width in
     // the circular window so all live targets have distinct slots even when a
     // custom slice height exceeds every active item weight.
@@ -330,6 +348,9 @@ SliceBuildResult CriticalSequence::process_slice_incremental(
 
             initialize_item_cursor(item);
             advance_item_cursor(item, target_limit, result);
+            // Items are considered in nondecreasing (weight, tie_rank) order,
+            // so accepted items can extend the scheduling view monotonically.
+            add_active_item_by_weight(item);
 #ifndef NDEBUG
             record_legacy_sync_start(item);
 #endif
@@ -384,6 +405,7 @@ SliceBuildResult CriticalSequence::process_slice_incremental(
 #ifndef NDEBUG
     assert_active_cursors_match_legacy_sync(
         active_items, target_limit, legacy_sync_start_by_rank);
+    assert_active_item_views_match(active_items);
 #endif
     return result;
 }

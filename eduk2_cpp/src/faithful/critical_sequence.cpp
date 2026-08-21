@@ -152,7 +152,9 @@ std::size_t CriticalSequence::estimated_bytes() const noexcept {
     return states_.size() * sizeof(State) + pending_.estimated_bytes() +
            expandable_points_.capacity() * sizeof(PointId) +
            item_cursors_.capacity() * sizeof(ItemCursor) +
-           item_tie_rank_by_id_.capacity() * sizeof(int);
+           item_tie_rank_by_id_.capacity() * sizeof(int) +
+           active_items_by_weight_.capacity() * sizeof(ActiveItem) +
+           active_item_alive_by_rank_.capacity() * sizeof(unsigned char);
 }
 
 std::size_t CriticalSequence::unprocessed_historical_states(
@@ -187,10 +189,96 @@ bool CriticalSequence::item_was_introduced(const ActiveItem& item) const {
 void CriticalSequence::stop_item_after_slice(const ActiveItem& item) {
     ItemCursor& cursor_state = cursor_for(item);
     cursor_state.built_upon_end = cursor_state.next_built_upon;
+
+    if (item.tie_rank < 0 ||
+        static_cast<std::size_t>(item.tie_rank) >= active_item_alive_by_rank_.size()) {
+        throw std::logic_error("stopped item tie rank is outside active weight view");
+    }
+    unsigned char& alive = active_item_alive_by_rank_[
+        static_cast<std::size_t>(item.tie_rank)];
+    if (alive == 0) {
+        throw std::logic_error("stopped item is absent from active weight view");
+    }
+    alive = 0;
+    active_items_by_weight_dirty_ = true;
 }
+
+bool CriticalSequence::active_item_weight_less(
+    const ActiveItem& left, const ActiveItem& right) noexcept {
+    if (left.w != right.w) return left.w < right.w;
+    return left.tie_rank < right.tie_rank;
+}
+
+void CriticalSequence::add_active_item_by_weight(const ActiveItem& item) {
+    if (item.tie_rank < 0 ||
+        static_cast<std::size_t>(item.tie_rank) >= active_item_alive_by_rank_.size()) {
+        throw std::logic_error("introduced item tie rank is outside active weight view");
+    }
+    unsigned char& alive = active_item_alive_by_rank_[
+        static_cast<std::size_t>(item.tie_rank)];
+    if (alive != 0) {
+        throw std::logic_error("introduced item already exists in active weight view");
+    }
+    if (!active_items_by_weight_.empty() &&
+        active_item_weight_less(item, active_items_by_weight_.back())) {
+        throw std::logic_error(
+            "introduced items are not monotone in weight/tie-rank order");
+    }
+    active_items_by_weight_.push_back(item);
+    alive = 1;
+}
+
+void CriticalSequence::compact_active_items_by_weight() {
+    if (!active_items_by_weight_dirty_) return;
+    std::size_t kept = 0;
+    for (const ActiveItem& item : active_items_by_weight_) {
+        if (item.tie_rank < 0 ||
+            static_cast<std::size_t>(item.tie_rank) >= active_item_alive_by_rank_.size()) {
+            throw std::logic_error("active weight-view item has an invalid tie rank");
+        }
+        if (active_item_alive_by_rank_[static_cast<std::size_t>(item.tie_rank)] == 0) {
+            continue;
+        }
+        active_items_by_weight_[kept++] = item;
+    }
+    active_items_by_weight_.resize(kept);
+    active_items_by_weight_dirty_ = false;
+}
+
+#ifndef NDEBUG
+void CriticalSequence::assert_active_item_views_match(
+    const std::vector<ActiveItem>& active_items) const {
+    assert(!active_items_by_weight_dirty_);
+    assert(active_items.size() == active_items_by_weight_.size());
+    assert(std::is_sorted(active_items_by_weight_.begin(),
+                          active_items_by_weight_.end(),
+                          active_item_weight_less));
+
+    std::vector<unsigned char> seen(item_cursors_.size(), 0);
+    for (const ActiveItem& item : active_items) {
+        assert(item.tie_rank >= 0);
+        const std::size_t rank = static_cast<std::size_t>(item.tie_rank);
+        assert(rank < seen.size());
+        assert(active_item_alive_by_rank_[rank] != 0);
+        assert(seen[rank] == 0);
+        seen[rank] = 1;
+    }
+    for (const ActiveItem& item : active_items_by_weight_) {
+        assert(item.tie_rank >= 0);
+        const std::size_t rank = static_cast<std::size_t>(item.tie_rank);
+        assert(rank < seen.size());
+        assert(seen[rank] != 0);
+        assert(active_item_alive_by_rank_[rank] != 0);
+    }
+}
+#endif
 
 void CriticalSequence::configure_item_order(const std::vector<Item>& ratio_ordered_items) {
     item_cursors_.assign(ratio_ordered_items.size(), ItemCursor{});
+    active_items_by_weight_.clear();
+    active_items_by_weight_.reserve(ratio_ordered_items.size());
+    active_item_alive_by_rank_.assign(ratio_ordered_items.size(), 0);
+    active_items_by_weight_dirty_ = false;
     int maximum_id = -1;
     for (const Item& item : ratio_ordered_items) maximum_id = std::max(maximum_id, item.id);
     if (maximum_id < 0 ||
@@ -386,8 +474,10 @@ void CriticalSequence::schedule_current_active_successors(
     assert(expandable_points_.back() == parent);
     const std::size_t parent_position = expandable_points_.size() - 1;
     const Weight remaining = target_limit - base.weight;
-    for (const ActiveItem& item : items) {
-        if (item.w > remaining) continue;
+    // This mirror is ordered only for capacity filtering.  Candidate priority
+    // remains the immutable tie_rank carried by each ActiveItem.
+    for (const ActiveItem& item : active_items_by_weight_) {
+        if (item.w > remaining) break;
 
         ItemCursor& cursor_state = cursor_for(item);
         assert(cursor_state.introduced);
