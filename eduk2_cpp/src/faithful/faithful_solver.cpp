@@ -6,6 +6,7 @@
 #include "incumbent.hpp"
 #include <algorithm>
 #include <array>
+#include <cassert>
 #include <chrono>
 #include <iostream>
 #include <map>
@@ -94,6 +95,78 @@ public:
     do { if constexpr (kBasicStats) { __VA_ARGS__; } } while (false)
 #define UKP_FULL_STATS(...) \
     do { if constexpr (kFullStats) { __VA_ARGS__; } } while (false)
+
+// Accumulates all residual-set changes requested during one DP slice.  The
+// request tables deduplicate IDs without sorting, so dp_items remains the
+// single source of the stable better_ratio order used to rebuild the context.
+struct ResidualDelta {
+    explicit ResidualDelta(std::size_t item_count)
+        : removal_requested_by_id(item_count, 0),
+          retirement_requested_by_id(item_count, 0) {}
+
+    void begin_slice() {
+        for (const int item_id : removed_ids) {
+            removal_requested_by_id[static_cast<std::size_t>(item_id)] = 0;
+        }
+        for (const detail::ActiveItem& item : active_items_to_retire) {
+            retirement_requested_by_id[static_cast<std::size_t>(item.id)] = 0;
+        }
+        removed_ids.clear();
+        active_items_to_retire.clear();
+        incumbent_changed = false;
+        had_item_decisions = false;
+        duplicate_requests = 0;
+    }
+
+    bool request_removal(int item_id) {
+        if (item_id < 0 ||
+            static_cast<std::size_t>(item_id) >= removal_requested_by_id.size()) {
+            throw std::logic_error("residual removal item id is out of range");
+        }
+        unsigned char& requested =
+            removal_requested_by_id[static_cast<std::size_t>(item_id)];
+        if (requested != 0) {
+            ++duplicate_requests;
+            return false;
+        }
+        requested = 1;
+        removed_ids.push_back(item_id);
+        return true;
+    }
+
+    void request_active_removal(const detail::ActiveItem& item) {
+        request_removal(item.id);
+        unsigned char& requested = retirement_requested_by_id[
+            static_cast<std::size_t>(item.id)];
+        if (requested != 0) {
+            ++duplicate_requests;
+            return;
+        }
+        requested = 1;
+        active_items_to_retire.push_back(item);
+    }
+
+    [[nodiscard]] bool contains(int item_id) const {
+        if (item_id < 0 ||
+            static_cast<std::size_t>(item_id) >= removal_requested_by_id.size()) {
+            throw std::logic_error("residual query item id is out of range");
+        }
+        return removal_requested_by_id[static_cast<std::size_t>(item_id)] != 0;
+    }
+
+    [[nodiscard]] bool requested() const noexcept {
+        return had_item_decisions || !removed_ids.empty() ||
+               !active_items_to_retire.empty();
+    }
+
+    std::vector<int> removed_ids;
+    std::vector<detail::ActiveItem> active_items_to_retire;
+    std::vector<unsigned char> removal_requested_by_id;
+    std::vector<unsigned char> retirement_requested_by_id;
+    bool incumbent_changed = false;
+    bool had_item_decisions = false;
+    long long duplicate_requests = 0;
+};
 
 struct Cell {
     Profit profit = 0;
@@ -485,15 +558,17 @@ SolverResult Solver::solve(const Instance& inst) {
     long long discarded_bound_calls = 0;
     long long& bound_calls_counter = kBasicStats
         ? result.stats.bound_calls : discarded_bound_calls;
-    BoundContext ctx = make_bound_context(items, context_telemetry_ptr);
+    BoundContext ctx;
     BoundValue global_bound{};
     global_bound.upper = std::numeric_limits<Profit>::max();
-    long long best_count = inst.capacity / ctx.best.w;
-    Profit incumbent = safe_mul(best_count, ctx.best.p);
+    long long best_count = 0;
+    Profit incumbent = 0;
     if (options_.use_bounds) {
-        const detail::BoundPhase bound_phase = detail::initialize_bounds(
+        // initialize_bounds is the only initial BoundContext construction on
+        // the bounded path.  The previous code built the same context twice.
+        detail::BoundPhase bound_phase = detail::initialize_bounds(
             items, inst.capacity, options_.bound_policy, context_telemetry_ptr);
-        ctx = bound_phase.context;
+        ctx = std::move(bound_phase.context);
         global_bound = bound_phase.global;
         best_count = bound_phase.best_count;
         incumbent = bound_phase.incumbent;
@@ -502,6 +577,10 @@ SolverResult Solver::solve(const Instance& inst) {
             result.stats.global_bound_used = bound_type_name(global_bound.type);
             result.stats.bound_winner = result.stats.global_bound_used;
         );
+    } else {
+        ctx = make_bound_context(items, context_telemetry_ptr);
+        best_count = inst.capacity / ctx.best.w;
+        incumbent = safe_mul(best_count, ctx.best.p);
     }
 
     detail::Incumbent incumbent_solution(inst.items.size());
@@ -524,14 +603,21 @@ SolverResult Solver::solve(const Instance& inst) {
 
     if (options_.use_bounds) {
         const long long items_before_bound_reduction = static_cast<long long>(items.size());
+#ifndef NDEBUG
+        assert(std::is_sorted(items.begin(), items.end(), better_ratio));
+#endif
         items = detail::reduce_variables_by_bound(items, ctx, inst.capacity, incumbent,
                                                   bound_calls_counter, options_.bound_policy);
+        // reduce_variables_by_bound is a stable filter, so survivors retain
+        // the exact better_ratio order of the input.
+#ifndef NDEBUG
+        assert(std::is_sorted(items.begin(), items.end(), better_ratio));
+#endif
         UKP_BASIC_STATS(
             result.stats.items_removed_bound =
                 items_before_bound_reduction - static_cast<long long>(items.size());
         );
-        std::sort(items.begin(), items.end(), better_ratio);
-        ctx = make_bound_context(items, context_telemetry_ptr);
+        rebuild_bound_context_ratio_ordered(ctx, items, context_telemetry_ptr);
         UKP_BASIC_STATS(
             result.stats.after_preprocess_items = static_cast<long long>(items.size());
         );
@@ -756,6 +842,7 @@ SolverResult Solver::solve(const Instance& inst) {
     // which item would be considered next.
     std::vector<Weight> active_suffix_min_weight;
     auto rebuild_active_suffix_min_weight = [&]() {
+        UKP_FULL_STATS(++result.stats.suffix_rebuilds;);
         active_suffix_min_weight.resize(active_items.size());
         if (active_items.empty()) return;
         Weight minimum_weight = active_items.back().w;
@@ -771,6 +858,10 @@ SolverResult Solver::solve(const Instance& inst) {
             rebuild_active_suffix_min_weight();
         }
     };
+
+    ResidualDelta residual_delta(inst.items.size());
+    std::vector<detail::ActiveItem> residual_survivors;
+    residual_survivors.reserve(dp_items.size());
 
     auto consider_greedy_completion = [&](detail::PointId state_index) {
         ensure_active_suffix_min_weight();
@@ -827,6 +918,7 @@ SolverResult Solver::solve(const Instance& inst) {
                                                reconstruction_multiplicity,
                                                reconstruction_touched_ids)) {
             incumbent = incumbent_solution.profit;
+            residual_delta.incumbent_changed = true;
             UKP_BASIC_STATS(++result.stats.incumbent_improvements_dp;);
         }
         for (const int item_id : reconstruction_touched_ids) {
@@ -835,17 +927,81 @@ SolverResult Solver::solve(const Instance& inst) {
         reconstruction_touched_ids.clear();
     };
 
+    auto commit_residual_delta = [&](bool solver_will_continue) {
+        if (!residual_delta.requested()) return;
+
+        UKP_FULL_STATS(
+            ++result.stats.residual_transactions;
+            result.stats.duplicate_removal_requests +=
+                residual_delta.duplicate_requests;
+        );
+
+        long long removed_now = 0;
+        for (const int item_id : residual_delta.removed_ids) {
+            unsigned char& alive =
+                residual_item_alive[static_cast<std::size_t>(item_id)];
+            if (alive == 0) {
+                UKP_FULL_STATS(++result.stats.duplicate_removal_requests;);
+                continue;
+            }
+            alive = 0;
+            ++removed_now;
+        }
+        UKP_FULL_STATS(result.stats.residual_items_removed += removed_now;);
+
+        // Cursor retirement and active-list compaction are committed together,
+        // after all threshold decisions for this slice are known.
+        for (const detail::ActiveItem& item :
+             residual_delta.active_items_to_retire) {
+            sequence.retire_item(item, candidate_limit);
+        }
+        if (!residual_delta.active_items_to_retire.empty()) {
+            residual_survivors.clear();
+            for (const detail::ActiveItem& item : active_items) {
+                if (!residual_delta.contains(item.id)) {
+                    residual_survivors.push_back(item);
+                }
+            }
+            if (residual_survivors.size() != active_items.size()) {
+                active_items.swap(residual_survivors);
+                rebuild_active_suffix_min_weight();
+            }
+        }
+
+        // A terminal slice never queries the context again.  With bounds
+        // disabled, the shrinking residual context is likewise unused.
+        if (!solver_will_continue || !options_.use_bounds) return;
+
+        UKP_FULL_STATS(++result.stats.context_rebuilds_requested;);
+        if (removed_now == 0) {
+            UKP_FULL_STATS(++result.stats.context_rebuilds_skipped_no_change;);
+            return;
+        }
+
+        residual_items.clear();
+        for (const Item& item : dp_items) {
+            if (residual_slot(item) != 0) residual_items.push_back(item);
+        }
+        if (residual_items.empty()) {
+            throw std::logic_error("residual transaction removed every item");
+        }
+#ifndef NDEBUG
+        assert(std::is_sorted(
+            residual_items.begin(), residual_items.end(), better_ratio));
+#endif
+        rebuild_bound_context_ratio_ordered(
+            ctx, residual_items, context_telemetry_ptr);
+    };
+
     // Listing 1 mapping: build/process a slice; fathom its states with
     // f(y)+U(c-y)<=z; greedily complete survivors; update contributions;
     // apply threshold dominance at the completed boundary; then test stopping.
     // After crossing c/2, extend once through the largest active-item range,
     // as in EDUK2's `standard` recurrence.
-    std::vector<detail::ActiveItem> threshold_survivors;
-    threshold_survivors.reserve(dp_items.size());
     for (Weight ya = 0; ya < process_limit;) {
         const Weight yb = std::min(process_limit, ya + h);
+        residual_delta.begin_slice();
         LocalSliceStats slice;
-        long long threshold_removed_this_slice = 0;
         if constexpr (kFullStats) {
             slice.begin = ya;
             slice.end = yb;
@@ -964,11 +1120,15 @@ SolverResult Solver::solve(const Instance& inst) {
                     build.items_introduced_by_reduction_decile[decile];
             }
         );
-        if (next_item != previous_next_item) {
-            for (std::size_t index = previous_next_item; index < next_item; ++index) {
-                residual_slot(items_by_weight[index]) = 0;
+        residual_delta.had_item_decisions = next_item != previous_next_item;
+        // Introduced items receive their initial contribution in the callback.
+        // A considered item that still has no contribution was rejected by the
+        // envelope or contextual bound and leaves the residual set.
+        for (std::size_t index = previous_next_item; index < next_item; ++index) {
+            const detail::ActiveItem& item = items_by_weight[index];
+            if (contribution_slot(item.id) == kNoContribution) {
+                residual_delta.request_removal(item.id);
             }
-            for (const detail::ActiveItem& item : active_items) residual_slot(item) = 1;
         }
         UKP_FULL_STATS(
             slice.successor_attempts += build.successor_attempts;
@@ -985,6 +1145,7 @@ SolverResult Solver::solve(const Instance& inst) {
         );
         if (options_.use_bounds && incumbent >= global_bound.upper) {
             closed_by_bound = true;
+            commit_residual_delta(false);
             UKP_FULL_STATS(
                 slice.active_items_after = static_cast<long long>(active_items.size());
             );
@@ -993,11 +1154,10 @@ SolverResult Solver::solve(const Instance& inst) {
             break;
         }
 
-        // Dynamic threshold dominance from EDUK/PYAsUKP:
-        // last_contribution(i) + w_i <= yb.  Run it only at a completed
-        // slice, and keep one item so the active recurrence is never empty.
+        // Dynamic threshold dominance from EDUK/PYAsUKP.  Record every
+        // decision first; the transaction below updates membership, cursors,
+        // active_items, suffix minima, and BoundContext exactly once.
         if (!active_items.empty()) {
-            threshold_survivors.clear();
             std::size_t remaining_active = active_items.size();
             for (const detail::ActiveItem& item : active_items) {
                 const Weight contribution = contribution_slot(item.id);
@@ -1007,36 +1167,13 @@ SolverResult Solver::solve(const Instance& inst) {
                 if (remaining_active > 1 &&
                     safe_add(contribution, item.w) <= yb) {
                     --remaining_active;
-                    residual_slot(item) = 0;
-                    // Eager scheduling had already emitted transitions from
-                    // every currently expandable state.  Freeze that prefix
-                    // and let its cursor drain lazily in later slices.
-                    sequence.retire_item(item, candidate_limit);
-                    ++threshold_removed_this_slice;
+                    residual_delta.request_active_removal(item);
                     UKP_BASIC_STATS(++result.stats.items_removed_threshold;);
                     UKP_FULL_STATS(++slice.items_removed_threshold;);
-                } else {
-                    threshold_survivors.push_back(item);
                 }
             }
-            // Threshold removal changes the active recurrence.  Rebuild the
-            // greedy suffix now; the valid residual bound context is rebuilt
-            // below together with the not-yet-introduced candidates.
-            if (threshold_survivors.size() != active_items.size()) {
-                active_items.swap(threshold_survivors);
-                rebuild_active_suffix_min_weight();
-            }
         }
-        if (next_item != previous_next_item || threshold_removed_this_slice > 0) {
-            residual_items.clear();
-            for (const Item& item : dp_items) {
-                if (residual_slot(item) != 0) residual_items.push_back(item);
-            }
-            if (!residual_items.empty()) {
-                rebuild_bound_context_ratio_ordered(
-                    ctx, residual_items, context_telemetry_ptr);
-            }
-        }
+        commit_residual_delta(true);
         UKP_FULL_STATS(
             slice.active_items_after = static_cast<long long>(active_items.size());
         );

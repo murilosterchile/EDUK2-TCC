@@ -192,6 +192,18 @@ void print_full_stats(const SolverResult& res, bool verbose) {
               << res.stats.bound_context_dominance_witness_invalidations << '\n';
     std::cout << "bound_context_dominance_pair_checks "
               << res.stats.bound_context_dominance_pair_checks << '\n';
+    std::cout << "residual_transactions "
+              << res.stats.residual_transactions << '\n';
+    std::cout << "residual_items_removed "
+              << res.stats.residual_items_removed << '\n';
+    std::cout << "context_rebuilds_requested "
+              << res.stats.context_rebuilds_requested << '\n';
+    std::cout << "context_rebuilds_skipped_no_change "
+              << res.stats.context_rebuilds_skipped_no_change << '\n';
+    std::cout << "suffix_rebuilds "
+              << res.stats.suffix_rebuilds << '\n';
+    std::cout << "duplicate_removal_requests "
+              << res.stats.duplicate_removal_requests << '\n';
 
     if (!verbose) return;
 

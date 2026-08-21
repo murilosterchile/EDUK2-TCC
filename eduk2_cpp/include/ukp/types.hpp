@@ -123,6 +123,13 @@ struct Stats {
     long long bound_context_dominance_searches_avoided_by_witness = 0;
     long long bound_context_dominance_witness_invalidations = 0;
     long long bound_context_dominance_pair_checks = 0;
+    // Full-mode residual transaction telemetry.
+    long long residual_transactions = 0;
+    long long residual_items_removed = 0;
+    long long context_rebuilds_requested = 0;
+    long long context_rebuilds_skipped_no_change = 0;
+    long long suffix_rebuilds = 0;
+    long long duplicate_removal_requests = 0;
     // Full-mode wall-clock phase timings. They remain zero in None/Basic.
     long long phase_preprocessing_ns = 0;
     long long phase_global_bounds_ns = 0;
