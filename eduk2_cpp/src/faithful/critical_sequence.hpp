@@ -3,6 +3,7 @@
 #include "ukp/types.hpp"
 
 #include <algorithm>
+#include <cassert>
 #include <cstddef>
 #include <limits>
 #include <vector>
@@ -164,8 +165,11 @@ private:
     void schedule_current_active_successors(PointId parent, Weight target_limit,
                                             const std::vector<ActiveItem>& items,
                                             SliceBuildResult& result);
-    void synchronize_active_cursors(const std::vector<ActiveItem>& items,
-                                    Weight target_limit);
+#ifndef NDEBUG
+    void assert_active_cursors_match_legacy_sync(
+        const std::vector<ActiveItem>& items, Weight target_limit,
+        const std::vector<std::size_t>& legacy_sync_start_by_rank) const;
+#endif
     static void sample_active_items(const std::vector<ActiveItem>& items,
                                     SliceBuildResult& result);
     void initialize_item_cursor(const ActiveItem& item);
@@ -274,6 +278,25 @@ SliceBuildResult CriticalSequence::process_slice_incremental(
     // weight is consumed.
     advance_active_cursors(active_items, target_limit, result);
 
+#ifndef NDEBUG
+    // Preserve the cursor positions from which the legacy end-of-slice
+    // synchronize_active_cursors() would have started. Newly introduced items
+    // are recorded immediately after their historical backfill below.
+    constexpr std::size_t kUnrecordedCursor =
+        std::numeric_limits<std::size_t>::max();
+    std::vector<std::size_t> legacy_sync_start_by_rank(
+        item_cursors_.size(), kUnrecordedCursor);
+    const auto record_legacy_sync_start = [&](const ActiveItem& item) {
+        assert(item.tie_rank >= 0);
+        const std::size_t rank = static_cast<std::size_t>(item.tie_rank);
+        assert(rank < legacy_sync_start_by_rank.size());
+        legacy_sync_start_by_rank[rank] = cursor_for(item).next_built_upon;
+    };
+    for (const ActiveItem& item : active_items) {
+        record_legacy_sync_start(item);
+    }
+#endif
+
     const Weight first_weight = ya == std::numeric_limits<Weight>::max() ? ya : ya + 1;
     for (Weight weight = first_weight;; ++weight) {
         Candidate selected{};
@@ -307,6 +330,9 @@ SliceBuildResult CriticalSequence::process_slice_incremental(
 
             initialize_item_cursor(item);
             advance_item_cursor(item, target_limit, result);
+#ifndef NDEBUG
+            record_legacy_sync_start(item);
+#endif
             const auto position = std::lower_bound(
                 active_items.begin(), active_items.end(), item,
                 [](const ActiveItem& existing, const ActiveItem& value) {
@@ -355,7 +381,10 @@ SliceBuildResult CriticalSequence::process_slice_incremental(
         }
         if (weight == yb) break;
     }
-    synchronize_active_cursors(active_items, target_limit);
+#ifndef NDEBUG
+    assert_active_cursors_match_legacy_sync(
+        active_items, target_limit, legacy_sync_start_by_rank);
+#endif
     return result;
 }
 

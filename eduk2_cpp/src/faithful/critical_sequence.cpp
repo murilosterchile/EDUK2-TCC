@@ -376,9 +376,24 @@ void CriticalSequence::schedule_current_active_successors(
     }
     const State& base = states_[parent];
     if (base.weight > target_limit) return;
+
+    // This method is called immediately after `parent` is appended to
+    // expandable_points_. For every item that can reach the current slice,
+    // consuming this parent is therefore exactly the cursor advancement that
+    // synchronize_active_cursors() used to reconstruct at the end of the
+    // slice. Items that do not fit keep the parent as their next cursor input.
+    assert(!expandable_points_.empty());
+    assert(expandable_points_.back() == parent);
+    const std::size_t parent_position = expandable_points_.size() - 1;
     const Weight remaining = target_limit - base.weight;
     for (const ActiveItem& item : items) {
         if (item.w > remaining) continue;
+
+        ItemCursor& cursor_state = cursor_for(item);
+        assert(cursor_state.introduced);
+        assert(cursor_state.next_built_upon == parent_position);
+        assert(parent_position < cursor_state.built_upon_end);
+
         if constexpr (stats_enabled_v<StatsMode::Basic>) {
             ++result.cursor_advances;
             ++result.successor_item_scans;
@@ -388,25 +403,43 @@ void CriticalSequence::schedule_current_active_successors(
         }
         pending_.store(base.weight + item.w, Candidate{
             safe_add(base.profit, item.p), parent, item.id, item.tie_rank});
+        cursor_state.next_built_upon = parent_position + 1;
     }
 }
 
-void CriticalSequence::synchronize_active_cursors(
-    const std::vector<ActiveItem>& items, Weight target_limit) {
+#ifndef NDEBUG
+void CriticalSequence::assert_active_cursors_match_legacy_sync(
+    const std::vector<ActiveItem>& items, Weight target_limit,
+    const std::vector<std::size_t>& legacy_sync_start_by_rank) const {
+    constexpr std::size_t kUnrecordedCursor =
+        std::numeric_limits<std::size_t>::max();
+
     for (const ActiveItem& item : items) {
-        ItemCursor& cursor_state = cursor_for(item);
-        if (target_limit < item.w) continue;
-        const Weight maximum_parent_weight = target_limit - item.w;
-        const auto first = expandable_points_.begin() +
-            static_cast<std::ptrdiff_t>(cursor_state.next_built_upon);
-        const auto position = std::upper_bound(
-            first, expandable_points_.end(), maximum_parent_weight,
-            [this](Weight maximum, PointId point) {
-                return maximum < states_[point].weight;
-            });
-        cursor_state.next_built_upon = static_cast<std::size_t>(
-            position - expandable_points_.begin());
+        assert(item.tie_rank >= 0);
+        const std::size_t rank = static_cast<std::size_t>(item.tie_rank);
+        assert(rank < legacy_sync_start_by_rank.size());
+        const std::size_t legacy_start = legacy_sync_start_by_rank[rank];
+        assert(legacy_start != kUnrecordedCursor);
+        assert(legacy_start <= expandable_points_.size());
+
+        std::size_t legacy_result = legacy_start;
+        if (target_limit >= item.w) {
+            const Weight maximum_parent_weight = target_limit - item.w;
+            const auto first = expandable_points_.begin() +
+                static_cast<std::ptrdiff_t>(legacy_start);
+            const auto position = std::upper_bound(
+                first, expandable_points_.end(), maximum_parent_weight,
+                [this](Weight maximum, PointId point) {
+                    return maximum < states_[point].weight;
+                });
+            legacy_result = static_cast<std::size_t>(
+                position - expandable_points_.begin());
+        }
+
+        const ItemCursor& cursor_state = cursor_for(item);
+        assert(cursor_state.next_built_upon == legacy_result);
     }
 }
+#endif
 
 }  // namespace ukp::faithful::detail
