@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ukp/stats_mode.hpp"
+
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -121,6 +123,12 @@ struct Stats {
     long long bound_context_dominance_searches_avoided_by_witness = 0;
     long long bound_context_dominance_witness_invalidations = 0;
     long long bound_context_dominance_pair_checks = 0;
+    // Full-mode wall-clock phase timings. They remain zero in None/Basic.
+    long long phase_preprocessing_ns = 0;
+    long long phase_global_bounds_ns = 0;
+    long long phase_core_bb_ns = 0;
+    long long phase_dp_ns = 0;
+    long long phase_reconstruction_ns = 0;
     long long estimated_state_bytes = 0;
     std::string bound_winner = "none";
     std::string global_bound_used = "none";

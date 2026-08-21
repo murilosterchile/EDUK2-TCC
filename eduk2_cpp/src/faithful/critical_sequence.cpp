@@ -51,22 +51,30 @@ void CriticalSequence::ComputedWindow::configure(Weight largest_item_weight) {
 void CriticalSequence::ComputedWindow::store(Weight weight, const Candidate& candidate) {
     Slot& slot = slots_[index(weight)];
     if (slot.weight != weight) {
-        if (slot.weight >= 0) ++index_collisions_;
-        ++candidates_stored_;
+        if constexpr (stats_enabled_v<StatsMode::Full>) {
+            if (slot.weight >= 0) ++index_collisions_;
+            ++candidates_stored_;
+        }
         slot = Slot{candidate, weight};
         return;
     }
 
-    ++collisions_;
+    if constexpr (stats_enabled_v<StatsMode::Full>) {
+        ++collisions_;
+    }
     if (candidate.profit > slot.candidate.profit ||
         (candidate.profit == slot.candidate.profit &&
          candidate.tie_rank < slot.candidate.tie_rank)) {
         // Equal-profit candidates retain the highest ratio-order priority.
-        ++candidates_stored_;
-        ++replacements_;
+        if constexpr (stats_enabled_v<StatsMode::Full>) {
+            ++candidates_stored_;
+            ++replacements_;
+        }
         slot = Slot{candidate, weight};
     } else {
-        ++rejections_;
+        if constexpr (stats_enabled_v<StatsMode::Full>) {
+            ++rejections_;
+        }
     }
 }
 
@@ -292,11 +300,15 @@ void CriticalSequence::schedule_successors(PointId parent, Weight compute_limit,
     const State& base = state(parent);
     const Weight remaining_capacity = compute_limit - base.weight;
     long long generated = 0;
-    ++result.active_item_samples;
-    result.active_items_sum += static_cast<long long>(items.size());
-    result.active_items_max = std::max(
-        result.active_items_max, static_cast<long long>(items.size()));
-    result.successor_item_scans += static_cast<long long>(items.size());
+    if constexpr (stats_enabled_v<StatsMode::Full>) {
+        ++result.active_item_samples;
+        result.active_items_sum += static_cast<long long>(items.size());
+        result.active_items_max = std::max(
+            result.active_items_max, static_cast<long long>(items.size()));
+    }
+    if constexpr (stats_enabled_v<StatsMode::Basic>) {
+        result.successor_item_scans += static_cast<long long>(items.size());
+    }
     for (std::size_t index = 0; index < items.size(); ++index) {
         const Item& item = items[index];
         if (item.w > remaining_capacity) continue;
@@ -306,17 +318,24 @@ void CriticalSequence::schedule_successors(PointId parent, Weight compute_limit,
                                   tie_rank(item, index)};
         pending_.store(weight, candidate);
     }
-    generated_candidates_ += generated;
-    result.successor_attempts += generated;
-    result.points_generated += generated;
+    if constexpr (stats_enabled_v<StatsMode::Basic>) {
+        generated_candidates_ += generated;
+        result.successor_attempts += generated;
+        result.points_generated += generated;
+    }
 }
 
 void CriticalSequence::sample_active_items(const std::vector<ActiveItem>& items,
                                            SliceBuildResult& result) {
-    ++result.active_item_samples;
-    result.active_items_sum += static_cast<long long>(items.size());
-    result.active_items_max = std::max(
-        result.active_items_max, static_cast<long long>(items.size()));
+    if constexpr (stats_enabled_v<StatsMode::Full>) {
+        ++result.active_item_samples;
+        result.active_items_sum += static_cast<long long>(items.size());
+        result.active_items_max = std::max(
+            result.active_items_max, static_cast<long long>(items.size()));
+    } else {
+        (void)items;
+        (void)result;
+    }
 }
 
 void CriticalSequence::advance_item_cursor(const ActiveItem& item, Weight target_limit,
@@ -333,15 +352,23 @@ void CriticalSequence::advance_item_cursor(const ActiveItem& item, Weight target
         if (base.weight > maximum_parent_weight) break;
 
         ++cursor_state.next_built_upon;
-        ++result.cursor_advances;
-        ++result.successor_item_scans;
+        if constexpr (stats_enabled_v<StatsMode::Basic>) {
+            ++result.cursor_advances;
+            ++result.successor_item_scans;
+        }
         const Weight weight = base.weight + item.w;
-        ++generated_candidates_;
-        ++result.successor_attempts;
-        ++result.points_generated;
+        if constexpr (stats_enabled_v<StatsMode::Basic>) {
+            ++generated_candidates_;
+            ++result.successor_attempts;
+            ++result.points_generated;
+        }
         if (cursor < cursor_state.historical_end) {
-            ++cursor_state.backfill_attempts;
-            ++result.backfill_attempts;
+            if constexpr (stats_enabled_v<StatsMode::Full>) {
+                ++cursor_state.backfill_attempts;
+            }
+            if constexpr (stats_enabled_v<StatsMode::Basic>) {
+                ++result.backfill_attempts;
+            }
         }
         pending_.store(weight, Candidate{
             safe_add(base.profit, item.p), parent, item.id, item.tie_rank});
@@ -374,17 +401,21 @@ void CriticalSequence::advance_retired_cursors(Weight target_limit,
 void CriticalSequence::schedule_current_active_successors(
     PointId parent, Weight target_limit, const std::vector<ActiveItem>& items,
     SliceBuildResult& result) {
-    sample_active_items(items, result);
+    if constexpr (stats_enabled_v<StatsMode::Full>) {
+        sample_active_items(items, result);
+    }
     const State& base = states_[parent];
     if (base.weight > target_limit) return;
     const Weight remaining = target_limit - base.weight;
     for (const ActiveItem& item : items) {
         if (item.w > remaining) continue;
-        ++result.cursor_advances;
-        ++result.successor_item_scans;
-        ++generated_candidates_;
-        ++result.successor_attempts;
-        ++result.points_generated;
+        if constexpr (stats_enabled_v<StatsMode::Basic>) {
+            ++result.cursor_advances;
+            ++result.successor_item_scans;
+            ++generated_candidates_;
+            ++result.successor_attempts;
+            ++result.points_generated;
+        }
         pending_.store(base.weight + item.w, Candidate{
             safe_add(base.profit, item.p), parent, item.id, item.tie_rank});
     }

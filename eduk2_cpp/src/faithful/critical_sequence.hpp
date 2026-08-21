@@ -198,9 +198,13 @@ SliceBuildResult CriticalSequence::process_slice(
 
     if (!root_processed_ && ya == 0) {
         root_processed_ = true;
-        ++result.states_entered;
+        if constexpr (stats_enabled_v<StatsMode::Basic>) {
+            ++result.states_entered;
+        }
         if (should_expand(0)) {
-            ++result.states_expanded;
+            if constexpr (stats_enabled_v<StatsMode::Basic>) {
+                ++result.states_expanded;
+            }
             expandable_points_.push_back(0);
             schedule_successors(0, compute_limit, items, result);
         }
@@ -218,10 +222,14 @@ SliceBuildResult CriticalSequence::process_slice(
                 states_.push_back(
                     State{weight, candidate.profit, candidate.predecessor, candidate.item_id});
                 const PointId id = states_.size() - 1;
-                ++result.states_created;
-                ++result.states_entered;
+                if constexpr (stats_enabled_v<StatsMode::Basic>) {
+                    ++result.states_created;
+                    ++result.states_entered;
+                }
                 if (should_expand(id)) {
-                    ++result.states_expanded;
+                    if constexpr (stats_enabled_v<StatsMode::Basic>) {
+                        ++result.states_expanded;
+                    }
                     expandable_points_.push_back(id);
                     schedule_successors(id, compute_limit, items, result);
                 }
@@ -248,11 +256,17 @@ SliceBuildResult CriticalSequence::process_slice_incremental(
     pending_.configure(yb - ya);
     if (!root_processed_ && ya == 0) {
         root_processed_ = true;
-        ++result.states_entered;
+        if constexpr (stats_enabled_v<StatsMode::Basic>) {
+            ++result.states_entered;
+        }
         if (should_expand(0)) {
-            ++result.states_expanded;
+            if constexpr (stats_enabled_v<StatsMode::Basic>) {
+                ++result.states_expanded;
+            }
             expandable_points_.push_back(0);
-            sample_active_items(active_items, result);
+            if constexpr (stats_enabled_v<StatsMode::Full>) {
+                sample_active_items(active_items, result);
+            }
         }
     }
 
@@ -278,13 +292,19 @@ SliceBuildResult CriticalSequence::process_slice_incremental(
 
         while (next_item < items_by_weight.size() && items_by_weight[next_item].w == weight) {
             ActiveItem item = items_by_weight[next_item++];
-            ++result.items_considered_for_introduction;
+            if constexpr (stats_enabled_v<StatsMode::Basic>) {
+                ++result.items_considered_for_introduction;
+            }
             if (item.p <= envelope) {
-                ++result.items_rejected_by_envelope;
+                if constexpr (stats_enabled_v<StatsMode::Basic>) {
+                    ++result.items_rejected_by_envelope;
+                }
                 continue;
             }
             if (!should_introduce(item, envelope)) {
-                ++result.items_rejected_by_bound;
+                if constexpr (stats_enabled_v<StatsMode::Basic>) {
+                    ++result.items_rejected_by_bound;
+                }
                 continue;
             }
 
@@ -299,19 +319,23 @@ SliceBuildResult CriticalSequence::process_slice_incremental(
             selected = Candidate{item.p, 0, item.id, item.tie_rank};
             has_selected = true;
             envelope = item.p;
-            ++result.items_introduced;
-            if (compute_limit > 0) {
-                const auto scaled = static_cast<__int128>(item.w) * 10;
-                const auto raw_decile = static_cast<std::size_t>(scaled / compute_limit);
-                const std::size_t decile = std::min<std::size_t>(9, raw_decile);
-                ++result.items_introduced_by_capacity_decile[decile];
+            if constexpr (stats_enabled_v<StatsMode::Basic>) {
+                ++result.items_introduced;
             }
-            if (!items_by_weight.empty() && items_by_weight.back().w > 0) {
-                const auto scaled = static_cast<__int128>(item.w) * 10;
-                const auto raw_decile = static_cast<std::size_t>(
-                    scaled / items_by_weight.back().w);
-                const std::size_t decile = std::min<std::size_t>(9, raw_decile);
-                ++result.items_introduced_by_reduction_decile[decile];
+            if constexpr (stats_enabled_v<StatsMode::Full>) {
+                if (compute_limit > 0) {
+                    const auto scaled = static_cast<__int128>(item.w) * 10;
+                    const auto raw_decile = static_cast<std::size_t>(scaled / compute_limit);
+                    const std::size_t decile = std::min<std::size_t>(9, raw_decile);
+                    ++result.items_introduced_by_capacity_decile[decile];
+                }
+                if (!items_by_weight.empty() && items_by_weight.back().w > 0) {
+                    const auto scaled = static_cast<__int128>(item.w) * 10;
+                    const auto raw_decile = static_cast<std::size_t>(
+                        scaled / items_by_weight.back().w);
+                    const std::size_t decile = std::min<std::size_t>(9, raw_decile);
+                    ++result.items_introduced_by_reduction_decile[decile];
+                }
             }
         }
 
@@ -319,10 +343,14 @@ SliceBuildResult CriticalSequence::process_slice_incremental(
             states_.push_back(
                 State{weight, selected.profit, selected.predecessor, selected.item_id});
             const PointId id = states_.size() - 1;
-            ++result.states_created;
-            ++result.states_entered;
+            if constexpr (stats_enabled_v<StatsMode::Basic>) {
+                ++result.states_created;
+                ++result.states_entered;
+            }
             if (should_expand(id)) {
-                ++result.states_expanded;
+                if constexpr (stats_enabled_v<StatsMode::Basic>) {
+                    ++result.states_expanded;
+                }
                 expandable_points_.push_back(id);
                 schedule_current_active_successors(
                     id, target_limit, active_items, result);
