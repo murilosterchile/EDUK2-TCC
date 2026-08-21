@@ -1009,6 +1009,21 @@ void check_exnsds12_incremental_regression() {
             "exnsds12 reactivated the eager full-item DP");
     require(result.stats.successor_item_scans < 3'000'000,
             "exnsds12 successor fan-out regressed");
+    require(result.stats.dp_stop_reason == "periodicity" &&
+                result.stats.periodicity_hits == 1 &&
+                result.stats.periodicity_level >= 0 &&
+                result.stats.periodicity_level < (instance.capacity + 1) / 2,
+            "exnsds12 did not use the EDUK2 early periodicity certificate");
+
+    SolverOptions without_periodicity;
+    without_periodicity.use_periodicity = false;
+    const SolverResult reference = faithful::Solver(without_periodicity).solve(instance);
+    require(reference.stats.periodicity_hits == 0 && reference.stats.periodicity_level == -1,
+            "disabled periodicity still changed DP termination");
+    require(result.solution.profit == reference.solution.profit &&
+                result.solution.weight == reference.solution.weight &&
+                result.solution.multiplicity_by_id == reference.solution.multiplicity_by_id,
+            "periodic fill changed the exnsds12 optimum or reconstruction");
 }
 
 }  // namespace

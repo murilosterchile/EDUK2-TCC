@@ -402,6 +402,10 @@ SolverResult Solver::solve(const Instance& inst) {
     // only receives a const view and performs every experimental reduction on
     // its own local copy.
     const std::vector<Item> dp_items = items;
+    // Gilmore-Gomory periodicity, as used by EDUK2, is defined with respect
+    // to the ratio-best item.  Keep this witness stable while the residual
+    // bound context shrinks during the DP.
+    const Item periodic_best = dp_items.front();
     result.stats.dp_item_ids.reserve(dp_items.size());
     for (const Item& item : dp_items) result.stats.dp_item_ids.push_back(item.id);
 
@@ -502,6 +506,9 @@ SolverResult Solver::solve(const Instance& inst) {
     result.stats.slices.reserve(static_cast<std::size_t>(estimated_slice_count));
     bool half_capacity_extension_done = false;
     bool closed_by_bound = false;
+    bool periodicity_detected = false;
+    detail::PointId periodicity_base = detail::no_point;
+    long long periodicity_best_copies = 0;
     std::array<long long, kBoundTypes.size()> contextual_bound_counts{};
     auto record_contextual_bound = [&](BoundType type, SliceStats& slice) {
         ++contextual_bound_counts[bound_type_index(type)];
@@ -638,7 +645,10 @@ SolverResult Solver::solve(const Instance& inst) {
             [&](detail::PointId state_index) {
             const detail::State& state = sequence.state(state_index);
             ++slice.states_entered;
-            if (options_.use_bounds) {
+            // PYAsUKP's transfert_in_sequence_result never fathoms a state
+            // whose last item is b.  Preserving that chain is an invariant of
+            // the threshold-based periodicity certificate and of fill_with_best.
+            if (options_.use_bounds && state.item_id != periodic_best.id) {
                 const BoundValue residual = compute_bound(
                     ctx, inst.capacity - state.weight, options_.bound_policy);
                 ++result.stats.bound_calls;
@@ -728,6 +738,39 @@ SolverResult Solver::solve(const Instance& inst) {
         slice.active_items_after = static_cast<long long>(items.size());
         result.stats.slices.push_back(std::move(slice));
         const std::size_t active_count = items.size();
+        // EDUK2 tests Chainlist.is_single only after reduction, i.e. after
+        // Select.next_lightest has considered every item.  At that point a
+        // singleton decreasingS containing b is the implementation's
+        // threshold-dominance certificate for the paper's y+ level.
+        const bool all_items_introduced = next_item == items_by_weight.size();
+        if (options_.use_periodicity && all_items_introduced && active_count == 1 &&
+            items.front().id == periodic_best.id) {
+            periodicity_detected = true;
+            result.stats.periodicity_level = yb;
+            ++result.stats.periodicity_hits;
+
+            // Direct counterpart of PYAsUKP's fill_with_best.  Select a
+            // critical point in the capacity's residue class and complete it
+            // with copies of b; no new DP states are required beyond y+.
+            const std::vector<detail::PointId>& points = sequence.skip_points();
+            periodicity_base = points.back();
+            const detail::State& last_state = sequence.state(periodicity_base);
+            const Weight difference = inst.capacity - last_state.weight;
+            const Weight remainder = difference % periodic_best.w;
+            periodicity_best_copies = difference / periodic_best.w;
+            if (remainder != 0) {
+                const Weight target_weight =
+                    last_state.weight - (periodic_best.w - remainder);
+                periodicity_base = sequence.state_at_or_before(target_weight);
+                ++periodicity_best_copies;
+            }
+            const detail::State& base_state = sequence.state(periodicity_base);
+            if (base_state.item_id == periodic_best.id) {
+                periodicity_best_copies =
+                    (inst.capacity - base_state.weight) / periodic_best.w;
+            }
+            break;
+        }
         if (!half_capacity_extension_done && yb >= initial_process_limit) {
             const Weight active_wmax = items.empty() ? Weight{0} :
                 std::max_element(items.begin(), items.end(),
@@ -737,6 +780,41 @@ SolverResult Solver::solve(const Instance& inst) {
         }
         if (active_count == 1 && half_capacity_extension_done && yb >= process_limit) break;
         ya = yb;
+    }
+
+    if (periodicity_detected) {
+        const detail::State& base_state = sequence.state(periodicity_base);
+        std::vector<long long> multiplicity(inst.items.size(), 0);
+        for (detail::PointId cursor = periodicity_base; cursor != detail::no_point;
+             cursor = sequence.state(cursor).predecessor) {
+            const int item_id = sequence.state(cursor).item_id;
+            if (item_id < 0) break;
+            if (static_cast<std::size_t>(item_id) >= multiplicity.size()) {
+                throw std::runtime_error("periodic backtracking failed");
+            }
+            ++multiplicity[static_cast<std::size_t>(item_id)];
+        }
+        if (periodic_best.id < 0 ||
+            static_cast<std::size_t>(periodic_best.id) >= multiplicity.size()) {
+            throw std::runtime_error("periodic best item is outside multiplicity");
+        }
+        multiplicity[static_cast<std::size_t>(periodic_best.id)] +=
+            periodicity_best_copies;
+        const Profit periodic_profit = safe_add(
+            base_state.profit, safe_mul(periodicity_best_copies, periodic_best.p));
+        const Weight periodic_weight = safe_add(
+            base_state.weight, safe_mul(periodicity_best_copies, periodic_best.w));
+        incumbent_solution.consider(periodic_profit, periodic_weight,
+                                    std::move(multiplicity));
+
+        publish_contextual_bound_counts();
+        result.solution = incumbent_solution.solution("faithful");
+        result.stats.estimated_state_bytes =
+            static_cast<long long>(sequence.estimated_bytes());
+        result.stats.active_items_final = 1;
+        result.stats.dp_stop_reason = "periodicity";
+        result.stats.stop_reason = "periodicity";
+        return result;
     }
 
     // c/2 cut: the sequence query is the prefix maximum, because its profits
