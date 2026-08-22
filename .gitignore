@@ -2,3 +2,11 @@ eduk2_cpp/build/
 eduk2_cpp/build-benchmark/
 build/
 eduk2_cpp/results/
+benchmarks/pyasukp_paper/external/
+benchmarks/pyasukp_paper/instances/ss/*.ukp
+benchmarks/pyasukp_paper/instances/ss/metadata.csv
+benchmarks/pyasukp_paper/instances/*/*.ukp
+benchmarks/pyasukp_paper/instances/*/metadata.csv
+benchmarks/pyasukp_paper/logs/
+benchmarks/pyasukp_paper/results/
+benchmarks/

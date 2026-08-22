@@ -714,6 +714,15 @@ SolverResult Solver::solve(const Instance& inst) {
         }
     }
 
+    // State fathoming must use the immutable global post-reduction context.
+    // Threshold dominance shrinks `ctx` during the DP, but states already
+    // materialized in CriticalSequence can still contain items removed from
+    // that residual context and can later participate in the c/2 split.
+    // Using the shrinking context here can therefore underestimate a state's
+    // remaining potential and incorrectly suppress descendants needed by the
+    // final historical-state reconstruction.
+    const BoundContext state_bound_ctx = ctx;
+
     PhaseTimer<kFullStats> dp_phase(result.stats.phase_dp_ns);
 
     // Select.next_lightest traverses the residual items by nondecreasing
@@ -1046,6 +1055,23 @@ SolverResult Solver::solve(const Instance& inst) {
             ya, yb, candidate_limit, active_items, items_by_weight, next_item,
             [&](const detail::ActiveItem& item, Profit) {
                 if (options_.use_bounds && item.id != periodic_best.id) {
+                    // The residual BoundContext can be smaller than the set of
+                    // continuations already materialized in CriticalSequence.
+                    // Before allowing that context to reject a newly introduced
+                    // item, preserve the item whenever it can already combine
+                    // with a historical DP state to improve the incumbent.
+                    //
+                    // This is a feasible lower-bound witness, not a new pruning
+                    // rule: if item.p + f(c - item.w) > incumbent, no valid upper
+                    // bound may fathom the item at this introduction point.
+                    const Weight historical_residual = inst.capacity - item.w;
+                    const Profit historical_feasible = safe_add(
+                        item.p, sequence.value_at(historical_residual));
+                    if (historical_feasible > incumbent) {
+                        contribution_slot(item.id) = item.w;
+                        return true;
+                    }
+
                     const detail::BoundDecision decision =
                         detail::evaluate_candidate(
                             ctx, item.w, item.p, inst.capacity, incumbent,
@@ -1081,7 +1107,7 @@ SolverResult Solver::solve(const Instance& inst) {
             if (options_.use_bounds && state_item_id != periodic_best.id) {
                 const detail::BoundDecision decision =
                     detail::evaluate_candidate(
-                        ctx, state.weight, state.profit, inst.capacity,
+                        state_bound_ctx, state.weight, state.profit, inst.capacity,
                         incumbent, options_.bound_policy);
                 record_bound_decision(decision);
                 if (decision.lower_filter_hit) {
@@ -1207,9 +1233,8 @@ SolverResult Solver::solve(const Instance& inst) {
         // BoundContext does not cover every historical continuation already
         // materialized in CriticalSequence, so using it to eliminate an
         // already-active item can underestimate that item's true remaining
-        // potential. The unified bound engine remains enabled for the safe
-        // call sites (initial reduction, item introduction, and state
-        // fathoming).
+        // potential. Item introduction keeps its historical feasible guard,
+        // while state fathoming uses the immutable global `state_bound_ctx`.
 
         commit_residual_delta(true);
         UKP_FULL_STATS(
