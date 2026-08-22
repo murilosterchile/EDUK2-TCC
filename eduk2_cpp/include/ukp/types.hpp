@@ -122,6 +122,7 @@ struct Stats {
     std::map<std::string, long long> contextual_bound_item_wins;
     std::map<std::string, long long> contextual_bound_fathoms;
     long long bound_context_rebuilds = 0;
+    long long bound_context_incremental_updates = 0;
     long long bound_context_items_processed = 0;
     long long bound_context_tau_q_recomputations = 0;
     long long bound_context_tau_q_items_scanned = 0;
@@ -143,6 +144,7 @@ struct Stats {
     // Full-mode wall-clock phase timings. They remain zero in None/Basic.
     long long phase_preprocessing_ns = 0;
     long long phase_global_bounds_ns = 0;
+    long long phase_context_maintenance_ns = 0;
     long long phase_core_bb_ns = 0;
     long long phase_dp_ns = 0;
     long long phase_reconstruction_ns = 0;

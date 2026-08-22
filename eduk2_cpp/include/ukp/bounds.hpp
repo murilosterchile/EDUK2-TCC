@@ -69,6 +69,7 @@ struct BoundContext {
 // changing any bound formula, witness selection, or cache-validity decision.
 struct BoundContextTelemetry {
     long long rebuilds = 0;
+    long long incremental_updates = 0;
     long long items_processed = 0;
     long long tau_q_recomputations = 0;
     long long tau_q_items_scanned = 0;
@@ -80,6 +81,10 @@ struct BoundContextTelemetry {
     long long dominance_searches_avoided_by_witness = 0;
     long long dominance_witness_invalidations = 0;
     long long dominance_pair_checks = 0;
+    // Time spent only in incremental residual-context maintenance.  Oracle
+    // verification performed by debug/full faithful builds is intentionally
+    // excluded from this timer.
+    long long incremental_maintenance_ns = 0;
 };
 
 BoundContext make_bound_context(const std::vector<Item>& items,
@@ -91,6 +96,18 @@ BoundContext make_bound_context(const std::vector<Item>& items,
 void rebuild_bound_context_ratio_ordered(BoundContext& context,
                                          const std::vector<Item>& ratio_ordered_items,
                                          BoundContextTelemetry* telemetry = nullptr);
+// Applies a monotone set of item removals directly to an existing ratio-ordered
+// residual context.  It preserves the same BoundContext a full rebuild would
+// produce while reusing q*, alpha and dominance witnesses whenever their
+// defining bases/witnesses survive.
+void apply_bound_context_removals(
+    BoundContext& context,
+    const std::vector<int>& removed_ids,
+    const std::vector<unsigned char>& removed_by_id,
+    BoundContextTelemetry* telemetry = nullptr);
+// Validation oracle used only by Debug/full-telemetry faithful builds. Throws
+// if any semantic field or published bound differs from a fresh full rebuild.
+void verify_bound_context_against_full_rebuild(const BoundContext& context);
 BoundValue compute_u3(const BoundContext& ctx, Weight c);
 BoundValue compute_v(const BoundContext& ctx, Weight c);
 BoundValue compute_tau_star(const BoundContext& ctx, Weight c);

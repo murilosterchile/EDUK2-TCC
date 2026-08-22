@@ -540,7 +540,11 @@ SolverResult Solver::solve(const Instance& inst) {
     auto publish_context_telemetry = [&]() {
         if constexpr (kFullStats) {
             result.stats.bound_context_rebuilds = context_telemetry.rebuilds;
+            result.stats.bound_context_incremental_updates =
+                context_telemetry.incremental_updates;
             result.stats.bound_context_items_processed = context_telemetry.items_processed;
+            result.stats.phase_context_maintenance_ns =
+                context_telemetry.incremental_maintenance_ns;
             result.stats.bound_context_tau_q_recomputations =
                 context_telemetry.tau_q_recomputations;
             result.stats.bound_context_tau_q_items_scanned =
@@ -659,9 +663,9 @@ SolverResult Solver::solve(const Instance& inst) {
     }
 
     // The residual bound set is monotone: a candidate leaves it only after an
-    // envelope/bound rejection or threshold removal.  Keep membership by id
-    // and rebuild in dp_items' stable ratio order, avoiding the old active +
-    // weight-ordered concatenation and its full sort on every change.
+    // envelope/bound rejection or threshold removal. Keep membership by id for
+    // duplicate/removal accounting; BoundContext itself now applies the same
+    // removals incrementally while preserving dp_items' stable ratio order.
     std::vector<unsigned char> residual_item_alive(inst.items.size(), 0);
     auto residual_slot = [&](const auto& item) -> unsigned char& {
         if (item.id < 0 || static_cast<std::size_t>(item.id) >= residual_item_alive.size()) {
@@ -670,8 +674,6 @@ SolverResult Solver::solve(const Instance& inst) {
         return residual_item_alive[static_cast<std::size_t>(item.id)];
     };
     for (const Item& item : dp_items) residual_slot(item) = 1;
-    std::vector<Item> residual_items;
-    residual_items.reserve(dp_items.size());
     if (options_.use_core_bb) {
         PhaseTimer<kFullStats> core_bb_phase(result.stats.phase_core_bb_ns);
         constexpr long long kFaithfulCoreNodeLimit = 10'000;
@@ -1005,19 +1007,24 @@ SolverResult Solver::solve(const Instance& inst) {
             return;
         }
 
-        residual_items.clear();
-        for (const Item& item : dp_items) {
-            if (residual_slot(item) != 0) residual_items.push_back(item);
-        }
-        if (residual_items.empty()) {
-            throw std::logic_error("residual transaction removed every item");
+        const std::size_t previous_context_size = ctx.items.size();
+        apply_bound_context_removals(
+            ctx, residual_delta.removed_ids,
+            residual_delta.removal_requested_by_id, context_telemetry_ptr);
+        if (previous_context_size - ctx.items.size() !=
+            static_cast<std::size_t>(removed_now)) {
+            throw std::logic_error(
+                "incremental BoundContext removed an unexpected number of items");
         }
 #ifndef NDEBUG
-        assert(std::is_sorted(
-            residual_items.begin(), residual_items.end(), better_ratio));
+        verify_bound_context_against_full_rebuild(ctx);
+#else
+        if constexpr (kFullStats) {
+            // Full telemetry keeps the same oracle used during development,
+            // but benchmark builds compile this branch away entirely.
+            verify_bound_context_against_full_rebuild(ctx);
+        }
 #endif
-        rebuild_bound_context_ratio_ordered(
-            ctx, residual_items, context_telemetry_ptr);
     };
 
     // Listing 1 mapping: build/process a slice; fathom its states with

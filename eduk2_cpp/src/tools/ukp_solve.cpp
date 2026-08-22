@@ -95,6 +95,8 @@ void print_full_stats(const SolverResult& res, bool verbose) {
               << res.stats.phase_preprocessing_ns << '\n';
     std::cout << "phase_global_bounds_ns "
               << res.stats.phase_global_bounds_ns << '\n';
+    std::cout << "phase_context_maintenance_ns "
+              << res.stats.phase_context_maintenance_ns << '\n';
     std::cout << "phase_core_bb_ns "
               << res.stats.phase_core_bb_ns << '\n';
     std::cout << "phase_dp_ns " << res.stats.phase_dp_ns << '\n';
@@ -179,11 +181,16 @@ void print_full_stats(const SolverResult& res, bool verbose) {
 
     std::cout << "bound_context_rebuilds "
               << res.stats.bound_context_rebuilds << '\n';
+    std::cout << "bound_context_incremental_updates "
+              << res.stats.bound_context_incremental_updates << '\n';
     std::cout << "bound_context_items_processed "
               << res.stats.bound_context_items_processed << '\n';
-    const double average_context_items = res.stats.bound_context_rebuilds == 0 ? 0.0 :
+    const long long context_operations =
+        res.stats.bound_context_rebuilds +
+        res.stats.bound_context_incremental_updates;
+    const double average_context_items = context_operations == 0 ? 0.0 :
         static_cast<double>(res.stats.bound_context_items_processed) /
-            static_cast<double>(res.stats.bound_context_rebuilds);
+            static_cast<double>(context_operations);
     std::cout << "bound_context_average_items "
               << average_context_items << '\n';
     std::cout << "bound_context_tau_q_recomputations "
