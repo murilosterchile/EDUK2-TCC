@@ -14,16 +14,16 @@ std::size_t CriticalSequence::ComputedWindow::index(Weight weight) const {
     return static_cast<std::size_t>(weight) & index_mask_;
 }
 
-void CriticalSequence::ComputedWindow::configure(Weight largest_item_weight) {
-    if (!slots_.empty() && largest_item_weight <= largest_item_weight_) return;
-    if (largest_item_weight < 0) {
-        throw std::invalid_argument("negative computed-window item weight");
+void CriticalSequence::ComputedWindow::configure(Weight live_span) {
+    if (!slots_.empty() && live_span <= configured_span_) return;
+    if (live_span < 0) {
+        throw std::invalid_argument("negative computed-window live span");
     }
-    if (largest_item_weight == std::numeric_limits<Weight>::max()) {
-        throw std::length_error("computed-window item weight is too large");
+    if (live_span == std::numeric_limits<Weight>::max()) {
+        throw std::length_error("computed-window live span is too large");
     }
-    const auto required_size = static_cast<std::size_t>(largest_item_weight + 1);
-    if (static_cast<Weight>(required_size) != largest_item_weight + 1) {
+    const auto required_size = static_cast<std::size_t>(live_span + 1);
+    if (static_cast<Weight>(required_size) != live_span + 1) {
         throw std::length_error("computed-window does not fit in size_t");
     }
 
@@ -34,54 +34,107 @@ void CriticalSequence::ComputedWindow::configure(Weight largest_item_weight) {
         }
         size <<= 1;
     }
-    largest_item_weight_ = largest_item_weight;
+    configured_span_ = live_span;
+#ifndef NDEBUG
+    if constexpr (stats_enabled_v<StatsMode::Full>) {
+        legacy_configure(live_span);
+    }
+#endif
     if (size == slots_.size()) return;
 
     std::vector<Slot> replacement(size);
     const std::size_t replacement_mask = size - 1;
     for (const Slot& slot : slots_) {
         if (slot.weight < 0) continue;
-        Slot& destination = replacement[static_cast<std::size_t>(slot.weight) & replacement_mask];
+        Slot& destination =
+            replacement[static_cast<std::size_t>(slot.weight) & replacement_mask];
+#ifndef NDEBUG
+        assert(destination.weight < 0);
+#endif
         destination = slot;
     }
     slots_ = std::move(replacement);
     index_mask_ = replacement_mask;
+#ifndef NDEBUG
+    if constexpr (stats_enabled_v<StatsMode::Full>) {
+        assert_all_winners_match_legacy();
+    }
+#endif
 }
 
-void CriticalSequence::ComputedWindow::store(Weight weight, const Candidate& candidate) {
+void CriticalSequence::ComputedWindow::store(
+    Weight weight, Profit profit, PointId predecessor, int item_id, int tie_rank) {
+#ifndef NDEBUG
+    if constexpr (stats_enabled_v<StatsMode::Full>) {
+        legacy_store(weight, Candidate{profit, tie_rank, item_id, predecessor});
+    }
+#endif
+
     Slot& slot = slots_[index(weight)];
     if (slot.weight != weight) {
         if constexpr (stats_enabled_v<StatsMode::Full>) {
             if (slot.weight >= 0) ++index_collisions_;
             ++candidates_stored_;
         }
-        slot = Slot{candidate, weight};
+        slot.weight = weight;
+        slot.candidate.profit = profit;
+        slot.candidate.tie_rank = tie_rank;
+        slot.candidate.item_id = item_id;
+        slot.candidate.predecessor = predecessor;
+#ifndef NDEBUG
+        if constexpr (stats_enabled_v<StatsMode::Full>) {
+            assert_winner_matches_legacy(weight);
+        }
+#endif
         return;
     }
 
     if constexpr (stats_enabled_v<StatsMode::Full>) {
         ++collisions_;
     }
-    if (candidate.profit > slot.candidate.profit ||
-        (candidate.profit == slot.candidate.profit &&
-         candidate.tie_rank < slot.candidate.tie_rank)) {
-        // Equal-profit candidates retain the highest ratio-order priority.
-        if constexpr (stats_enabled_v<StatsMode::Full>) {
-            ++candidates_stored_;
-            ++replacements_;
-        }
-        slot = Slot{candidate, weight};
-    } else {
+
+    const Profit current_profit = slot.candidate.profit;
+    const bool wins = profit > current_profit ||
+        (profit == current_profit && tie_rank < slot.candidate.tie_rank);
+    if (!wins) {
         if constexpr (stats_enabled_v<StatsMode::Full>) {
             ++rejections_;
         }
+#ifndef NDEBUG
+        if constexpr (stats_enabled_v<StatsMode::Full>) {
+            assert_winner_matches_legacy(weight);
+        }
+#endif
+        return;
     }
+
+    // Equal-profit candidates retain the highest ratio-order priority.
+    if constexpr (stats_enabled_v<StatsMode::Full>) {
+        ++candidates_stored_;
+        ++replacements_;
+    }
+    slot.candidate.profit = profit;
+    slot.candidate.tie_rank = tie_rank;
+    slot.candidate.item_id = item_id;
+    slot.candidate.predecessor = predecessor;
+#ifndef NDEBUG
+    if constexpr (stats_enabled_v<StatsMode::Full>) {
+        assert_winner_matches_legacy(weight);
+    }
+#endif
 }
 
 bool CriticalSequence::ComputedWindow::contains(Weight weight) const {
     if (slots_.empty()) return false;
-    const Slot& slot = slots_[index(weight)];
-    return slot.weight == weight;
+    const bool present = slots_[index(weight)].weight == weight;
+#ifndef NDEBUG
+    if constexpr (stats_enabled_v<StatsMode::Full>) {
+        const bool legacy_present = !legacy_slots_.empty() &&
+            legacy_slots_[static_cast<std::size_t>(weight) & legacy_index_mask_].weight == weight;
+        assert(present == legacy_present);
+    }
+#endif
+    return present;
 }
 
 CriticalSequence::Candidate CriticalSequence::ComputedWindow::take(Weight weight) {
@@ -90,12 +143,27 @@ CriticalSequence::Candidate CriticalSequence::ComputedWindow::take(Weight weight
         throw std::logic_error("computed-window candidate is missing");
     }
     const Candidate candidate = slot.candidate;
+#ifndef NDEBUG
+    if constexpr (stats_enabled_v<StatsMode::Full>) {
+        const Candidate legacy = legacy_take(weight);
+        assert(candidate.profit == legacy.profit);
+        assert(candidate.predecessor == legacy.predecessor);
+        assert(candidate.item_id == legacy.item_id);
+        assert(candidate.tie_rank == legacy.tie_rank);
+    }
+#endif
     slot.weight = -1;
     return candidate;
 }
 
 std::size_t CriticalSequence::ComputedWindow::estimated_bytes() const noexcept {
-    return slots_.capacity() * sizeof(Slot);
+    std::size_t bytes = slots_.capacity() * sizeof(Slot);
+#ifndef NDEBUG
+    if constexpr (stats_enabled_v<StatsMode::Full>) {
+        bytes += legacy_slots_.capacity() * sizeof(LegacySlot);
+    }
+#endif
+    return bytes;
 }
 
 long long CriticalSequence::ComputedWindow::candidates_stored() const noexcept {
@@ -113,6 +181,102 @@ long long CriticalSequence::ComputedWindow::rejections() const noexcept {
 long long CriticalSequence::ComputedWindow::index_collisions() const noexcept {
     return index_collisions_;
 }
+
+#ifndef NDEBUG
+void CriticalSequence::ComputedWindow::debug_legacy_configure(Weight live_span) {
+    if constexpr (stats_enabled_v<StatsMode::Full>) {
+        legacy_configure(live_span);
+    } else {
+        (void)live_span;
+    }
+}
+
+void CriticalSequence::ComputedWindow::legacy_configure(Weight live_span) {
+    if (!legacy_slots_.empty() && live_span <= legacy_configured_span_) return;
+    if (live_span < 0) {
+        throw std::invalid_argument("negative computed-window item weight");
+    }
+    if (live_span == std::numeric_limits<Weight>::max()) {
+        throw std::length_error("computed-window item weight is too large");
+    }
+    const auto required_size = static_cast<std::size_t>(live_span + 1);
+    if (static_cast<Weight>(required_size) != live_span + 1) {
+        throw std::length_error("computed-window does not fit in size_t");
+    }
+
+    std::size_t size = 1;
+    while (size < required_size) {
+        if (size > std::numeric_limits<std::size_t>::max() / 2) {
+            throw std::length_error("computed-window power-of-two size overflow");
+        }
+        size <<= 1;
+    }
+    legacy_configured_span_ = live_span;
+    if (size == legacy_slots_.size()) return;
+
+    std::vector<LegacySlot> replacement(size);
+    const std::size_t replacement_mask = size - 1;
+    for (const LegacySlot& slot : legacy_slots_) {
+        if (slot.weight < 0) continue;
+        LegacySlot& destination =
+            replacement[static_cast<std::size_t>(slot.weight) & replacement_mask];
+        destination = slot;
+    }
+    legacy_slots_ = std::move(replacement);
+    legacy_index_mask_ = replacement_mask;
+}
+
+void CriticalSequence::ComputedWindow::legacy_store(
+    Weight weight, const Candidate& candidate) {
+    LegacySlot& slot = legacy_slots_[
+        static_cast<std::size_t>(weight) & legacy_index_mask_];
+    const LegacyCandidate legacy_candidate{
+        candidate.profit, candidate.predecessor, candidate.item_id, candidate.tie_rank};
+    if (slot.weight != weight) {
+        slot = LegacySlot{legacy_candidate, weight};
+        return;
+    }
+    if (legacy_candidate.profit > slot.candidate.profit ||
+        (legacy_candidate.profit == slot.candidate.profit &&
+         legacy_candidate.tie_rank < slot.candidate.tie_rank)) {
+        slot = LegacySlot{legacy_candidate, weight};
+    }
+}
+
+CriticalSequence::Candidate CriticalSequence::ComputedWindow::legacy_take(Weight weight) {
+    LegacySlot& slot = legacy_slots_[
+        static_cast<std::size_t>(weight) & legacy_index_mask_];
+    assert(slot.weight == weight);
+    const Candidate candidate{slot.candidate.profit, slot.candidate.tie_rank,
+                              slot.candidate.item_id, slot.candidate.predecessor};
+    slot.weight = -1;
+    return candidate;
+}
+
+void CriticalSequence::ComputedWindow::assert_winner_matches_legacy(Weight weight) const {
+    const Slot& slot = slots_[index(weight)];
+    const LegacySlot& legacy = legacy_slots_[
+        static_cast<std::size_t>(weight) & legacy_index_mask_];
+    assert(slot.weight == weight);
+    assert(legacy.weight == weight);
+    assert(slot.candidate.profit == legacy.candidate.profit);
+    assert(slot.candidate.predecessor == legacy.candidate.predecessor);
+    assert(slot.candidate.item_id == legacy.candidate.item_id);
+    assert(slot.candidate.tie_rank == legacy.candidate.tie_rank);
+}
+
+void CriticalSequence::ComputedWindow::assert_all_winners_match_legacy() const {
+    for (const Slot& slot : slots_) {
+        if (slot.weight < 0) continue;
+        assert_winner_matches_legacy(slot.weight);
+    }
+    for (const LegacySlot& legacy : legacy_slots_) {
+        if (legacy.weight < 0) continue;
+        assert(slots_[index(legacy.weight)].weight == legacy.weight);
+        assert_winner_matches_legacy(legacy.weight);
+    }
+}
+#endif
 
 const State& CriticalSequence::state(PointId id) const { return states_.at(id); }
 
@@ -313,7 +477,11 @@ const CriticalSequence::ItemCursor& CriticalSequence::cursor_for(
 }
 
 void CriticalSequence::initialize_item_cursor(const ActiveItem& item) {
-    pending_.configure(item.w);
+#ifndef NDEBUG
+    if constexpr (stats_enabled_v<StatsMode::Full>) {
+        pending_.debug_legacy_configure(item.w);
+    }
+#endif
     ItemCursor& cursor_state = cursor_for(item);
     cursor_state.next_built_upon = std::min<std::size_t>(1, expandable_points_.size());
     cursor_state.historical_end = expandable_points_.size();
@@ -358,12 +526,19 @@ void CriticalSequence::reserve_active_storage(
         expandable_points_.reserve(estimate);
     }
 
-    if (items.empty()) return;
-    Weight largest_weight = items.front().w;
-    for (const ActiveItem& item : items) {
-        largest_weight = std::max(largest_weight, item.w);
+#ifndef NDEBUG
+    if constexpr (stats_enabled_v<StatsMode::Full>) {
+        if (!items.empty()) {
+            Weight largest_weight = items.front().w;
+            for (const ActiveItem& item : items) {
+                largest_weight = std::max(largest_weight, item.w);
+            }
+            pending_.debug_legacy_configure(largest_weight);
+        }
     }
-    pending_.configure(largest_weight);
+#else
+    (void)items;
+#endif
 }
 
 void CriticalSequence::schedule_successors(PointId parent, Weight compute_limit,
@@ -386,9 +561,8 @@ void CriticalSequence::schedule_successors(PointId parent, Weight compute_limit,
         if (item.w > remaining_capacity) continue;
         const Weight weight = base.weight + item.w;
         ++generated;
-        const Candidate candidate{safe_add(base.profit, item.p), parent, item.id,
-                                  tie_rank(item, index)};
-        pending_.store(weight, candidate);
+        pending_.store(weight, safe_add(base.profit, item.p), parent, item.id,
+                       tie_rank(item, index));
     }
     if constexpr (stats_enabled_v<StatsMode::Basic>) {
         generated_candidates_ += generated;
@@ -442,8 +616,8 @@ void CriticalSequence::advance_item_cursor(const ActiveItem& item, Weight target
                 ++result.backfill_attempts;
             }
         }
-        pending_.store(weight, Candidate{
-            safe_add(base.profit, item.p), parent, item.id, item.tie_rank});
+        pending_.store(weight, safe_add(base.profit, item.p), parent, item.id,
+                       item.tie_rank);
     }
 }
 
@@ -491,8 +665,8 @@ void CriticalSequence::schedule_current_active_successors(
             ++result.successor_attempts;
             ++result.points_generated;
         }
-        pending_.store(base.weight + item.w, Candidate{
-            safe_add(base.profit, item.p), parent, item.id, item.tie_rank});
+        pending_.store(base.weight + item.w, safe_add(base.profit, item.p),
+                       parent, item.id, item.tie_rank);
         cursor_state.next_built_upon = parent_position + 1;
     }
 }

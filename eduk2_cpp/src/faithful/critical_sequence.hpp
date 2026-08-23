@@ -102,10 +102,12 @@ public:
 
 private:
     struct Candidate {
+        // Hot comparison fields first.  Reconstruction metadata is written
+        // only after this candidate wins its target weight.
         Profit profit;
-        PointId predecessor;
-        int item_id;
         int tie_rank;
+        int item_id;
+        PointId predecessor;
     };
 
     struct ItemCursor {
@@ -120,15 +122,15 @@ private:
         bool introduced = false;
     };
 
-    // All successors of the weight currently being visited are at most the
-    // largest item weight ahead.  A circular window of at least that width
-    // therefore retains every pending candidate without a capacity-sized
-    // table.  Power-of-two growth makes indexing a mask operation and
-    // amortizes the cost of introducing successively heavier items.
+    // A circular window retains only the live target-weight range, never a
+    // capacity-sized table.  Slot storage remains a single compact 32-byte AoS
+    // after measured split/SoA layouts regressed; Candidate itself is hot/cold
+    // ordered so collision rejection reads profit/tie_rank before cold metadata.
     class ComputedWindow {
     public:
-        void configure(Weight largest_item_weight);
-        void store(Weight weight, const Candidate& candidate);
+        void configure(Weight live_span);
+        void store(Weight weight, Profit profit, PointId predecessor,
+                   int item_id, int tie_rank);
         [[nodiscard]] bool contains(Weight weight) const;
         [[nodiscard]] Candidate take(Weight weight);
         [[nodiscard]] std::size_t estimated_bytes() const noexcept;
@@ -137,6 +139,11 @@ private:
         [[nodiscard]] long long replacements() const noexcept;
         [[nodiscard]] long long rejections() const noexcept;
         [[nodiscard]] long long index_collisions() const noexcept;
+#ifndef NDEBUG
+        // Replays the exact pre-optimization resize/store behavior in
+        // Debug/Full so every winner can be checked field by field.
+        void debug_legacy_configure(Weight live_span);
+#endif
 
     private:
         struct Slot {
@@ -147,13 +154,37 @@ private:
         [[nodiscard]] std::size_t index(Weight weight) const;
 
         std::vector<Slot> slots_;
-        Weight largest_item_weight_ = 0;
+        Weight configured_span_ = 0;
         std::size_t index_mask_ = 0;
         long long candidates_stored_ = 0;
         long long collisions_ = 0;
         long long replacements_ = 0;
         long long rejections_ = 0;
         long long index_collisions_ = 0;
+
+#ifndef NDEBUG
+        // Original layout, retained only as the Debug/Full semantic oracle.
+        struct LegacyCandidate {
+            Profit profit;
+            PointId predecessor;
+            int item_id;
+            int tie_rank;
+        };
+        struct LegacySlot {
+            LegacyCandidate candidate{};
+            Weight weight = -1;
+        };
+
+        void legacy_configure(Weight live_span);
+        void legacy_store(Weight weight, const Candidate& candidate);
+        [[nodiscard]] Candidate legacy_take(Weight weight);
+        void assert_winner_matches_legacy(Weight weight) const;
+        void assert_all_winners_match_legacy() const;
+
+        std::vector<LegacySlot> legacy_slots_;
+        Weight legacy_configured_span_ = 0;
+        std::size_t legacy_index_mask_ = 0;
+#endif
     };
 
     void schedule_successors(PointId parent, Weight compute_limit,
@@ -270,10 +301,17 @@ SliceBuildResult CriticalSequence::process_slice_incremental(
 #ifndef NDEBUG
     assert_active_item_views_match(active_items);
 #endif
-    // Cursor batches only contain targets in this slice.  Include its width in
-    // the circular window so all live targets have distinct slots even when a
-    // custom slice height exceeds every active item weight.
-    pending_.configure(yb - ya);
+    const Weight target_limit = std::min(yb, compute_limit);
+#ifndef NDEBUG
+    if constexpr (stats_enabled_v<StatsMode::Full>) {
+        pending_.debug_legacy_configure(yb - ya);
+    }
+#endif
+    // Incremental scheduling never stores a target above target_limit.  Thus
+    // every live target is in ]ya, target_limit], and this exact span is enough
+    // to make all circular indices distinct without growing by item weight.
+    const Weight live_span = target_limit > ya ? target_limit - ya : 0;
+    pending_.configure(live_span);
     if (!root_processed_ && ya == 0) {
         root_processed_ = true;
         if constexpr (stats_enabled_v<StatsMode::Basic>) {
@@ -290,7 +328,6 @@ SliceBuildResult CriticalSequence::process_slice_incremental(
         }
     }
 
-    const Weight target_limit = std::min(yb, compute_limit);
     // Resume each OCaml-style item cursor before visiting the slice.  Every
     // candidate needed in ]ya, yb] is therefore present before its target
     // weight is consumed.
@@ -360,7 +397,7 @@ SliceBuildResult CriticalSequence::process_slice_incremental(
                     return existing.tie_rank < value.tie_rank;
                 });
             active_items.insert(position, item);
-            selected = Candidate{item.p, 0, item.id, item.tie_rank};
+            selected = Candidate{item.p, item.tie_rank, item.id, 0};
             has_selected = true;
             envelope = item.p;
             if constexpr (stats_enabled_v<StatsMode::Basic>) {
