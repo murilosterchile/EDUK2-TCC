@@ -402,7 +402,7 @@ CoreSearchResult traverse_core(const std::vector<Item>& dp_items, const BoundCon
         // The faithful core is exactly its prefix: no local ordering or
         // filtering is permitted on this path.
         const std::size_t n = dp_items.size();
-        const std::size_t core_size = std::min(n, std::max<std::size_t>(100, n / 100));
+        const std::size_t core_size = std::min(n, std::max<std::size_t>(500, n / 100));
         core_items.assign(dp_items.begin(), dp_items.begin() + core_size);
     } else {
         core_items = dp_items;

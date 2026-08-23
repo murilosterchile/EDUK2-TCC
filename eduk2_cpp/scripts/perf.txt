@@ -1,0 +1,207 @@
+(
+    INSTANCE="nsds2_n20000wmin50000-145-s248156760c1718879"
+    INSTANCE_PATH="$(realpath eduk2_cpp/data/${INSTANCE}.ukp)"
+
+    RESULT_DIR="results/perf_compare"
+    OUT="${RESULT_DIR}/${INSTANCE}.perf.txt"
+
+    CPP_BIN="./eduk2_cpp/build/ukp_solve_benchmark"
+
+    OCAML_DIR="/home/aprix/Downloads/pyasukp_mail/pyasukp"
+    OCAML_BIN="${OCAML_DIR}/pyasukpt"
+
+    echo "Instancia: $INSTANCE_PATH"
+    echo "C++:       $CPP_BIN"
+    echo "OCaml:     $OCAML_BIN"
+    echo
+
+    if [[ ! -f "$INSTANCE_PATH" ]]; then
+        echo "ERRO: instancia nao encontrada:"
+        echo "$INSTANCE_PATH"
+        exit 1
+    fi
+
+    if [[ ! -x "$CPP_BIN" ]]; then
+        echo "ERRO: executavel C++ nao encontrado:"
+        echo "$CPP_BIN"
+        exit 1
+    fi
+
+    if [[ ! -x "$OCAML_BIN" ]]; then
+        echo "ERRO: executavel OCaml nao encontrado:"
+        echo "$OCAML_BIN"
+        exit 1
+    fi
+
+    mkdir -p "$RESULT_DIR"
+
+    TEMP_DIR="$(mktemp -d)"
+    SOURCE="$INSTANCE_PATH"
+
+    CPP_CORE="$(mktemp)"
+    CPP_L1="$(mktemp)"
+    CPP_LLC="$(mktemp)"
+
+    OCAML_CORE="$(mktemp)"
+    OCAML_L1="$(mktemp)"
+    OCAML_LLC="$(mktemp)"
+
+    trap 'rm -rf "$TEMP_DIR" "$CPP_CORE" "$CPP_L1" "$CPP_LLC" "$OCAML_CORE" "$OCAML_L1" "$OCAML_LLC"' EXIT
+
+    if ! grep -qE '^[[:space:]]*(n|m):|^[[:space:]]*begin data' "$INSTANCE_PATH"; then
+        echo "Convertendo instancia para o formato PYAsUKP..."
+
+        SOURCE="${TEMP_DIR}/${INSTANCE}.ukp"
+
+        awk '
+            /^[[:space:]]*#/ { next }
+
+            {
+                for (i = 1; i <= NF; ++i)
+                    values[++count] = $i
+            }
+
+            END {
+                n = values[1]
+                capacity = values[2]
+
+                if (n == "" || capacity == "")
+                    exit 2
+
+                print "n: " n
+                print "c: " capacity
+                print "begin data"
+
+                for (i = 0; i < n; ++i)
+                    print values[4 + 2 * i] " " values[3 + 2 * i]
+
+                print "end data"
+            }
+        ' "$INSTANCE_PATH" > "$SOURCE"
+
+        if [[ $? -ne 0 ]]; then
+            echo "ERRO: falha ao converter a instancia para o PYAsUKP."
+            exit 1
+        fi
+    fi
+
+    echo
+    echo "[1/6] C++ - core counters"
+
+    perf stat -r 1 -x ';' \
+        -e task-clock,cpu_core/cycles/,cpu_core/instructions/,cpu_core/branches/,cpu_core/branch-misses/ \
+        -o "$CPP_CORE" \
+        -- taskset -c 2 \
+        "$CPP_BIN" faithful "$INSTANCE_PATH" \
+        >/dev/null || exit 1
+
+    echo "[2/6] C++ - L1"
+
+    perf stat -r 1 -x ';' \
+        -e cpu_core/L1-dcache-loads/,cpu_core/L1-dcache-load-misses/ \
+        -o "$CPP_L1" \
+        -- taskset -c 2 \
+        "$CPP_BIN" faithful "$INSTANCE_PATH" \
+        >/dev/null || exit 1
+
+    echo "[3/6] C++ - LLC"
+
+    perf stat -r 1 -x ';' \
+        -e cpu_core/LLC-loads/,cpu_core/LLC-load-misses/ \
+        -o "$CPP_LLC" \
+        -- taskset -c 2 \
+        "$CPP_BIN" faithful "$INSTANCE_PATH" \
+        >/dev/null || exit 1
+
+    echo "[4/6] OCaml - core counters"
+
+    perf stat -r 1 -x ';' \
+        -e task-clock,cpu_core/cycles/,cpu_core/instructions/,cpu_core/branches/,cpu_core/branch-misses/ \
+        -o "$OCAML_CORE" \
+        -- taskset -c 2 \
+        "$OCAML_BIN" -src "$SOURCE" -batch \
+        >/dev/null || exit 1
+
+    echo "[5/6] OCaml - L1"
+
+    perf stat -r 1 -x ';' \
+        -e cpu_core/L1-dcache-loads/,cpu_core/L1-dcache-load-misses/ \
+        -o "$OCAML_L1" \
+        -- taskset -c 2 \
+        "$OCAML_BIN" -src "$SOURCE" -batch \
+        >/dev/null || exit 1
+
+    echo "[6/6] OCaml - LLC"
+
+    perf stat -r 1 -x ';' \
+        -e cpu_core/LLC-loads/,cpu_core/LLC-load-misses/ \
+        -o "$OCAML_LLC" \
+        -- taskset -c 2 \
+        "$OCAML_BIN" -src "$SOURCE" -batch \
+        >/dev/null || exit 1
+
+    {
+        printf 'cpp'
+
+        awk -F';' '
+            /^[[:space:]]*#/ { next }
+
+            NF >= 3 {
+                value=$1
+                unit=$2
+                event=$3
+
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", unit)
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", event)
+
+                if (value != "" &&
+                    value != "<not supported>" &&
+                    value != "<not counted>") {
+
+                    if (unit != "")
+                        printf "\t%s=%s_%s", event, value, unit
+                    else
+                        printf "\t%s=%s", event, value
+                }
+            }
+        ' "$CPP_CORE" "$CPP_L1" "$CPP_LLC"
+
+        printf '\n'
+
+        printf 'ocaml'
+
+        awk -F';' '
+            /^[[:space:]]*#/ { next }
+
+            NF >= 3 {
+                value=$1
+                unit=$2
+                event=$3
+
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", unit)
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", event)
+
+                if (value != "" &&
+                    value != "<not supported>" &&
+                    value != "<not counted>") {
+
+                    if (unit != "")
+                        printf "\t%s=%s_%s", event, value, unit
+                    else
+                        printf "\t%s=%s", event, value
+                }
+            }
+        ' "$OCAML_CORE" "$OCAML_L1" "$OCAML_LLC"
+
+        printf '\n'
+    } > "$OUT"
+
+    echo
+    echo "Medicao concluida:"
+    echo "$OUT"
+    echo
+
+    cat "$OUT"
+)
