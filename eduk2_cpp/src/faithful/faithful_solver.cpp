@@ -625,6 +625,13 @@ SolverResult Solver::solve(const Instance& inst) {
         return result;
     }
 
+    // PYAsUKP builds its context-dominance bound before removing context-
+    // dominated variables and reuses that immutable bound for every later item
+    // introduction.  Keep the same pre-reduction context as a correctness guard
+    // for irreversible pruning decisions made by the shrinking residual context.
+    BoundContext introduction_bound_ctx;
+    if (options_.use_bounds) introduction_bound_ctx = ctx;
+
     if (options_.use_bounds) {
         const long long items_before_bound_reduction = static_cast<long long>(items.size());
 #ifndef NDEBUG
@@ -1092,7 +1099,41 @@ SolverResult Solver::solve(const Instance& inst) {
                                 bound_type_index(decision.witness)];
                         );
                     }
-                    if (decision.can_fathom) return false;
+                    if (decision.can_fathom) {
+                        // `ctx` is only the residual active context.  Threshold
+                        // dominance and earlier introduction decisions can remove
+                        // variables from it even though a not-yet-introduced item
+                        // may still need continuations represented by those
+                        // variables in the original EDUK recurrence.  Therefore a
+                        // residual-context fathom is only provisional.
+                        //
+                        // Recheck only prospective rejections against the immutable
+                        // pre-reduction context, matching PYAsUKP's `bound` lifetime.
+                        // The residual context remains the fast first-stage filter;
+                        // the item is rejected only if the stable context independently
+                        // certifies the same pruning decision.
+                        const detail::BoundDecision stable_decision =
+                            detail::evaluate_candidate(
+                                introduction_bound_ctx, item.w, item.p,
+                                inst.capacity, incumbent, options_.bound_policy);
+                        record_bound_decision(stable_decision);
+                        if (stable_decision.lower_filter_hit) {
+                            UKP_FULL_STATS(
+                                ++result.stats.contextual_bound_calls_avoided_by_lower;
+                                ++result.stats.contextual_bound_item_calls_avoided_by_lower;
+                            );
+                        }
+                        if (stable_decision.evaluated_mask != 0) {
+                            UKP_BASIC_STATS(++result.stats.bound_calls;);
+                            UKP_FULL_STATS(++result.stats.contextual_bound_item_queries;);
+                            record_contextual_bound(stable_decision, slice);
+                            UKP_FULL_STATS(
+                                ++contextual_bound_item_wins[
+                                    bound_type_index(stable_decision.witness)];
+                            );
+                        }
+                        if (stable_decision.can_fathom) return false;
+                    }
                 }
                 contribution_slot(item.id) = item.w;
                 return true;
