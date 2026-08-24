@@ -193,6 +193,15 @@ constexpr std::array<BoundType, 5> kBoundTypes{
     BoundType::U3, BoundType::V, BoundType::TauStar,
     BoundType::BestItemStar, BoundType::Both};
 
+const char* pyasukp_policy_name(BoundPolicy policy) {
+    switch (policy) {
+        case BoundPolicy::U3: return "MT";
+        case BoundPolicy::V: return "V";
+        case BoundPolicy::PyasukpBoth: return "Both";
+        default: return "none";
+    }
+}
+
 Profit run_core_bb_rec(const std::vector<Item>& core, Weight c, size_t k,
                        Profit cur_profit, Weight cur_weight,
                        Profit incumbent, long long& nodes, long long limit) {
@@ -311,6 +320,11 @@ struct CoreTraversal {
     CoreSearchResult result;
     std::unordered_map<Weight, Profit> best_profit_at_weight;
     std::vector<Weight> min_remaining_weight;
+    // PYAsUKP's default bandbukp2 path has bbnewv=false and therefore does
+    // not use the Dynefflist state table.  Keep the memoization available for
+    // experimental modes only; keying solely by used_weight is not a valid
+    // equivalence relation across different B&B levels.
+    bool use_state_memo = true;
 };
 
 std::vector<Weight> lightest_worse(const std::vector<Item>& items) {
@@ -324,6 +338,7 @@ std::vector<Weight> lightest_worse(const std::vector<Item>& items) {
 }
 
 bool remember_core_state(CoreTraversal& search, Weight used_weight, Profit used_profit) {
+    if (!search.use_state_memo) return true;
     const auto known = search.best_profit_at_weight.find(used_weight);
     if (known != search.best_profit_at_weight.end() && known->second >= used_profit) return false;
     search.best_profit_at_weight[used_weight] = used_profit;
@@ -467,9 +482,15 @@ CoreSearchResult traverse_core(const std::vector<Item>& dp_items, const BoundCon
     }
     // Bounds in the core must describe its locally filtered items, while the
     // global upper remains the global certificate used for closure.
-    BoundContext core_bounds = make_bound_context(filtered, context_telemetry);
-    CoreTraversal search{filtered, core_bounds, policy, capacity, global_upper, std::max<long long>(0, limit), {}, {},
-                         lightest_worse(filtered)};
+    const bool include_optional_bounds =
+        policy == BoundPolicy::BestCertified ||
+        policy == BoundPolicy::TauStar ||
+        policy == BoundPolicy::BestItemStar;
+    BoundContext core_bounds = make_bound_context(
+        filtered, context_telemetry, include_optional_bounds);
+    CoreTraversal search{filtered, core_bounds, policy, capacity, global_upper,
+                         std::max<long long>(0, limit), {}, {},
+                         lightest_worse(filtered), !paper_faithful_mode};
     search.result.multiple_removed = core_multiple_removed;
     search.result.modular_removed = core_modular_removed;
     search.result.multiplicity.assign(original_count, 0);
@@ -477,6 +498,132 @@ CoreSearchResult traverse_core(const std::vector<Item>& dp_items, const BoundCon
     greedy_fill(search, multiplicity);
     backtrack(search, multiplicity);
     return search.result;
+}
+
+
+std::vector<const Item*> pyasukp_variable_reduction_order(
+    const std::vector<Item>& items, Weight capacity) {
+    // Prepro.ends_bests_others scans the input in increasing index order while
+    // `place` conses every remaining item.  Init.structures then builds
+    // `imin1 :: remains`, so after the minimum-weight item the candidates are
+    // visited in reverse input order.  C++ item ids are assigned in input
+    // order, allowing us to reproduce that order for the stage-1 survivors.
+    const Item* lightest = nullptr;
+    for (const Item& item : items) {
+        if (item.w > capacity) continue;
+        if (lightest == nullptr || item.w < lightest->w ||
+            (item.w == lightest->w && item.p > lightest->p) ||
+            (item.w == lightest->w && item.p == lightest->p &&
+             item.id < lightest->id)) {
+            lightest = &item;
+        }
+    }
+
+    std::vector<const Item*> order;
+    order.reserve(items.size());
+    if (lightest != nullptr) order.push_back(lightest);
+
+    std::vector<const Item*> remaining;
+    remaining.reserve(items.size());
+    for (const Item& item : items) {
+        if (item.w <= capacity && &item != lightest) remaining.push_back(&item);
+    }
+    std::sort(remaining.begin(), remaining.end(),
+              [](const Item* left, const Item* right) {
+                  return left->id > right->id;
+              });
+    order.insert(order.end(), remaining.begin(), remaining.end());
+    return order;
+}
+
+std::vector<Item> reduce_variables_with_pyasukp_incumbent(
+    const Instance& inst,
+    const std::vector<Item>& ratio_ordered_items,
+    const BoundContext& immutable_bound_context,
+    Weight capacity,
+    Profit& incumbent,
+    detail::Incumbent& incumbent_solution,
+    long long& bound_calls,
+    BoundPolicy resolved_pyasukp_policy,
+    detail::BoundDecisionTelemetry* decision_telemetry) {
+    if (resolved_pyasukp_policy != BoundPolicy::U3 &&
+        resolved_pyasukp_policy != BoundPolicy::V &&
+        resolved_pyasukp_policy != BoundPolicy::PyasukpBoth) {
+        throw std::invalid_argument(
+            "PYAsUKP variable reduction requires resolved MT/V/Both policy");
+    }
+
+    std::vector<unsigned char> keep(inst.items.size(), 0);
+    for (const Item& item : ratio_ordered_items) {
+        if (item.id < 0 || static_cast<std::size_t>(item.id) >= keep.size()) {
+            throw std::logic_error("item id is outside variable-reduction table");
+        }
+        if (item.w <= capacity || item.id == immutable_bound_context.best.id) {
+            keep[static_cast<std::size_t>(item.id)] = 1;
+        }
+    }
+
+    const std::vector<const Item*> reduction_order =
+        pyasukp_variable_reduction_order(ratio_ordered_items, capacity);
+    for (const Item* item_ptr : reduction_order) {
+        const Item& item = *item_ptr;
+        if (item.id == immutable_bound_context.best.id) {
+            // The initial incumbent already contains the maximal number of b1.
+            continue;
+        }
+
+        // Bounds.with_wp first builds a feasible residual completion and uses
+        // it to strengthen bound.z.  Only then does Init.structures call
+        // is_context_dominated.  The context itself remains the original,
+        // pre-reduction bound exactly as in PYAsUKP.
+        const Weight residual_capacity = capacity - item.w;
+        const detail::FeasibleCompletion completion = detail::complete_with_bound(
+            immutable_bound_context, resolved_pyasukp_policy, residual_capacity);
+        const Profit candidate_profit = safe_add(item.p, completion.profit);
+        const Weight candidate_weight = safe_add(item.w, completion.weight);
+
+        if (candidate_profit > incumbent_solution.profit ||
+            (candidate_profit == incumbent_solution.profit &&
+             candidate_weight > incumbent_solution.weight)) {
+            std::vector<long long> multiplicity(inst.items.size(), 0);
+            multiplicity[static_cast<std::size_t>(item.id)] = 1;
+            for (std::size_t index = 0; index < completion.term_count; ++index) {
+                const detail::CompletionTerm& term = completion.terms[index];
+                if (term.item_id < 0 ||
+                    static_cast<std::size_t>(term.item_id) >= multiplicity.size()) {
+                    throw std::logic_error(
+                        "bound completion item id is outside multiplicity");
+                }
+                multiplicity[static_cast<std::size_t>(term.item_id)] += term.count;
+            }
+            if (incumbent_solution.consider(candidate_profit, candidate_weight,
+                                            std::move(multiplicity))) {
+                incumbent = incumbent_solution.profit;
+            }
+        }
+
+        const detail::BoundDecision decision = detail::evaluate_candidate(
+            immutable_bound_context, item.w, item.p, capacity, incumbent,
+            resolved_pyasukp_policy);
+        detail::accumulate_bound_decision_telemetry(decision_telemetry, decision);
+        if (decision.evaluated_mask != 0) ++bound_calls;
+        if (decision.can_fathom) {
+            keep[static_cast<std::size_t>(item.id)] = 0;
+        }
+    }
+
+    // The DP relies on stable better_ratio order.  Evaluate candidates in the
+    // PYAsUKP preprocessing order above, but publish survivors in the original
+    // ratio order used by the C++ CriticalSequence.
+    std::vector<Item> reduced;
+    reduced.reserve(ratio_ordered_items.size());
+    for (const Item& item : ratio_ordered_items) {
+        if (item.id == immutable_bound_context.best.id ||
+            keep[static_cast<std::size_t>(item.id)] != 0) {
+            reduced.push_back(item);
+        }
+    }
+    return reduced;
 }
 
 Solution solution_from_best_item(const Instance& inst, const Item& best, long long count) {
@@ -587,6 +734,12 @@ SolverResult Solver::solve(const Instance& inst) {
     global_bound.upper = std::numeric_limits<Profit>::max();
     long long best_count = 0;
     Profit incumbent = 0;
+    BoundPolicy effective_bound_policy = options_.bound_policy;
+    BoundPolicy pyasukp_completion_policy = BoundPolicy::U3;
+    BoundContext pyasukp_completion_bound_ctx;
+    const BoundContext* bound_completion_context = nullptr;
+    const bool use_bound_completion =
+        options_.use_bounds && options_.use_pyasukp_bound_completion;
     if (options_.use_bounds) {
         // initialize_bounds is the only initial BoundContext construction on
         // the bounded path.  The previous code built the same context twice.
@@ -596,6 +749,28 @@ SolverResult Solver::solve(const Instance& inst) {
         global_bound = bound_phase.global;
         best_count = bound_phase.best_count;
         incumbent = bound_phase.incumbent;
+        effective_bound_policy = bound_phase.effective_policy;
+        if (options_.bound_policy == BoundPolicy::PyasukpFaithful) {
+            pyasukp_completion_policy = effective_bound_policy;
+            UKP_BASIC_STATS(
+                result.stats.pyasukp_bound_mode =
+                    pyasukp_policy_name(pyasukp_completion_policy);
+            );
+        }
+        if (use_bound_completion &&
+            options_.bound_policy != BoundPolicy::PyasukpFaithful) {
+            // Configuration B keeps BestCertified for upper bounds, but its
+            // incumbent completion must use the minimum-weight V parameters
+            // from PYAsUKP rather than the generic C++ V/Tau* context.
+            pyasukp_completion_bound_ctx =
+                make_bound_context(items, nullptr, false);
+            pyasukp_completion_policy = resolve_pyasukp_policy(
+                pyasukp_completion_bound_ctx, inst.capacity);
+            UKP_BASIC_STATS(
+                result.stats.pyasukp_bound_mode =
+                    pyasukp_policy_name(pyasukp_completion_policy);
+            );
+        }
         UKP_BASIC_STATS(
             ++result.stats.bound_calls;
             result.stats.global_bound_used = ::ukp::bound_type_name(global_bound.type);
@@ -631,15 +806,29 @@ SolverResult Solver::solve(const Instance& inst) {
     // for irreversible pruning decisions made by the shrinking residual context.
     BoundContext introduction_bound_ctx;
     if (options_.use_bounds) introduction_bound_ctx = ctx;
+    if (use_bound_completion) {
+        bound_completion_context =
+            options_.bound_policy == BoundPolicy::PyasukpFaithful
+                ? &introduction_bound_ctx
+                : &pyasukp_completion_bound_ctx;
+    }
 
     if (options_.use_bounds) {
         const long long items_before_bound_reduction = static_cast<long long>(items.size());
 #ifndef NDEBUG
         assert(std::is_sorted(items.begin(), items.end(), better_ratio));
 #endif
-        items = detail::reduce_variables_by_bound(
-            items, ctx, inst.capacity, incumbent, bound_calls_counter,
-            options_.bound_policy, bound_decision_telemetry_ptr);
+        if (options_.bound_policy == BoundPolicy::PyasukpFaithful &&
+            use_bound_completion) {
+            items = reduce_variables_with_pyasukp_incumbent(
+                inst, items, introduction_bound_ctx, inst.capacity, incumbent,
+                incumbent_solution, bound_calls_counter, effective_bound_policy,
+                bound_decision_telemetry_ptr);
+        } else {
+            items = detail::reduce_variables_by_bound(
+                items, ctx, inst.capacity, incumbent, bound_calls_counter,
+                effective_bound_policy, bound_decision_telemetry_ptr);
+        }
         // reduce_variables_by_bound is a stable filter, so survivors retain
         // the exact better_ratio order of the input.
 #ifndef NDEBUG
@@ -653,6 +842,21 @@ SolverResult Solver::solve(const Instance& inst) {
         UKP_BASIC_STATS(
             result.stats.after_preprocess_items = static_cast<long long>(items.size());
         );
+
+        // Bounds.with_wp raises Optimal as soon as its feasible z reaches the
+        // original certified upper bound.  The incumbent stored above is fully
+        // reconstructible, so the C++ faithful path can close at the same point.
+        if (incumbent >= global_bound.upper) {
+            global_bounds_phase.stop();
+            result.solution = incumbent_solution.solution("faithful");
+            UKP_BASIC_STATS(
+                result.stats.active_items_final = static_cast<long long>(items.size());
+                result.stats.stop_reason = "preprocessing_bound";
+                result.stats.dp_stop_reason = "not_started";
+            );
+            publish_context_telemetry();
+            return result;
+        }
     }
     global_bounds_phase.stop();
 
@@ -689,7 +893,7 @@ SolverResult Solver::solve(const Instance& inst) {
         UKP_BASIC_STATS(result.stats.core_node_limit = core_node_limit;);
         std::vector<int>* selected_core_ids = nullptr;
         if constexpr (kFullStats) selected_core_ids = &result.stats.core_item_ids;
-        CoreSearchResult core = traverse_core(dp_items, ctx, options_.bound_policy, inst.capacity,
+        CoreSearchResult core = traverse_core(dp_items, ctx, effective_bound_policy, inst.capacity,
                                                global_bound.upper, options_.core_size,
                                                core_node_limit, inst.items.size(), effective,
                                                options_.paper_faithful_mode, context_telemetry_ptr,
@@ -885,6 +1089,10 @@ SolverResult Solver::solve(const Instance& inst) {
     // which item would be considered next.
     std::vector<Weight> active_suffix_min_weight;
     auto rebuild_active_suffix_min_weight = [&]() {
+        if (use_bound_completion) {
+            active_suffix_min_weight.clear();
+            return;
+        }
         UKP_FULL_STATS(++result.stats.suffix_rebuilds;);
         active_suffix_min_weight.resize(active_items.size());
         if (active_items.empty()) return;
@@ -907,12 +1115,14 @@ SolverResult Solver::solve(const Instance& inst) {
     residual_survivors.reserve(dp_items.size());
 
     auto consider_greedy_completion = [&](detail::PointId state_index) {
+        UKP_BASIC_STATS(++result.stats.greedy_completion_calls;);
         ensure_active_suffix_min_weight();
         const detail::State& state = sequence.state(state_index);
         Weight used_weight = state.weight;
         Weight remaining = inst.capacity - used_weight;
         Profit candidate_profit = state.profit;
         for (std::size_t index = 0; index < active_items.size(); ++index) {
+            UKP_BASIC_STATS(++result.stats.greedy_completion_item_scans;);
             if (remaining < active_suffix_min_weight[index]) break;
             const detail::ActiveItem& item = active_items[index];
             if (item.w > remaining) continue;
@@ -938,6 +1148,7 @@ SolverResult Solver::solve(const Instance& inst) {
              cursor = sequence.state(cursor).predecessor) {
             const int item_id = sequence.state(cursor).item_id;
             if (item_id < 0) break;
+            UKP_BASIC_STATS(++result.stats.greedy_completion_reconstruction_steps;);
             long long& count = reconstruction_multiplicity[static_cast<std::size_t>(item_id)];
             if (count == 0) reconstruction_touched_ids.push_back(item_id);
             ++count;
@@ -945,6 +1156,7 @@ SolverResult Solver::solve(const Instance& inst) {
         Weight reconstruction_weight = state.weight;
         Weight reconstruction_remaining = inst.capacity - reconstruction_weight;
         for (std::size_t index = 0; index < active_items.size(); ++index) {
+            UKP_BASIC_STATS(++result.stats.greedy_completion_reconstruction_steps;);
             if (reconstruction_remaining < active_suffix_min_weight[index]) break;
             const detail::ActiveItem& item = active_items[index];
             if (item.w > reconstruction_remaining) continue;
@@ -962,7 +1174,94 @@ SolverResult Solver::solve(const Instance& inst) {
                                                reconstruction_touched_ids)) {
             incumbent = incumbent_solution.profit;
             residual_delta.incumbent_changed = true;
-            UKP_BASIC_STATS(++result.stats.incumbent_improvements_dp;);
+            UKP_BASIC_STATS(
+                ++result.stats.incumbent_improvements_dp;
+                ++result.stats.greedy_completion_improvements;
+            );
+        }
+        for (const int item_id : reconstruction_touched_ids) {
+            reconstruction_multiplicity[static_cast<std::size_t>(item_id)] = 0;
+        }
+        reconstruction_touched_ids.clear();
+    };
+
+    auto consider_bound_completion = [&](detail::PointId state_index) {
+        UKP_BASIC_STATS(
+            ++result.stats.bound_completion_calls;
+            switch (pyasukp_completion_policy) {
+                case BoundPolicy::U3:
+                    ++result.stats.bound_completion_u3_calls;
+                    break;
+                case BoundPolicy::V:
+                    ++result.stats.bound_completion_v_calls;
+                    break;
+                case BoundPolicy::PyasukpBoth:
+                    ++result.stats.bound_completion_both_calls;
+                    break;
+                default:
+                    break;
+            }
+        );
+
+        const detail::State& state = sequence.state(state_index);
+        const Weight residual_capacity = inst.capacity - state.weight;
+        if (bound_completion_context == nullptr) {
+            throw std::logic_error("bound completion context was not initialized");
+        }
+        const detail::FeasibleCompletion completion =
+            detail::complete_with_bound(
+                *bound_completion_context, pyasukp_completion_policy,
+                residual_capacity);
+        const Profit candidate_profit =
+            safe_add(state.profit, completion.profit);
+        const Weight candidate_weight =
+            safe_add(state.weight, completion.weight);
+
+        if (candidate_profit < incumbent_solution.profit ||
+            (candidate_profit == incumbent_solution.profit &&
+             candidate_weight <= incumbent_solution.weight)) {
+            return;
+        }
+
+        if (reconstruction_multiplicity.empty()) {
+            reconstruction_multiplicity.assign(inst.items.size(), 0);
+        }
+        for (detail::PointId cursor = state_index; cursor != detail::no_point;
+             cursor = sequence.state(cursor).predecessor) {
+            const int item_id = sequence.state(cursor).item_id;
+            if (item_id < 0) break;
+            UKP_BASIC_STATS(++result.stats.bound_completion_reconstruction_steps;);
+            long long& count =
+                reconstruction_multiplicity[static_cast<std::size_t>(item_id)];
+            if (count == 0) reconstruction_touched_ids.push_back(item_id);
+            ++count;
+        }
+        for (std::size_t index = 0; index < completion.term_count; ++index) {
+            const detail::CompletionTerm& term = completion.terms[index];
+            if (term.count <= 0) continue;
+            if (term.item_id < 0 ||
+                static_cast<std::size_t>(term.item_id) >=
+                    reconstruction_multiplicity.size()) {
+                throw std::logic_error(
+                    "bound completion item id is outside multiplicity");
+            }
+            UKP_BASIC_STATS(++result.stats.bound_completion_reconstruction_steps;);
+            long long& count = reconstruction_multiplicity[
+                static_cast<std::size_t>(term.item_id)];
+            if (count == 0) reconstruction_touched_ids.push_back(term.item_id);
+            count += term.count;
+        }
+
+        if (incumbent_solution.consider_sparse(
+                candidate_profit, candidate_weight,
+                reconstruction_multiplicity, reconstruction_touched_ids,
+                state_index)) {
+            incumbent = incumbent_solution.profit;
+            residual_delta.incumbent_changed = true;
+            UKP_BASIC_STATS(
+                ++result.stats.incumbent_improvements_dp;
+                ++result.stats.bound_completion_improvements;
+            );
         }
         for (const int item_id : reconstruction_touched_ids) {
             reconstruction_multiplicity[static_cast<std::size_t>(item_id)] = 0;
@@ -1082,7 +1381,7 @@ SolverResult Solver::solve(const Instance& inst) {
                     const detail::BoundDecision decision =
                         detail::evaluate_candidate(
                             ctx, item.w, item.p, inst.capacity, incumbent,
-                            options_.bound_policy);
+                            effective_bound_policy);
                     record_bound_decision(decision);
                     if (decision.lower_filter_hit) {
                         UKP_FULL_STATS(
@@ -1115,7 +1414,7 @@ SolverResult Solver::solve(const Instance& inst) {
                         const detail::BoundDecision stable_decision =
                             detail::evaluate_candidate(
                                 introduction_bound_ctx, item.w, item.p,
-                                inst.capacity, incumbent, options_.bound_policy);
+                                inst.capacity, incumbent, effective_bound_policy);
                         record_bound_decision(stable_decision);
                         if (stable_decision.lower_filter_hit) {
                             UKP_FULL_STATS(
@@ -1149,7 +1448,7 @@ SolverResult Solver::solve(const Instance& inst) {
                 const detail::BoundDecision decision =
                     detail::evaluate_candidate(
                         state_bound_ctx, state.weight, state.profit, inst.capacity,
-                        incumbent, options_.bound_policy);
+                        incumbent, effective_bound_policy);
                 record_bound_decision(decision);
                 if (decision.lower_filter_hit) {
                     UKP_FULL_STATS(
@@ -1178,9 +1477,15 @@ SolverResult Solver::solve(const Instance& inst) {
                     return false;
                 }
             }
-            // Listing 1's fathoming improves z by greedily completing every
-            // surviving optimal state with the current dominance-free items.
-            consider_greedy_completion(state_index);
+            // Change B replaces the later C++ greedy active-item scan with the
+            // O(1) feasible completion attached to PYAsUKP's selected bound.
+            // The switch is explicit so A/C retain the original baseline and
+            // B/BC differ only in incumbent completion.
+            if (use_bound_completion) {
+                consider_bound_completion(state_index);
+            } else {
+                consider_greedy_completion(state_index);
+            }
             // Every state exposed by the sequence is a strict skip-point.
             if (state_item_id >= 0) contribution_slot(state_item_id) = state.weight;
             UKP_BASIC_STATS(++result.stats.states_kept;);

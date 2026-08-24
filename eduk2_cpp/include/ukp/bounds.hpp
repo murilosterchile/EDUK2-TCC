@@ -55,6 +55,11 @@ struct BoundContext {
     Profit delta1 = 0;
     BoundType preferred = BoundType::Both;
     bool no_multiple_dominance = false;
+    // True for the generic/experimental context.  PyasukpFaithful sets this
+    // to false so q* and BestItemStar certification data (including the
+    // O(n^2) multiple-dominance search) are not computed when the original
+    // PYAsUKP MT/V/Both path cannot use them.
+    bool include_optional_bounds = true;
     // When multiple dominance is present, these stable item IDs retain the
     // pair that certified it in the most recent full search.
     int multiple_dominance_dominator_id = -1;
@@ -88,7 +93,8 @@ struct BoundContextTelemetry {
 };
 
 BoundContext make_bound_context(const std::vector<Item>& items,
-                                BoundContextTelemetry* telemetry = nullptr);
+                                BoundContextTelemetry* telemetry = nullptr,
+                                bool include_optional_bounds = true);
 // Rebuilds an existing context for a monotonically shrinking residual subset,
 // retaining vector storage and cached witnesses that are still present.  The
 // caller guarantees exact better_ratio order; multiplying every profit by the
@@ -112,6 +118,10 @@ BoundValue compute_u3(const BoundContext& ctx, Weight c);
 BoundValue compute_v(const BoundContext& ctx, Weight c);
 BoundValue compute_tau_star(const BoundContext& ctx, Weight c);
 BoundValue compute_best_item_star(const BoundContext& ctx, Weight c);
+// Resolve PYAsUKP's default create_bound/create_both choice for the original
+// full-capacity bound.  The result is U3 (MT), V, or PyasukpBoth and must then
+// remain fixed while the solver evaluates later critical points.
+BoundPolicy resolve_pyasukp_policy(const BoundContext& ctx, Weight c);
 bool is_bound_applicable(const BoundContext& ctx, BoundType type);
 bool is_bound_certified(const BoundContext& ctx, BoundType type);
 std::vector<BoundType> certified_bound_types(const BoundContext& ctx);

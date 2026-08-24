@@ -9,6 +9,22 @@ struct BoundPhase {
     BoundValue global;
     Profit incumbent = 0;
     long long best_count = 0;
+    BoundPolicy effective_policy = BoundPolicy::BestCertified;
+};
+
+struct CompletionTerm {
+    int item_id = -1;
+    long long count = 0;
+};
+
+// Compact feasible residual completion used only as a lower bound/incumbent
+// witness.  MT uses at most b1,b2,b3; V uses one item; Both keeps the better
+// of those two feasible solutions.  No active-item scan is required.
+struct FeasibleCompletion {
+    Profit profit = 0;
+    Weight weight = 0;
+    std::array<CompletionTerm, 3> terms{};
+    std::size_t term_count = 0;
 };
 
 // Contextual DP fathoming only consumes the upper value and its witness type.
@@ -56,6 +72,10 @@ BoundDecision evaluate_candidate(const BoundContext& context,
                                  Weight total_capacity,
                                  Profit incumbent,
                                  BoundPolicy policy);
+
+FeasibleCompletion complete_with_bound(const BoundContext& context,
+                                       BoundPolicy resolved_pyasukp_policy,
+                                       Weight residual_capacity);
 
 void accumulate_bound_decision_telemetry(
     BoundDecisionTelemetry* telemetry, const BoundDecision& decision) noexcept;

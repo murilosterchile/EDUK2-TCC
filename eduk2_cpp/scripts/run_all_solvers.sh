@@ -16,6 +16,20 @@ RUN_ID="$(date +%Y%m%d_%H%M%S)"
 OUTPUT_FILE="${OUTPUT_FILE:-${PROJECT_DIR}/results/run_${RUN_ID}.txt}"
 BUILD=1
 
+# Final comparison summary.
+FAITHFUL_FASTER_COUNT=0
+COMPARED_TIME_COUNT=0
+DIFFERENT_OPTIMUM_COUNT=0
+declare -a DIFFERENT_OPTIMUM_INSTANCES=()
+
+# Results from the most recently executed solver.
+LAST_CPP_STATUS=""
+LAST_CPP_ELAPSED=""
+LAST_CPP_PROFIT=""
+LAST_OCAML_STATUS=""
+LAST_OCAML_ELAPSED=""
+LAST_OCAML_PROFIT=""
+
 usage() {
     cat <<'EOF'
 Usage: scripts/run_all_solvers.sh [options]
@@ -243,20 +257,36 @@ run_cpp() {
         )"
     done
 
+    local avg_elapsed avg_profit avg_weight avg_optimal avg_verified
+    local avg_states avg_points avg_bb_nodes
+
+    avg_elapsed="$(average_array "${elapsed_values[@]}")"
+    avg_profit="$(average_array "${profit_values[@]}")"
+    avg_weight="$(average_array "${weight_values[@]}")"
+    avg_optimal="$(average_array "${optimal_values[@]}")"
+    avg_verified="$(average_array "${verified_values[@]}")"
+    avg_states="$(average_array "${states_values[@]}")"
+    avg_points="$(average_array "${points_values[@]}")"
+    avg_bb_nodes="$(average_array "${bb_nodes_values[@]}")"
+
     append_row \
         "$label" \
         "$kind" \
         "$status" \
         "$RUNS" \
-        "$(average_array "${elapsed_values[@]}")" \
-        "$(average_array "${profit_values[@]}")" \
-        "$(average_array "${weight_values[@]}")" \
-        "$(average_array "${optimal_values[@]}")" \
-        "$(average_array "${verified_values[@]}")" \
-        "$(average_array "${states_values[@]}")" \
-        "$(average_array "${points_values[@]}")" \
-        "$(average_array "${bb_nodes_values[@]}")" \
+        "$avg_elapsed" \
+        "$avg_profit" \
+        "$avg_weight" \
+        "$avg_optimal" \
+        "$avg_verified" \
+        "$avg_states" \
+        "$avg_points" \
+        "$avg_bb_nodes" \
         "last_stop_reason=${stop_reason}"
+
+    LAST_CPP_STATUS="$status"
+    LAST_CPP_ELAPSED="$avg_elapsed"
+    LAST_CPP_PROFIT="$avg_profit"
 }
 
 run_ocaml() {
@@ -348,20 +378,32 @@ run_ocaml() {
         )
     done
 
+    local avg_elapsed avg_profit avg_optimal avg_points avg_bb_nodes
+
+    avg_elapsed="$(average_array "${elapsed_values[@]}")"
+    avg_profit="$(average_array "${profit_values[@]}")"
+    avg_optimal="$(average_array "${optimal_values[@]}")"
+    avg_points="$(average_array "${points_values[@]}")"
+    avg_bb_nodes="$(average_array "${bb_nodes_values[@]}")"
+
     append_row \
         "$label" \
         "ocaml_pyasukpt" \
         "$status" \
         "$RUNS" \
-        "$(average_array "${elapsed_values[@]}")" \
-        "$(average_array "${profit_values[@]}")" \
+        "$avg_elapsed" \
+        "$avg_profit" \
         "" \
-        "$(average_array "${optimal_values[@]}")" \
+        "$avg_optimal" \
         "" \
         "" \
-        "$(average_array "${points_values[@]}")" \
-        "$(average_array "${bb_nodes_values[@]}")" \
+        "$avg_points" \
+        "$avg_bb_nodes" \
         "$summary"
+
+    LAST_OCAML_STATUS="$status"
+    LAST_OCAML_ELAPSED="$avg_elapsed"
+    LAST_OCAML_PROFIT="$avg_profit"
 }
 
 mapfile -d '' -t instances < <(
@@ -382,9 +424,55 @@ for instance in "${instances[@]}"; do
 
     echo "running ${label}"
 
+    # Reset per-instance results before running both solvers.
+    LAST_CPP_STATUS=""
+    LAST_CPP_ELAPSED=""
+    LAST_CPP_PROFIT=""
+    LAST_OCAML_STATUS=""
+    LAST_OCAML_ELAPSED=""
+    LAST_OCAML_PROFIT=""
+
     run_cpp "$FAITHFUL_BIN" "$instance" faithful "$label"
     run_ocaml "$instance" "$label"
+
+    # Compare execution time once per instance, using each solver's average
+    # over RUNS executions.
+    if [[ "$LAST_CPP_STATUS" == "ok" && "$LAST_OCAML_STATUS" == "ok" &&
+          -n "$LAST_CPP_ELAPSED" && -n "$LAST_OCAML_ELAPSED" ]]; then
+        ((COMPARED_TIME_COUNT += 1))
+
+        if awk -v faithful="$LAST_CPP_ELAPSED" -v ocaml="$LAST_OCAML_ELAPSED" \
+            'BEGIN { exit !(faithful < ocaml) }'; then
+            ((FAITHFUL_FASTER_COUNT += 1))
+        fi
+    fi
+
+    # Compare the optimum once per instance, regardless of RUNS.
+    if [[ "$LAST_CPP_STATUS" == "ok" && "$LAST_OCAML_STATUS" == "ok" &&
+          -n "$LAST_CPP_PROFIT" && -n "$LAST_OCAML_PROFIT" ]]; then
+        if ! awk -v faithful="$LAST_CPP_PROFIT" -v ocaml="$LAST_OCAML_PROFIT" \
+            'BEGIN { exit !(faithful == ocaml) }'; then
+            ((DIFFERENT_OPTIMUM_COUNT += 1))
+            DIFFERENT_OPTIMUM_INSTANCES+=(
+                "${label} (faithful=${LAST_CPP_PROFIT}, ocaml=${LAST_OCAML_PROFIT})"
+            )
+        fi
+    fi
 done
 
+echo
 echo "completed ${#instances[@]} instances"
 echo "report: ${OUTPUT_FILE}"
+echo
+echo "=== Final comparison ==="
+echo "faithful faster than OCaml: ${FAITHFUL_FASTER_COUNT}/${COMPARED_TIME_COUNT} instances"
+echo "instances with different optimum: ${DIFFERENT_OPTIMUM_COUNT}"
+
+if ((DIFFERENT_OPTIMUM_COUNT > 0)); then
+    echo "instances with different optimum:"
+    for mismatch in "${DIFFERENT_OPTIMUM_INSTANCES[@]}"; do
+        echo "  - ${mismatch}"
+    done
+else
+    echo "all compared instances returned the same optimum"
+fi

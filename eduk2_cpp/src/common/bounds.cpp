@@ -95,7 +95,10 @@ BoundType policy_type(BoundPolicy p) {
         case BoundPolicy::V: return BoundType::V;
         case BoundPolicy::TauStar: return BoundType::TauStar;
         case BoundPolicy::BestItemStar: return BoundType::BestItemStar;
-        case BoundPolicy::BestCertified: return BoundType::Both;
+        case BoundPolicy::BestCertified:
+        case BoundPolicy::PyasukpFaithful:
+        case BoundPolicy::PyasukpBoth:
+            return BoundType::Both;
     }
     return BoundType::U3;
 }
@@ -165,11 +168,13 @@ void populate_bound_context(BoundContext& ctx, const std::vector<Item>& items,
         ctx.multiple_dominance_dominator_id;
     const int previous_multiple_dominance_dominated_id =
         ctx.multiple_dominance_dominated_id;
+    const bool include_optional_bounds = ctx.include_optional_bounds;
     // Contexts are rebuilt repeatedly while the residual item set shrinks.
     // Preserve the two largest buffers instead of allocating fresh copies.
     std::vector<Item> item_storage = std::move(ctx.items);
     std::vector<Item> normalized_storage = std::move(ctx.normalized_ratio_items);
     ctx = BoundContext{};
+    ctx.include_optional_bounds = include_optional_bounds;
     ctx.items = std::move(item_storage);
     ctx.normalized_ratio_items = std::move(normalized_storage);
     ctx.items.assign(items.begin(), items.end());
@@ -202,11 +207,26 @@ void populate_bound_context(BoundContext& ctx, const std::vector<Item>& items,
     if (third) { ctx.third = *third; ctx.has_three = true; }
 
     bool found = false;
-    for (const Item& it : items) if (diff(it) > 0 && (!found || it.w < ctx.lightest_positive.w ||
-            (it.w == ctx.lightest_positive.w && it.id < ctx.lightest_positive.id))) {
-        ctx.lightest_positive = it; found = true;
+    if (!ctx.include_optional_bounds) {
+        // PYAsUKP bounds.ml:create_bound receives `imin1`, documented by
+        // Prepro.ends_bests_others as the minimum-weight item type.  The
+        // generic C++ V/Tau* machinery uses a different base, so keep that
+        // historical behavior only for optional/experimental contexts.
+        ctx.lightest_positive = *std::min_element(
+            items.begin(), items.end(),
+            [](const Item& left, const Item& right) {
+                if (left.w != right.w) return left.w < right.w;
+                return left.id < right.id;
+            });
+        found = true;
+    } else {
+        for (const Item& it : items) if (diff(it) > 0 && (!found || it.w < ctx.lightest_positive.w ||
+                (it.w == ctx.lightest_positive.w && it.id < ctx.lightest_positive.id))) {
+            ctx.lightest_positive = it; found = true;
+        }
     }
-    // The paper uses the ratio-best item as item 1 when no p_i-w_i is positive.
+    // Generic contexts retain the historical Tau*/V base.  Lean contexts use
+    // the exact PYAsUKP minimum-weight item selected above.
     ctx.tau_star_base = found ? ctx.lightest_positive : ctx.best;
     ctx.lightest_positive = ctx.tau_star_base;
     ctx.has_lightest_positive = true;
@@ -245,37 +265,46 @@ void populate_bound_context(BoundContext& ctx, const std::vector<Item>& items,
         floor_div(static_cast<__int128>(ctx.best_item_star_base.p) * ctx.psi, 1)};
     const bool tau_context_unchanged = has_previous_subset && previous_psi == ctx.psi &&
         same_item(previous_tau_base, ctx.tau_star_base);
-    if (tau_context_unchanged && previous_tau_q_item_present) {
-        ctx.tau_star_q_star_num = previous_tau_q_num;
-        ctx.tau_star_q_star_den = previous_tau_q_den;
-        ctx.tau_star_q_star_item_id = previous_tau_q_item_id;
-    } else {
-        if (telemetry != nullptr) {
-            ++telemetry->tau_q_recomputations;
-            telemetry->tau_q_items_scanned += static_cast<long long>(items.size());
-        }
-        const RationalWitness tau_q =
-            q_star(ctx.normalized_ratio_items, ctx.normalized_tau_star_base);
-        ctx.tau_star_q_star_num = tau_q.value.numerator;
-        ctx.tau_star_q_star_den = tau_q.value.denominator;
-        ctx.tau_star_q_star_item_id = tau_q.item_id;
-    }
     const bool best_context_unchanged = has_previous_subset && previous_psi == ctx.psi &&
         same_item(previous_best_base, ctx.best_item_star_base);
-    if (best_context_unchanged && previous_best_q_item_present) {
-        ctx.best_item_star_q_star_num = previous_best_q_num;
-        ctx.best_item_star_q_star_den = previous_best_q_den;
-        ctx.best_item_star_q_star_item_id = previous_best_q_item_id;
-    } else {
-        if (telemetry != nullptr) {
-            ++telemetry->best_q_recomputations;
-            telemetry->best_q_items_scanned += static_cast<long long>(items.size());
+    if (ctx.include_optional_bounds) {
+        if (tau_context_unchanged && previous_tau_q_item_present) {
+            ctx.tau_star_q_star_num = previous_tau_q_num;
+            ctx.tau_star_q_star_den = previous_tau_q_den;
+            ctx.tau_star_q_star_item_id = previous_tau_q_item_id;
+        } else {
+            if (telemetry != nullptr) {
+                ++telemetry->tau_q_recomputations;
+                telemetry->tau_q_items_scanned += static_cast<long long>(items.size());
+            }
+            const RationalWitness tau_q =
+                q_star(ctx.normalized_ratio_items, ctx.normalized_tau_star_base);
+            ctx.tau_star_q_star_num = tau_q.value.numerator;
+            ctx.tau_star_q_star_den = tau_q.value.denominator;
+            ctx.tau_star_q_star_item_id = tau_q.item_id;
         }
-        const RationalWitness best_item_q =
-            q_star(ctx.normalized_ratio_items, ctx.normalized_best_item_star_base);
-        ctx.best_item_star_q_star_num = best_item_q.value.numerator;
-        ctx.best_item_star_q_star_den = best_item_q.value.denominator;
-        ctx.best_item_star_q_star_item_id = best_item_q.item_id;
+        if (best_context_unchanged && previous_best_q_item_present) {
+            ctx.best_item_star_q_star_num = previous_best_q_num;
+            ctx.best_item_star_q_star_den = previous_best_q_den;
+            ctx.best_item_star_q_star_item_id = previous_best_q_item_id;
+        } else {
+            if (telemetry != nullptr) {
+                ++telemetry->best_q_recomputations;
+                telemetry->best_q_items_scanned += static_cast<long long>(items.size());
+            }
+            const RationalWitness best_item_q =
+                q_star(ctx.normalized_ratio_items, ctx.normalized_best_item_star_base);
+            ctx.best_item_star_q_star_num = best_item_q.value.numerator;
+            ctx.best_item_star_q_star_den = best_item_q.value.denominator;
+            ctx.best_item_star_q_star_item_id = best_item_q.item_id;
+        }
+    } else {
+        ctx.tau_star_q_star_num = 0;
+        ctx.tau_star_q_star_den = 1;
+        ctx.tau_star_q_star_item_id = -1;
+        ctx.best_item_star_q_star_num = 0;
+        ctx.best_item_star_q_star_den = 1;
+        ctx.best_item_star_q_star_item_id = -1;
     }
 
     if (tau_context_unchanged && previous_alpha_item_present) {
@@ -309,7 +338,11 @@ void populate_bound_context(BoundContext& ctx, const std::vector<Item>& items,
     }
     ctx.preferred = static_cast<__int128>(ctx.alpha_num) <= ctx.alpha_den
         ? BoundType::V : BoundType::Both;
-    if (has_previous_subset && previous_no_multiple_dominance) {
+    if (!ctx.include_optional_bounds) {
+        ctx.no_multiple_dominance = false;
+        ctx.multiple_dominance_dominator_id = -1;
+        ctx.multiple_dominance_dominated_id = -1;
+    } else if (has_previous_subset && previous_no_multiple_dominance) {
         ctx.no_multiple_dominance = true;
     } else if (has_previous_subset &&
                previous_multiple_dominance_dominator_id >= 0 &&
@@ -427,6 +460,8 @@ void verify_context_fields(const BoundContext& actual, const BoundContext& oracl
     require_context_field(actual.preferred == oracle.preferred, "preferred");
     require_context_field(actual.no_multiple_dominance == oracle.no_multiple_dominance,
                           "no_multiple_dominance");
+    require_context_field(actual.include_optional_bounds == oracle.include_optional_bounds,
+                          "include_optional_bounds");
     require_context_field(actual.multiple_dominance_dominator_id ==
                               oracle.multiple_dominance_dominator_id,
                           "multiple_dominance_dominator_id");
@@ -463,7 +498,9 @@ void verify_context_bounds(const BoundContext& actual, const BoundContext& oracl
         for (const BoundPolicy policy : {BoundPolicy::U3, BoundPolicy::V,
                                          BoundPolicy::TauStar,
                                          BoundPolicy::BestItemStar,
-                                         BoundPolicy::BestCertified}) {
+                                         BoundPolicy::BestCertified,
+                                         BoundPolicy::PyasukpFaithful,
+                                         BoundPolicy::PyasukpBoth}) {
             require_context_field(same_bound_value(compute_bound(actual, capacity, policy),
                                                    compute_bound(oracle, capacity, policy)),
                                   "compute_bound policy");
@@ -473,8 +510,10 @@ void verify_context_bounds(const BoundContext& actual, const BoundContext& oracl
 } // namespace
 
 BoundContext make_bound_context(const std::vector<Item>& items,
-                                BoundContextTelemetry* telemetry) {
+                                BoundContextTelemetry* telemetry,
+                                bool include_optional_bounds) {
     BoundContext ctx;
+    ctx.include_optional_bounds = include_optional_bounds;
     populate_bound_context(ctx, items, false, telemetry);
     return ctx;
 }
@@ -554,8 +593,16 @@ void apply_bound_context_removals(
     bool found_positive = false;
     Item lightest_positive{};
     const bool previous_tau_was_positive = diff(previous_tau_base) > 0;
-    if (previous_tau_was_positive &&
-        !id_is_removed(removed_by_id, previous_tau_base.id)) {
+    if (!ctx.include_optional_bounds) {
+        lightest_positive = *std::min_element(
+            ctx.items.begin(), ctx.items.end(),
+            [](const Item& left, const Item& right) {
+                if (left.w != right.w) return left.w < right.w;
+                return left.id < right.id;
+            });
+        found_positive = true;
+    } else if (previous_tau_was_positive &&
+               !id_is_removed(removed_by_id, previous_tau_base.id)) {
         lightest_positive = previous_tau_base;
         found_positive = true;
     } else if (previous_tau_was_positive) {
@@ -603,44 +650,53 @@ void apply_bound_context_removals(
         ctx.best_item_star_base.id, ctx.best_item_star_base.w,
         floor_div(static_cast<__int128>(ctx.best_item_star_base.p) * ctx.psi, 1)};
 
-    const bool previous_tau_q_item_survives =
-        previous_tau_q_item_id < 0 ||
-        !id_is_removed(removed_by_id, previous_tau_q_item_id);
-    if (tau_base_unchanged && psi_unchanged && previous_tau_q_item_survives) {
-        ctx.tau_star_q_star_num = previous_tau_q_num;
-        ctx.tau_star_q_star_den = previous_tau_q_den;
-        ctx.tau_star_q_star_item_id = previous_tau_q_item_id;
-    } else {
-        if (telemetry != nullptr) {
-            ++telemetry->tau_q_recomputations;
-            telemetry->tau_q_items_scanned +=
-                static_cast<long long>(ctx.normalized_ratio_items.size());
+    if (ctx.include_optional_bounds) {
+        const bool previous_tau_q_item_survives =
+            previous_tau_q_item_id < 0 ||
+            !id_is_removed(removed_by_id, previous_tau_q_item_id);
+        if (tau_base_unchanged && psi_unchanged && previous_tau_q_item_survives) {
+            ctx.tau_star_q_star_num = previous_tau_q_num;
+            ctx.tau_star_q_star_den = previous_tau_q_den;
+            ctx.tau_star_q_star_item_id = previous_tau_q_item_id;
+        } else {
+            if (telemetry != nullptr) {
+                ++telemetry->tau_q_recomputations;
+                telemetry->tau_q_items_scanned +=
+                    static_cast<long long>(ctx.normalized_ratio_items.size());
+            }
+            const RationalWitness tau_q =
+                q_star(ctx.normalized_ratio_items, ctx.normalized_tau_star_base);
+            ctx.tau_star_q_star_num = tau_q.value.numerator;
+            ctx.tau_star_q_star_den = tau_q.value.denominator;
+            ctx.tau_star_q_star_item_id = tau_q.item_id;
         }
-        const RationalWitness tau_q =
-            q_star(ctx.normalized_ratio_items, ctx.normalized_tau_star_base);
-        ctx.tau_star_q_star_num = tau_q.value.numerator;
-        ctx.tau_star_q_star_den = tau_q.value.denominator;
-        ctx.tau_star_q_star_item_id = tau_q.item_id;
-    }
 
-    const bool previous_best_q_item_survives =
-        previous_best_q_item_id < 0 ||
-        !id_is_removed(removed_by_id, previous_best_q_item_id);
-    if (best_base_unchanged && psi_unchanged && previous_best_q_item_survives) {
-        ctx.best_item_star_q_star_num = previous_best_q_num;
-        ctx.best_item_star_q_star_den = previous_best_q_den;
-        ctx.best_item_star_q_star_item_id = previous_best_q_item_id;
-    } else {
-        if (telemetry != nullptr) {
-            ++telemetry->best_q_recomputations;
-            telemetry->best_q_items_scanned +=
-                static_cast<long long>(ctx.normalized_ratio_items.size());
+        const bool previous_best_q_item_survives =
+            previous_best_q_item_id < 0 ||
+            !id_is_removed(removed_by_id, previous_best_q_item_id);
+        if (best_base_unchanged && psi_unchanged && previous_best_q_item_survives) {
+            ctx.best_item_star_q_star_num = previous_best_q_num;
+            ctx.best_item_star_q_star_den = previous_best_q_den;
+            ctx.best_item_star_q_star_item_id = previous_best_q_item_id;
+        } else {
+            if (telemetry != nullptr) {
+                ++telemetry->best_q_recomputations;
+                telemetry->best_q_items_scanned +=
+                    static_cast<long long>(ctx.normalized_ratio_items.size());
+            }
+            const RationalWitness best_q =
+                q_star(ctx.normalized_ratio_items, ctx.normalized_best_item_star_base);
+            ctx.best_item_star_q_star_num = best_q.value.numerator;
+            ctx.best_item_star_q_star_den = best_q.value.denominator;
+            ctx.best_item_star_q_star_item_id = best_q.item_id;
         }
-        const RationalWitness best_q =
-            q_star(ctx.normalized_ratio_items, ctx.normalized_best_item_star_base);
-        ctx.best_item_star_q_star_num = best_q.value.numerator;
-        ctx.best_item_star_q_star_den = best_q.value.denominator;
-        ctx.best_item_star_q_star_item_id = best_q.item_id;
+    } else {
+        ctx.tau_star_q_star_num = 0;
+        ctx.tau_star_q_star_den = 1;
+        ctx.tau_star_q_star_item_id = -1;
+        ctx.best_item_star_q_star_num = 0;
+        ctx.best_item_star_q_star_den = 1;
+        ctx.best_item_star_q_star_item_id = -1;
     }
 
     const bool previous_alpha_item_survives =
@@ -658,7 +714,9 @@ void apply_bound_context_removals(
 
     ctx.multiple_dominance_dominator_id = -1;
     ctx.multiple_dominance_dominated_id = -1;
-    if (previous_no_multiple_dominance) {
+    if (!ctx.include_optional_bounds) {
+        ctx.no_multiple_dominance = false;
+    } else if (previous_no_multiple_dominance) {
         // Removing items cannot create a new multiple-dominance pair.
         ctx.no_multiple_dominance = true;
     } else {
@@ -701,6 +759,7 @@ void apply_bound_context_removals(
 void verify_bound_context_against_full_rebuild(const BoundContext& context) {
     if (context.items.empty()) context_mismatch("empty context");
     BoundContext oracle;
+    oracle.include_optional_bounds = context.include_optional_bounds;
     populate_bound_context(oracle, context.items, true, nullptr);
     verify_context_fields(context, oracle);
     verify_context_bounds(context, oracle);
@@ -765,8 +824,32 @@ BoundValue compute_best_item_star(const BoundContext& ctx, Weight c) {
     return normalized_bound_from_q(ctx.normalized_best_item_star_base,
         ctx.best_item_star_base, c, q, ctx.psi, BoundType::BestItemStar);
 }
+
+BoundPolicy resolve_pyasukp_policy(const BoundContext& ctx, Weight c) {
+    // bounds.ml:create_bound first selects V whenever alpha <= 1.  Otherwise
+    // create_both computes MT and V at the original capacity and keeps only MT
+    // when MT is strictly tighter; V wins ties, in which case the OCaml value
+    // remains Both so both formulas continue to be evaluated by with_both_wp.
+    if (static_cast<__int128>(ctx.alpha_num) <= ctx.alpha_den) {
+        return BoundPolicy::V;
+    }
+    const BoundValue mt = compute_u3(ctx, c);
+    const BoundValue v = compute_v(ctx, c);
+    return v.upper <= mt.upper ? BoundPolicy::PyasukpBoth : BoundPolicy::U3;
+}
+
 BoundValue compute_bound(const BoundContext& ctx, Weight c, BoundPolicy policy) {
     if (c <= 0) return {0,0,BoundType::U3};
+    if (policy == BoundPolicy::PyasukpFaithful) {
+        policy = resolve_pyasukp_policy(ctx, c);
+    }
+    if (policy == BoundPolicy::PyasukpBoth) {
+        const BoundValue mt = compute_u3(ctx, c);
+        const BoundValue v = compute_v(ctx, c);
+        BoundValue out = v.upper <= mt.upper ? v : mt;
+        out.lower = std::max(mt.lower, v.lower);
+        return out;
+    }
     const BoundType requested=policy_type(policy);
     if (requested != BoundType::Both && is_bound_certified(ctx,requested)) return individual(ctx,c,requested);
     // Forced q* policies that are not certified fall back to certified U3;

@@ -43,7 +43,10 @@ BoundType requested_type(BoundPolicy policy) {
         case BoundPolicy::V: return BoundType::V;
         case BoundPolicy::TauStar: return BoundType::TauStar;
         case BoundPolicy::BestItemStar: return BoundType::BestItemStar;
-        case BoundPolicy::BestCertified: return BoundType::Both;
+        case BoundPolicy::BestCertified:
+        case BoundPolicy::PyasukpFaithful:
+        case BoundPolicy::PyasukpBoth:
+            return BoundType::Both;
     }
     return BoundType::U3;
 }
@@ -149,8 +152,12 @@ BoundPhase initialize_bounds(const std::vector<Item>& items, Weight capacity,
                              BoundPolicy policy,
                              BoundContextTelemetry* telemetry) {
     BoundPhase phase;
-    phase.context = make_bound_context(items, telemetry);
-    phase.global = compute_bound(phase.context, capacity, policy);
+    const bool include_optional_bounds = policy != BoundPolicy::PyasukpFaithful;
+    phase.context = make_bound_context(items, telemetry, include_optional_bounds);
+    phase.effective_policy = policy == BoundPolicy::PyasukpFaithful
+        ? resolve_pyasukp_policy(phase.context, capacity)
+        : policy;
+    phase.global = compute_bound(phase.context, capacity, phase.effective_policy);
     phase.best_count = capacity / phase.context.best.w;
     phase.incumbent = safe_mul(phase.best_count, phase.context.best.p);
     return phase;
@@ -162,6 +169,19 @@ ContextualBound compute_contextual_bound(const BoundContext& context,
                                          long long best_copies) {
     if (residual_capacity <= 0) {
         return {0, BoundType::U3, bound_mask(BoundType::U3)};
+    }
+    if (policy == BoundPolicy::PyasukpFaithful) {
+        policy = resolve_pyasukp_policy(context, residual_capacity);
+    }
+    if (policy == BoundPolicy::PyasukpBoth) {
+        ContextualBound mt = compute_individual_contextual(
+            context, residual_capacity, BoundType::U3, best_copies);
+        ContextualBound v = compute_individual_contextual(
+            context, residual_capacity, BoundType::V, best_copies);
+        const std::uint8_t evaluated = mt.evaluated_mask | v.evaluated_mask;
+        ContextualBound result = v.upper <= mt.upper ? v : mt;
+        result.evaluated_mask = evaluated;
+        return result;
     }
     const BoundType requested = requested_type(policy);
     if (requested != BoundType::Both && is_bound_certified(context, requested)) {
@@ -223,8 +243,25 @@ BoundDecision evaluate_candidate(const BoundContext& context,
         return decision;
     }
 
+    if (policy == BoundPolicy::PyasukpFaithful) {
+        policy = resolve_pyasukp_policy(context, total_capacity);
+    }
+    if (policy == BoundPolicy::PyasukpBoth) {
+        const ContextualBound mt = compute_individual_contextual(
+            context, residual_capacity, BoundType::U3, best_copies);
+        const ContextualBound v = compute_individual_contextual(
+            context, residual_capacity, BoundType::V, best_copies);
+        decision.evaluated_mask = mt.evaluated_mask | v.evaluated_mask;
+        const ContextualBound& winner = v.upper <= mt.upper ? v : mt;
+        decision.upper = winner.upper;
+        decision.witness = winner.type;
+        decision.can_fathom =
+            safe_add(prefix_profit, decision.upper) <= incumbent;
+        return decision;
+    }
+
     const BoundType requested = requested_type(policy);
-    const bool best_certified = requested == BoundType::Both;
+    const bool best_certified = policy == BoundPolicy::BestCertified;
     if (context.certified_type_count == 0) {
         throw std::logic_error("no certified bound");
     }
@@ -259,6 +296,72 @@ BoundDecision evaluate_candidate(const BoundContext& context,
         if (evaluate_one(context.certified_types[index], has_remaining)) break;
     }
     return decision;
+}
+
+FeasibleCompletion complete_with_bound(const BoundContext& context,
+                                       BoundPolicy resolved_pyasukp_policy,
+                                       Weight residual_capacity) {
+    if (residual_capacity <= 0) return {};
+    if (resolved_pyasukp_policy == BoundPolicy::PyasukpFaithful) {
+        // The solver normally resolves once at the original capacity.  Keep
+        // this fallback only for direct callers/tests.
+        resolved_pyasukp_policy =
+            resolve_pyasukp_policy(context, residual_capacity);
+    }
+
+    auto complete_u3 = [&]() {
+        FeasibleCompletion out;
+        const Item& b1 = context.best;
+        const long long x1 = residual_capacity / b1.w;
+        Weight remainder = residual_capacity - safe_mul(x1, b1.w);
+        if (x1 > 0) {
+            out.terms[out.term_count++] = {b1.id, x1};
+            out.profit = safe_add(out.profit, safe_mul(x1, b1.p));
+            out.weight = safe_add(out.weight, safe_mul(x1, b1.w));
+        }
+        if (!context.has_three) return out;
+
+        const Item& b2 = context.second;
+        const long long x2 = remainder / b2.w;
+        remainder -= safe_mul(x2, b2.w);
+        if (x2 > 0) {
+            out.terms[out.term_count++] = {b2.id, x2};
+            out.profit = safe_add(out.profit, safe_mul(x2, b2.p));
+            out.weight = safe_add(out.weight, safe_mul(x2, b2.w));
+        }
+
+        const Item& b3 = context.third;
+        const long long x3 = remainder / b3.w;
+        if (x3 > 0) {
+            out.terms[out.term_count++] = {b3.id, x3};
+            out.profit = safe_add(out.profit, safe_mul(x3, b3.p));
+            out.weight = safe_add(out.weight, safe_mul(x3, b3.w));
+        }
+        return out;
+    };
+
+    auto complete_v = [&]() {
+        FeasibleCompletion out;
+        const Item& item = context.tau_star_base;
+        const long long copies = residual_capacity / item.w;
+        if (copies > 0) {
+            out.terms[0] = {item.id, copies};
+            out.term_count = 1;
+            out.profit = safe_mul(copies, item.p);
+            out.weight = safe_mul(copies, item.w);
+        }
+        return out;
+    };
+
+    if (resolved_pyasukp_policy == BoundPolicy::U3) return complete_u3();
+    if (resolved_pyasukp_policy == BoundPolicy::V) return complete_v();
+    if (resolved_pyasukp_policy == BoundPolicy::PyasukpBoth) {
+        const FeasibleCompletion mt = complete_u3();
+        const FeasibleCompletion v = complete_v();
+        if (v.profit != mt.profit) return v.profit > mt.profit ? v : mt;
+        return v.weight > mt.weight ? v : mt;
+    }
+    throw std::invalid_argument("bound completion requires resolved PYAsUKP policy");
 }
 
 void accumulate_bound_decision_telemetry(

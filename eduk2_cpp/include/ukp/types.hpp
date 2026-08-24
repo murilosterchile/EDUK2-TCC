@@ -14,7 +14,19 @@
 namespace ukp {
 
 // Selection policy, deliberately distinct from BoundType (the formula used).
-enum class BoundPolicy { U3, V, TauStar, BestItemStar, BestCertified };
+// PyasukpFaithful is resolved once, from the original PYAsUKP bound context,
+// to U3, V, or the internal PyasukpBoth policy.  Keeping PyasukpBoth distinct
+// from BestCertified is important: it evaluates exactly U3 and V, while
+// BestCertified may also consider other certified experimental bounds.
+enum class BoundPolicy {
+    U3,
+    V,
+    TauStar,
+    BestItemStar,
+    BestCertified,
+    PyasukpFaithful,
+    PyasukpBoth
+};
 
 using Weight = long long;
 using Profit = long long;
@@ -94,6 +106,16 @@ struct Stats {
     long long points_generated = 0;
     long long incumbent_improvements_bb = 0;
     long long incumbent_improvements_dp = 0;
+    long long greedy_completion_calls = 0;
+    long long greedy_completion_item_scans = 0;
+    long long greedy_completion_improvements = 0;
+    long long greedy_completion_reconstruction_steps = 0;
+    long long bound_completion_calls = 0;
+    long long bound_completion_improvements = 0;
+    long long bound_completion_u3_calls = 0;
+    long long bound_completion_v_calls = 0;
+    long long bound_completion_both_calls = 0;
+    long long bound_completion_reconstruction_steps = 0;
     long long active_items_final = 0;
     long long items_considered_for_introduction = 0;
     long long items_introduced = 0;
@@ -151,6 +173,7 @@ struct Stats {
     long long estimated_state_bytes = 0;
     std::string bound_winner = "none";
     std::string global_bound_used = "none";
+    std::string pyasukp_bound_mode = "none";
     std::map<std::string, long long> contextual_bound_calls;
     std::vector<SliceStats> slices;
     std::string dp_stop_reason = "not_started";
@@ -178,9 +201,13 @@ struct SolverOptions {
     bool use_core_bb = true;
     bool use_periodicity = true;
     bool trace = false;
-    BoundPolicy bound_policy = BoundPolicy::BestCertified;
+    // The default faithful path follows PYAsUKP's MT/V/Both selection and
+    // with_wp feasible completion.  BestCertified and the old greedy
+    // completion remain selectable explicitly for controlled experiments.
+    BoundPolicy bound_policy = BoundPolicy::PyasukpFaithful;
+    bool use_pyasukp_bound_completion = true;
     // Experimental-only.  In paper_faithful_mode the core size is
-    // min(n, max(100, n / 100)) and this value is ignored.
+    // min(n, max(500, n / 100)) and this value is ignored.
     int core_size = -1;
     // Experimental-only.  In paper_faithful_mode B&B always uses 10,000
     // nodes and this value is ignored.

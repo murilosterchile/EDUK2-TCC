@@ -53,6 +53,26 @@ void print_basic_stats(const Instance& inst, const SolverResult& res,
               << res.stats.incumbent_improvements_bb << '\n';
     std::cout << "incumbent_improvements_dp "
               << res.stats.incumbent_improvements_dp << '\n';
+    std::cout << "greedy_completion_calls "
+              << res.stats.greedy_completion_calls << '\n';
+    std::cout << "greedy_completion_item_scans "
+              << res.stats.greedy_completion_item_scans << '\n';
+    std::cout << "greedy_completion_improvements "
+              << res.stats.greedy_completion_improvements << '\n';
+    std::cout << "greedy_completion_reconstruction_steps "
+              << res.stats.greedy_completion_reconstruction_steps << '\n';
+    std::cout << "bound_completion_calls "
+              << res.stats.bound_completion_calls << '\n';
+    std::cout << "bound_completion_improvements "
+              << res.stats.bound_completion_improvements << '\n';
+    std::cout << "bound_completion_u3_calls "
+              << res.stats.bound_completion_u3_calls << '\n';
+    std::cout << "bound_completion_v_calls "
+              << res.stats.bound_completion_v_calls << '\n';
+    std::cout << "bound_completion_both_calls "
+              << res.stats.bound_completion_both_calls << '\n';
+    std::cout << "bound_completion_reconstruction_steps "
+              << res.stats.bound_completion_reconstruction_steps << '\n';
     std::cout << "active_items_final " << res.stats.active_items_final << '\n';
     std::cout << "items_considered_for_introduction "
               << res.stats.items_considered_for_introduction << '\n';
@@ -67,6 +87,7 @@ void print_basic_stats(const Instance& inst, const SolverResult& res,
     std::cout << "backfills_per_item_introduced "
               << backfills_per_introduced << '\n';
     std::cout << "bound_winner " << res.stats.bound_winner << '\n';
+    std::cout << "pyasukp_bound_mode " << res.stats.pyasukp_bound_mode << '\n';
     std::cout << "paper_faithful_mode "
               << (options.paper_faithful_mode ? 1 : 0) << '\n';
     std::cout << "global_bound_used " << res.stats.global_bound_used << '\n';
@@ -275,7 +296,8 @@ int main(int argc, char** argv) {
                " [--paper-faithful|--no-paper-faithful]"
                " [--simple-dominance] [--core-remainder-ordering]"
                " [--modular-dominance] [--core-multiple-dominance]"
-               " [--bound-policy=u3|v|tau-star|best-item-star|best-certified]"
+               " [--bound-policy=u3|v|tau-star|best-item-star|best-certified|pyasukp-faithful]"
+               " [--bound-completion=greedy|pyasukp]"
                " [--verbose]\n";
         return 2;
     }
@@ -307,8 +329,20 @@ int main(int argc, char** argv) {
                 options.bound_policy = BoundPolicy::BestItemStar;
             } else if (value == "best-certified") {
                 options.bound_policy = BoundPolicy::BestCertified;
+            } else if (value == "pyasukp-faithful") {
+                options.bound_policy = BoundPolicy::PyasukpFaithful;
             } else {
                 std::cerr << "unknown bound policy: " << value << '\n';
+                return 2;
+            }
+        } else if (arg.rfind("--bound-completion=", 0) == 0) {
+            const std::string value = arg.substr(19);
+            if (value == "greedy") {
+                options.use_pyasukp_bound_completion = false;
+            } else if (value == "pyasukp") {
+                options.use_pyasukp_bound_completion = true;
+            } else {
+                std::cerr << "unknown bound completion: " << value << '\n';
                 return 2;
             }
         } else {
