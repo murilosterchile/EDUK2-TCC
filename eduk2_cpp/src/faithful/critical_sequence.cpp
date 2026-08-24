@@ -290,6 +290,18 @@ PointId CriticalSequence::state_at_or_before(Weight y) const {
         : static_cast<PointId>(std::prev(position) - states_.begin());
 }
 
+PointId CriticalSequence::expandable_state_at_or_before(Weight y) const {
+    if (y < 0 || expandable_points_.empty()) return 0;
+    const auto position = std::upper_bound(
+        expandable_points_.begin(), expandable_points_.end(), y,
+        [this](Weight value, PointId point) {
+            return value < states_[point].weight;
+        });
+    return position == expandable_points_.begin()
+        ? PointId{0}
+        : *std::prev(position);
+}
+
 Profit CriticalSequence::value_at(Weight y) const {
     return state(state_at_or_before(y)).profit;
 }
@@ -585,12 +597,41 @@ void CriticalSequence::sample_active_items(const std::vector<ActiveItem>& items,
 }
 
 void CriticalSequence::advance_item_cursor(const ActiveItem& item, Weight target_limit,
-                                           SliceBuildResult& result) {
+                                           Profit floor_profit, SliceBuildResult& result) {
     ItemCursor& cursor_state = cursor_for(item);
     if (target_limit < item.w) return;
     const Weight maximum_parent_weight = target_limit - item.w;
     const std::size_t available_end = std::min(cursor_state.built_upon_end,
                                                expandable_points_.size());
+
+    // In Slice.one every item contribution starts with paccprev, the profit
+    // already known at the lower boundary of the slice.  Since profits of the
+    // expandable critical points are strictly increasing, all parents with
+    // base.profit + item.p <= paccprev form one prefix.  Such contributions
+    // can never become a new critical point at any target > ya, so consume
+    // that prefix without materializing it in ComputedWindow.
+    if (floor_profit > item.p) {
+        const Profit maximum_base_profit = floor_profit - item.p;
+        while (cursor_state.next_built_upon < available_end) {
+            const PointId parent = expandable_points_[cursor_state.next_built_upon];
+            const State& base = states_[parent];
+            if (base.weight > maximum_parent_weight ||
+                base.profit > maximum_base_profit) {
+                break;
+            }
+            ++cursor_state.next_built_upon;
+        }
+    } else if (floor_profit == item.p) {
+        // The root contribution reproduces the item point that Init.introduce
+        // has just inserted.  Consume only zero-profit parents here; in the
+        // normal UKP representation that is just the root state.
+        while (cursor_state.next_built_upon < available_end) {
+            const PointId parent = expandable_points_[cursor_state.next_built_upon];
+            const State& base = states_[parent];
+            if (base.weight > maximum_parent_weight || base.profit > 0) break;
+            ++cursor_state.next_built_upon;
+        }
+    }
     while (cursor_state.next_built_upon < available_end) {
         const std::size_t cursor = cursor_state.next_built_upon;
         const PointId parent = expandable_points_[cursor];
@@ -622,11 +663,11 @@ void CriticalSequence::advance_item_cursor(const ActiveItem& item, Weight target
 }
 
 void CriticalSequence::advance_active_cursors(const std::vector<ActiveItem>& items,
-                                              Weight target_limit,
+                                              Weight target_limit, Profit floor_profit,
                                               SliceBuildResult& result) {
     // decreasingS/active_items order is the immutable ratio tie priority.
     for (const ActiveItem& item : items) {
-        advance_item_cursor(item, target_limit, result);
+        advance_item_cursor(item, target_limit, floor_profit, result);
     }
 }
 

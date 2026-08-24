@@ -1269,6 +1269,57 @@ SolverResult Solver::solve(const Instance& inst) {
         reconstruction_touched_ids.clear();
     };
 
+    // PYAsUKP switches Init.rwith_wp to Bounds.bound_up_half_c once c' has
+    // been reached.  From that point on, every residual capacity c-y is in
+    // the already solved prefix, so sequence_result gives an exact residual
+    // completion rather than an MT/V estimate.
+    auto consider_half_capacity_completion = [&](detail::PointId state_index) {
+        const detail::State& state = sequence.state(state_index);
+        const Weight residual_capacity = inst.capacity - state.weight;
+        const detail::PointId partner_index =
+            sequence.expandable_state_at_or_before(residual_capacity);
+        const detail::State& partner = sequence.state(partner_index);
+        const Profit candidate_profit = safe_add(state.profit, partner.profit);
+        const Weight candidate_weight = safe_add(state.weight, partner.weight);
+
+        if (candidate_profit < incumbent_solution.profit ||
+            (candidate_profit == incumbent_solution.profit &&
+             candidate_weight <= incumbent_solution.weight)) {
+            return candidate_profit;
+        }
+
+        if (reconstruction_multiplicity.empty()) {
+            reconstruction_multiplicity.assign(inst.items.size(), 0);
+        }
+        auto add_chain = [&](detail::PointId cursor) {
+            for (; cursor != detail::no_point;
+                 cursor = sequence.state(cursor).predecessor) {
+                const int item_id = sequence.state(cursor).item_id;
+                if (item_id < 0) break;
+                long long& count = reconstruction_multiplicity[
+                    static_cast<std::size_t>(item_id)];
+                if (count == 0) reconstruction_touched_ids.push_back(item_id);
+                ++count;
+            }
+        };
+        add_chain(state_index);
+        add_chain(partner_index);
+
+        if (incumbent_solution.consider_sparse(
+                candidate_profit, candidate_weight,
+                reconstruction_multiplicity, reconstruction_touched_ids,
+                state_index)) {
+            incumbent = incumbent_solution.profit;
+            residual_delta.incumbent_changed = true;
+            UKP_BASIC_STATS(++result.stats.incumbent_improvements_dp;);
+        }
+        for (const int item_id : reconstruction_touched_ids) {
+            reconstruction_multiplicity[static_cast<std::size_t>(item_id)] = 0;
+        }
+        reconstruction_touched_ids.clear();
+        return candidate_profit;
+    };
+
     auto commit_residual_delta = [&](bool solver_will_continue) {
         if (!residual_delta.requested()) return;
 
@@ -1444,7 +1495,19 @@ SolverResult Solver::solve(const Instance& inst) {
             // PYAsUKP's transfert_in_sequence_result never fathoms a state
             // whose last item is b.  Preserving that chain is an invariant of
             // the threshold-based periodicity certificate and of fill_with_best.
-            if (options_.use_bounds && state_item_id != periodic_best.id) {
+            if (options_.use_bounds && state_item_id != periodic_best.id &&
+                options_.paper_faithful_mode && half_capacity_extension_done) {
+                const Profit exact_completion =
+                    consider_half_capacity_completion(state_index);
+                // Bounds.is_context_dominated uses a strict comparison
+                // (u < z).  bound_up_half_c has u == z for this state, so an
+                // equal completion is kept exactly as in PYAsUKP.
+                if (exact_completion < incumbent) {
+                    UKP_BASIC_STATS(++result.stats.states_fathomed;);
+                    UKP_FULL_STATS(++slice.states_fathomed_by_bound;);
+                    return false;
+                }
+            } else if (options_.use_bounds && state_item_id != periodic_best.id) {
                 const detail::BoundDecision decision =
                     detail::evaluate_candidate(
                         state_bound_ctx, state.weight, state.profit, inst.capacity,
@@ -1481,10 +1544,12 @@ SolverResult Solver::solve(const Instance& inst) {
             // O(1) feasible completion attached to PYAsUKP's selected bound.
             // The switch is explicit so A/C retain the original baseline and
             // B/BC differ only in incumbent completion.
-            if (use_bound_completion) {
-                consider_bound_completion(state_index);
-            } else {
-                consider_greedy_completion(state_index);
+            if (!(options_.paper_faithful_mode && half_capacity_extension_done)) {
+                if (use_bound_completion) {
+                    consider_bound_completion(state_index);
+                } else {
+                    consider_greedy_completion(state_index);
+                }
             }
             // Every state exposed by the sequence is a strict skip-point.
             if (state_item_id >= 0) contribution_slot(state_item_id) = state.weight;

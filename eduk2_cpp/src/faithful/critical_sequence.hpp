@@ -82,6 +82,9 @@ public:
     void configure_item_order(const std::vector<Item>& ratio_ordered_items);
 
     [[nodiscard]] PointId state_at_or_before(Weight y) const;
+    // Same query restricted to the states that survived contextual fathoming
+    // and therefore correspond to PYAsUKP's sequence_result.
+    [[nodiscard]] PointId expandable_state_at_or_before(Weight y) const;
     [[nodiscard]] Profit value_at(Weight y) const;
     [[nodiscard]] const State& state(PointId id) const;
     [[nodiscard]] const std::vector<State>& states() const noexcept;
@@ -189,10 +192,10 @@ private:
 
     void schedule_successors(PointId parent, Weight compute_limit,
                              const std::vector<Item>& items, SliceBuildResult& result);
-    void advance_item_cursor(const ActiveItem& item, Weight target_limit,
+    void advance_item_cursor(const ActiveItem& item, Weight target_limit, Profit floor_profit,
                              SliceBuildResult& result);
     void advance_active_cursors(const std::vector<ActiveItem>& items, Weight target_limit,
-                                SliceBuildResult& result);
+                                Profit floor_profit, SliceBuildResult& result);
     void schedule_current_active_successors(PointId parent, Weight target_limit,
                                             const std::vector<ActiveItem>& items,
                                             SliceBuildResult& result);
@@ -331,7 +334,8 @@ SliceBuildResult CriticalSequence::process_slice_incremental(
     // Resume each OCaml-style item cursor before visiting the slice.  Every
     // candidate needed in ]ya, yb] is therefore present before its target
     // weight is consumed.
-    advance_active_cursors(active_items, target_limit, result);
+    const Profit slice_floor_profit = states_.back().profit;
+    advance_active_cursors(active_items, target_limit, slice_floor_profit, result);
 
 #ifndef NDEBUG
     // Preserve the cursor positions from which the legacy end-of-slice
@@ -384,7 +388,10 @@ SliceBuildResult CriticalSequence::process_slice_incremental(
             }
 
             initialize_item_cursor(item);
-            advance_item_cursor(item, target_limit, result);
+            // Init.introduce makes this item itself the new pacc at wi.
+            // Contributions that do not strictly beat pi can therefore be
+            // consumed immediately, exactly like Slice.one's paccprev filter.
+            advance_item_cursor(item, target_limit, item.p, result);
             // Items are considered in nondecreasing (weight, tie_rank) order,
             // so accepted items can extend the scheduling view monotonically.
             add_active_item_by_weight(item);
