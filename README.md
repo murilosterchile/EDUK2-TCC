@@ -30,3 +30,10 @@ cd  ~/TCC/EDUK2-TCC
   --ocaml-dir /home/aprix/TCC/EDUK2-TCC/pyasukp_mail/pyasukp \
   --data-dir /home/aprix/TCC/EDUK2-TCC/eduk2_cpp/data \
   --output-file /home/aprix/TCC/EDUK2-TCC/eduk2_cpp/results/all_solvers_mean_5.tsv
+
+
+  ./eduk2_cpp/scripts/run_all_solvers.sh \
+  --compare-with ukp5 \
+  --runs 1 \
+  --data-dir /home/aprix/TCC/EDUK2-TCC/eduk2_cpp/data \
+  --output-file /home/aprix/TCC/EDUK2-TCC/eduk2_cpp/results/ukp5_solvers_mean_5.tsv

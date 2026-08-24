@@ -134,6 +134,8 @@ private:
         void configure(Weight live_span);
         void store(Weight weight, Profit profit, PointId predecessor,
                    int item_id, int tie_rank);
+        void store_ratio_ordered(Weight weight, Profit profit, PointId predecessor,
+                                 int item_id, int tie_rank);
         [[nodiscard]] bool contains(Weight weight) const;
         [[nodiscard]] Candidate take(Weight weight);
         [[nodiscard]] std::size_t estimated_bytes() const noexcept;
@@ -193,7 +195,7 @@ private:
     void schedule_successors(PointId parent, Weight compute_limit,
                              const std::vector<Item>& items, SliceBuildResult& result);
     void advance_item_cursor(const ActiveItem& item, Weight target_limit, Profit floor_profit,
-                             SliceBuildResult& result);
+                             SliceBuildResult& result, bool ratio_ordered_phase = false);
     void advance_active_cursors(const std::vector<ActiveItem>& items, Weight target_limit,
                                 Profit floor_profit, SliceBuildResult& result);
     void schedule_current_active_successors(PointId parent, Weight target_limit,

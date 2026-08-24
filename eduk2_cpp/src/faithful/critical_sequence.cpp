@@ -124,6 +124,66 @@ void CriticalSequence::ComputedWindow::store(
 #endif
 }
 
+void CriticalSequence::ComputedWindow::store_ratio_ordered(
+    Weight weight, Profit profit, PointId predecessor, int item_id, int tie_rank) {
+#ifndef NDEBUG
+    if constexpr (stats_enabled_v<StatsMode::Full>) {
+        legacy_store(weight, Candidate{profit, tie_rank, item_id, predecessor});
+    }
+#endif
+
+    Slot& slot = slots_[index(weight)];
+    if (slot.weight != weight) {
+        if constexpr (stats_enabled_v<StatsMode::Full>) {
+            if (slot.weight >= 0) ++index_collisions_;
+            ++candidates_stored_;
+        }
+        slot.weight = weight;
+        slot.candidate.profit = profit;
+        slot.candidate.tie_rank = tie_rank;
+        slot.candidate.item_id = item_id;
+        slot.candidate.predecessor = predecessor;
+#ifndef NDEBUG
+        if constexpr (stats_enabled_v<StatsMode::Full>) {
+            assert_winner_matches_legacy(weight);
+        }
+#endif
+        return;
+    }
+    if constexpr (stats_enabled_v<StatsMode::Full>) ++collisions_;
+    const Profit current_profit = slot.candidate.profit;
+    // During advance_active_cursors items are traversed in immutable ratio
+    // order. For equal-profit candidates reaching the same target, the
+    // existing candidate therefore already has the better tie rank.
+#ifndef NDEBUG
+    if (profit == current_profit) {
+        assert(slot.candidate.tie_rank <= tie_rank);
+    }
+#endif
+    if (profit <= current_profit) {
+        if constexpr (stats_enabled_v<StatsMode::Full>) ++rejections_;
+#ifndef NDEBUG
+        if constexpr (stats_enabled_v<StatsMode::Full>) {
+            assert_winner_matches_legacy(weight);
+        }
+#endif
+        return;
+    }
+    if constexpr (stats_enabled_v<StatsMode::Full>) {
+        ++candidates_stored_;
+        ++replacements_;
+    }
+    slot.candidate.profit = profit;
+    slot.candidate.tie_rank = tie_rank;
+    slot.candidate.item_id = item_id;
+    slot.candidate.predecessor = predecessor;
+#ifndef NDEBUG
+    if constexpr (stats_enabled_v<StatsMode::Full>) {
+        assert_winner_matches_legacy(weight);
+    }
+#endif
+}
+
 bool CriticalSequence::ComputedWindow::contains(Weight weight) const {
     if (slots_.empty()) return false;
     const bool present = slots_[index(weight)].weight == weight;
@@ -597,7 +657,8 @@ void CriticalSequence::sample_active_items(const std::vector<ActiveItem>& items,
 }
 
 void CriticalSequence::advance_item_cursor(const ActiveItem& item, Weight target_limit,
-                                           Profit floor_profit, SliceBuildResult& result) {
+                                           Profit floor_profit, SliceBuildResult& result,
+                                           bool ratio_ordered_phase) {
     ItemCursor& cursor_state = cursor_for(item);
     if (target_limit < item.w) return;
     const Weight maximum_parent_weight = target_limit - item.w;
@@ -657,8 +718,13 @@ void CriticalSequence::advance_item_cursor(const ActiveItem& item, Weight target
                 ++result.backfill_attempts;
             }
         }
-        pending_.store(weight, safe_add(base.profit, item.p), parent, item.id,
-                       item.tie_rank);
+        const Profit candidate_profit = safe_add(base.profit, item.p);
+        if (ratio_ordered_phase) {
+            pending_.store_ratio_ordered(weight, candidate_profit, parent, item.id,
+                                         item.tie_rank);
+        } else {
+            pending_.store(weight, candidate_profit, parent, item.id, item.tie_rank);
+        }
     }
 }
 
@@ -667,7 +733,7 @@ void CriticalSequence::advance_active_cursors(const std::vector<ActiveItem>& ite
                                               SliceBuildResult& result) {
     // decreasingS/active_items order is the immutable ratio tie priority.
     for (const ActiveItem& item : items) {
-        advance_item_cursor(item, target_limit, floor_profit, result);
+        advance_item_cursor(item, target_limit, floor_profit, result, true);
     }
 }
 

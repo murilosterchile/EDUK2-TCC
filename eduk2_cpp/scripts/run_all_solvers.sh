@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Build and run faithful and PYAsUKP/OCaml for every .ukp file.
-# The input format is shared by the C++ reader and PYAsUKP's -src option.
+# Build and run faithful against PYAsUKP/OCaml or UKP5 for every .ukp file.
+# The input format is shared by all three solvers.
 
 set -u -o pipefail
 
@@ -8,8 +8,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 DATA_DIR="${DATA_DIR:-${PROJECT_DIR}/data}"
 BUILD_DIR="${BUILD_DIR:-${PROJECT_DIR}/build}"
-BENCHMARK_BUILD_DIR="${BENCHMARK_BUILD_DIR:-${PROJECT_DIR}/build}"
+BENCHMARK_BUILD_DIR="${BENCHMARK_BUILD_DIR:-${BUILD_DIR}}"
 OCAML_DIR="${OCAML_DIR:-/home/aprix/Downloads/pyasukp_mail/pyasukp}"
+UKP5_DIR="${UKP5_DIR:-${PROJECT_DIR}/../benchmarks/pyasukp_paper/external/masters/codes/cpp}"
+COMPARE_WITH="${COMPARE_WITH:-ocaml}"
 BUILD_TYPE="${BUILD_TYPE:-Release}"
 RUNS="${RUNS:-5}"
 RUN_ID="$(date +%Y%m%d_%H%M%S)"
@@ -26,9 +28,9 @@ declare -a DIFFERENT_OPTIMUM_INSTANCES=()
 LAST_CPP_STATUS=""
 LAST_CPP_ELAPSED=""
 LAST_CPP_PROFIT=""
-LAST_OCAML_STATUS=""
-LAST_OCAML_ELAPSED=""
-LAST_OCAML_PROFIT=""
+LAST_REFERENCE_STATUS=""
+LAST_REFERENCE_ELAPSED=""
+LAST_REFERENCE_PROFIT=""
 
 usage() {
     cat <<'EOF'
@@ -39,17 +41,20 @@ Options:
   --build-dir DIR      CMake build directory (default: build/)
   --benchmark-build-dir DIR
                          CMake build directory for faithful (default: build/)
+  --compare-with SOLVER Compare faithful with ocaml or ukp5 (default: ocaml)
   --ocaml-dir DIR      PYAsUKP directory (default: ~/Downloads/pyasukp_mail/pyasukp)
+  --ukp5-dir DIR       UKP5 C++ source directory (default: repository benchmark copy)
   --output-file FILE   Single text report (default: results/run_<timestamp>.txt)
   --output-dir DIR     Deprecated alias; writes DIR/results.txt
   --build-type TYPE    CMake build type (default: Release)
   --runs N             Executions per instance and solver (default: 5)
-  --no-build           Reuse existing C++ and native OCaml executables
+  --no-build           Reuse existing solver executables
   -h, --help           Show this help
 
-Environment variables DATA_DIR, BUILD_DIR, BENCHMARK_BUILD_DIR, OCAML_DIR,
-OUTPUT_FILE, BUILD_TYPE and RUNS have the equivalent effect. The script writes
-one tab-separated text report with averages over the requested executions.
+Environment variables DATA_DIR, BUILD_DIR, BENCHMARK_BUILD_DIR, COMPARE_WITH,
+OCAML_DIR, UKP5_DIR, UKP5_BIN, OUTPUT_FILE, BUILD_TYPE and RUNS have the
+equivalent effect. The script writes one tab-separated text report with
+averages over the requested executions.
 EOF
 }
 
@@ -58,7 +63,9 @@ while (($#)); do
         --data-dir) DATA_DIR="$2"; shift 2 ;;
         --build-dir) BUILD_DIR="$2"; shift 2 ;;
         --benchmark-build-dir) BENCHMARK_BUILD_DIR="$2"; shift 2 ;;
+        --compare-with) COMPARE_WITH="$2"; shift 2 ;;
         --ocaml-dir) OCAML_DIR="$2"; shift 2 ;;
+        --ukp5-dir) UKP5_DIR="$2"; shift 2 ;;
         --output-file) OUTPUT_FILE="$2"; shift 2 ;;
         --output-dir) OUTPUT_FILE="${2%/}/results.txt"; shift 2 ;;
         --build-type) BUILD_TYPE="$2"; shift 2 ;;
@@ -74,6 +81,15 @@ done
     exit 2
 }
 
+case "$COMPARE_WITH" in
+    ocaml) REFERENCE_LABEL="OCaml" ;;
+    ukp5) REFERENCE_LABEL="UKP5" ;;
+    *)
+        echo "--compare-with must be either ocaml or ukp5" >&2
+        exit 2
+        ;;
+esac
+
 require_dir() {
     [[ -d "$1" ]] || {
         echo "directory not found: $1" >&2
@@ -82,41 +98,57 @@ require_dir() {
 }
 
 require_dir "$DATA_DIR"
-require_dir "$OCAML_DIR"
+
+if [[ "$COMPARE_WITH" == "ocaml" ]]; then
+    require_dir "$OCAML_DIR"
+else
+    require_dir "$UKP5_DIR"
+fi
 
 TEMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TEMP_DIR"' EXIT
 OCAML_RUNTIME_DIR="$OCAML_DIR"
 
 if ((BUILD)); then
-    cmake -S "$PROJECT_DIR" -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE="$BUILD_TYPE"
-    cmake --build "$BUILD_DIR" --parallel
+    cmake -S "$PROJECT_DIR" -B "$BENCHMARK_BUILD_DIR" -DCMAKE_BUILD_TYPE="$BUILD_TYPE"
+    cmake --build "$BENCHMARK_BUILD_DIR" --parallel
 
-    # Build PYAsUKP from its .ml sources as a native executable so its timing
-    # is comparable to the C++ executables. Build in a clean temporary copy,
-    # avoiding stale artifacts and leaving the checked-out OCaml tree intact.
-    OCAML_RUNTIME_DIR="${TEMP_DIR}/pyasukp"
-    cp -a "$OCAML_DIR" "$OCAML_RUNTIME_DIR"
-    make -C "$OCAML_RUNTIME_DIR" allclean optt
+    if [[ "$COMPARE_WITH" == "ocaml" ]]; then
+        # Build PYAsUKP from its .ml sources as a native executable so its timing
+        # is comparable to the C++ executables. Build in a clean temporary copy,
+        # avoiding stale artifacts and leaving the checked-out OCaml tree intact.
+        OCAML_RUNTIME_DIR="${TEMP_DIR}/pyasukp"
+        cp -a "$OCAML_DIR" "$OCAML_RUNTIME_DIR"
+        make -C "$OCAML_RUNTIME_DIR" allclean optt
+    else
+        # This is the Makefile target whose main is mains/run_ukp5.cpp.
+        make -C "$UKP5_DIR" bin/run_ukp5.out
+    fi
 fi
 
 FAITHFUL_BIN="${BENCHMARK_BUILD_DIR}/ukp_solve_benchmark"
 OCAML_BIN="${OCAML_BIN:-${OCAML_RUNTIME_DIR}/pyasukpt}"
+UKP5_BIN="${UKP5_BIN:-${UKP5_DIR}/bin/run_ukp5.out}"
 
 if [[ ! -x "$FAITHFUL_BIN" ]]; then
     echo "C++ faithful benchmark executable not found: ${FAITHFUL_BIN}" >&2
     exit 2
 fi
 
-if [[ ! -x "$OCAML_BIN" ]]; then
-    if (( ! BUILD )); then
-        echo "OCaml executable not found: ${OCAML_BIN}" >&2
+if [[ "$COMPARE_WITH" == "ocaml" ]]; then
+    if [[ ! -x "$OCAML_BIN" ]]; then
+        if (( ! BUILD )); then
+            echo "OCaml executable not found: ${OCAML_BIN}" >&2
+            exit 2
+        fi
+    fi
+
+    if [[ ! -x "$OCAML_BIN" ]]; then
+        echo "native PYAsUKP build did not produce ${OCAML_BIN}" >&2
         exit 2
     fi
-fi
-
-if [[ ! -x "$OCAML_BIN" ]]; then
-    echo "native PYAsUKP build did not produce ${OCAML_BIN}" >&2
+elif [[ ! -x "$UKP5_BIN" ]]; then
+    echo "UKP5 executable not found: ${UKP5_BIN}" >&2
     exit 2
 fi
 
@@ -401,9 +433,97 @@ run_ocaml() {
         "$avg_bb_nodes" \
         "$summary"
 
-    LAST_OCAML_STATUS="$status"
-    LAST_OCAML_ELAPSED="$avg_elapsed"
-    LAST_OCAML_PROFIT="$avg_profit"
+    LAST_REFERENCE_STATUS="$status"
+    LAST_REFERENCE_ELAPSED="$avg_elapsed"
+    LAST_REFERENCE_PROFIT="$avg_profit"
+}
+
+run_ukp5() {
+    local instance="$1" label="$2"
+    local source="$instance"
+    local converted
+
+    # run_ukp5.out accepts n:/c:/begin-data input. Convert the compact legacy
+    # format, whose item order is profit then weight, before invoking it.
+    if ! grep -qE '^[[:space:]]*(n|m):|^[[:space:]]*begin data' "$instance"; then
+        converted="$(mktemp "${TEMP_DIR}/ukp5-input.XXXXXX.ukp")"
+
+        awk '
+            /^[[:space:]]*#/ { next }
+
+            {
+                for (i = 1; i <= NF; ++i)
+                    values[++count] = $i
+            }
+
+            END {
+                n = values[1]
+                capacity = values[2]
+
+                if (n == "" || capacity == "")
+                    exit 2
+
+                print "n: " n
+                print "c: " capacity
+                print "begin data"
+
+                for (i = 0; i < n; ++i)
+                    print values[4 + 2 * i] " " values[3 + 2 * i]
+
+                print "end data"
+            }
+        ' "$instance" > "$converted" || return 1
+
+        source="$converted"
+    fi
+
+    local start end output exit_code status="ok" details=""
+    local -a elapsed_values=()
+    local -a profit_values=()
+    local -a weight_values=()
+    local run
+
+    for ((run = 1; run <= RUNS; ++run)); do
+        start="$(date +%s%N)"
+        output="$("$UKP5_BIN" "$source" 2>&1)"
+        exit_code=$?
+        end="$(date +%s%N)"
+
+        elapsed_values+=("$(elapsed_seconds "$start" "$end")")
+
+        if ((exit_code != 0)); then
+            status="failed"
+            continue
+        fi
+
+        profit_values+=("$(value_from_cpp_output "$output" 'opt:')")
+        weight_values+=("$(value_from_cpp_output "$output" 'y_opt:')")
+        details="internal_seconds=$(value_from_cpp_output "$output" 'Seconds:')"
+    done
+
+    local avg_elapsed avg_profit avg_weight
+    avg_elapsed="$(average_array "${elapsed_values[@]}")"
+    avg_profit="$(average_array "${profit_values[@]}")"
+    avg_weight="$(average_array "${weight_values[@]}")"
+
+    append_row \
+        "$label" \
+        "ukp5" \
+        "$status" \
+        "$RUNS" \
+        "$avg_elapsed" \
+        "$avg_profit" \
+        "$avg_weight" \
+        "1" \
+        "" \
+        "" \
+        "" \
+        "" \
+        "$details"
+
+    LAST_REFERENCE_STATUS="$status"
+    LAST_REFERENCE_ELAPSED="$avg_elapsed"
+    LAST_REFERENCE_PROFIT="$avg_profit"
 }
 
 mapfile -d '' -t instances < <(
@@ -428,33 +548,37 @@ for instance in "${instances[@]}"; do
     LAST_CPP_STATUS=""
     LAST_CPP_ELAPSED=""
     LAST_CPP_PROFIT=""
-    LAST_OCAML_STATUS=""
-    LAST_OCAML_ELAPSED=""
-    LAST_OCAML_PROFIT=""
+    LAST_REFERENCE_STATUS=""
+    LAST_REFERENCE_ELAPSED=""
+    LAST_REFERENCE_PROFIT=""
 
     run_cpp "$FAITHFUL_BIN" "$instance" faithful "$label"
-    run_ocaml "$instance" "$label"
+    if [[ "$COMPARE_WITH" == "ocaml" ]]; then
+        run_ocaml "$instance" "$label"
+    else
+        run_ukp5 "$instance" "$label"
+    fi
 
     # Compare execution time once per instance, using each solver's average
     # over RUNS executions.
-    if [[ "$LAST_CPP_STATUS" == "ok" && "$LAST_OCAML_STATUS" == "ok" &&
-          -n "$LAST_CPP_ELAPSED" && -n "$LAST_OCAML_ELAPSED" ]]; then
+    if [[ "$LAST_CPP_STATUS" == "ok" && "$LAST_REFERENCE_STATUS" == "ok" &&
+          -n "$LAST_CPP_ELAPSED" && -n "$LAST_REFERENCE_ELAPSED" ]]; then
         ((COMPARED_TIME_COUNT += 1))
 
-        if awk -v faithful="$LAST_CPP_ELAPSED" -v ocaml="$LAST_OCAML_ELAPSED" \
-            'BEGIN { exit !(faithful < ocaml) }'; then
+        if awk -v faithful="$LAST_CPP_ELAPSED" -v reference="$LAST_REFERENCE_ELAPSED" \
+            'BEGIN { exit !(faithful < reference) }'; then
             ((FAITHFUL_FASTER_COUNT += 1))
         fi
     fi
 
     # Compare the optimum once per instance, regardless of RUNS.
-    if [[ "$LAST_CPP_STATUS" == "ok" && "$LAST_OCAML_STATUS" == "ok" &&
-          -n "$LAST_CPP_PROFIT" && -n "$LAST_OCAML_PROFIT" ]]; then
-        if ! awk -v faithful="$LAST_CPP_PROFIT" -v ocaml="$LAST_OCAML_PROFIT" \
-            'BEGIN { exit !(faithful == ocaml) }'; then
+    if [[ "$LAST_CPP_STATUS" == "ok" && "$LAST_REFERENCE_STATUS" == "ok" &&
+          -n "$LAST_CPP_PROFIT" && -n "$LAST_REFERENCE_PROFIT" ]]; then
+        if ! awk -v faithful="$LAST_CPP_PROFIT" -v reference="$LAST_REFERENCE_PROFIT" \
+            'BEGIN { exit !(faithful == reference) }'; then
             ((DIFFERENT_OPTIMUM_COUNT += 1))
             DIFFERENT_OPTIMUM_INSTANCES+=(
-                "${label} (faithful=${LAST_CPP_PROFIT}, ocaml=${LAST_OCAML_PROFIT})"
+                "${label} (faithful=${LAST_CPP_PROFIT}, ${COMPARE_WITH}=${LAST_REFERENCE_PROFIT})"
             )
         fi
     fi
@@ -465,7 +589,7 @@ echo "completed ${#instances[@]} instances"
 echo "report: ${OUTPUT_FILE}"
 echo
 echo "=== Final comparison ==="
-echo "faithful faster than OCaml: ${FAITHFUL_FASTER_COUNT}/${COMPARED_TIME_COUNT} instances"
+echo "faithful faster than ${REFERENCE_LABEL}: ${FAITHFUL_FASTER_COUNT}/${COMPARED_TIME_COUNT} instances"
 echo "instances with different optimum: ${DIFFERENT_OPTIMUM_COUNT}"
 
 if ((DIFFERENT_OPTIMUM_COUNT > 0)); then
