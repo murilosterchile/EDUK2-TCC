@@ -1,0 +1,48 @@
+# EDUK2 solver execution report
+# generated_at: 2026-08-20T00:03:09-03:00
+instance	algorithm	status	elapsed_seconds	profit	weight	optimal	verified	states_scanned	points_generated	bb_nodes	details
+corepb.ukp	faithful	ok	5,329700	10077782	999999	1	1	715904090	715904090	6	half_capacity
+corepb.ukp	optimized	ok	17,619649	10077782	999999	1	1	14475023559	0	0	uninitialized
+corepb.ukp	ocaml_pyasukpbct	ok	135,288317	10077782		false			47362	10001	Not a Saw ukp      16590 false          2      47362 false        10077782  135.25290 10001
+example.ukp	faithful	ok	0,003703	90	60	1	1	10	10	4	half_capacity
+example.ukp	optimized	ok	0,003024	90	60	1	1	0	0	13	uninitialized
+example.ukp	ocaml_pyasukpbct	ok	0,004935	90		false			1	5	Not a Saw ukp          0 false          1          1 false              90    0.00003 5
+exnsd16.ukp	faithful	ok	0,013077	1029680	889303	1	1	939027	939027	158	single_item
+exnsd16.ukp	optimized	ok	0,334634	1029680	889303	1	1	383560962	0	64	uninitialized
+exnsd16.ukp	ocaml_pyasukpbct	ok	0,042675	1029680		false			1	3864	Not a Saw ukp          0 false          1          1 false         1029680    0.03355 3864
+exnsd18.ukp	faithful	ok	0,006648	1112131	933366	1	1	121379	121379	905	single_item
+exnsd18.ukp	optimized	ok	0,199181	1112131	933366	1	1	174407943	0	128	uninitialized
+exnsd18.ukp	ocaml_pyasukpbct	ok	0,100216	1112131		false			3664	10001	Not a Saw ukp        156 true          1       3664 false         1112131    0.09276 10001
+exnsd20.ukp	faithful	ok	0,019721	1026086	914965	1	1	1642737	1642737	213	single_item
+exnsd20.ukp	optimized	ok	0,491246	1026086	914965	1	1	648343854	0	64	uninitialized
+exnsd20.ukp	ocaml_pyasukpbct	ok	0,256383	1026086		false			18575	10001	Not a Saw ukp        204 true          1      18575 false         1026086    0.24908 10001
+exnsd26.ukp	faithful	ok	0,019095	1027564	934159	1	1	2706224	2706224	111	single_item
+exnsd26.ukp	optimized	ok	0,569993	1027564	934159	1	1	792947144	0	0	uninitialized
+exnsd26.ukp	ocaml_pyasukpbct	ok	0,110541	1027564		false			12475	10001	Not a Saw ukp         97 true          1      12475 false         1027564    0.10265 10001
+exnsdbis10.ukp	faithful	ok	0,037044	1028035	894642	1	1	3690637	3690637	136	half_capacity
+exnsdbis10.ukp	optimized	ok	0,689954	1028035	894642	1	1	875003408	0	0	uninitialized
+exnsdbis10.ukp	ocaml_pyasukpbct	ok	0,199963	1028035		false			153502	10001	Not a Saw ukp        111 false          2     153502 false         1028035    0.19080 10001
+exnsdbis18.ukp	faithful	ok	0,028736	1037156	917598	1	1	2972260	2972260	139	single_item
+exnsdbis18.ukp	optimized	ok	0,558086	1037156	917598	1	1	752900336	0	0	uninitialized
+exnsdbis18.ukp	ocaml_pyasukpbct	ok	0,450423	1037156		false			165797	10001	Not a Saw ukp        454 true          1     165797 false         1037156    0.44139 10001
+exnsds12.ukp	faithful	ok	0,029238	3793952	1624196	1	1	1483185	1483185	630	single_item
+exnsds12.ukp	optimized	ok	0,473567	3793952	1624196	1	1	528928025	0	128	uninitialized
+exnsds12.ukp	ocaml_pyasukpbct	ok	0,671517	3793952		false			193112	10001	Not a Saw ukp        235 true          1     193112 false         3793952    0.65201 10001
+ukp_bb_favorable_2000_1p2M.ukp	faithful	ok	0,003608	1764350	1200000	1	1	0	0	0	initial_bound
+ukp_bb_favorable_2000_1p2M.ukp	optimized	ok	0,013820	1764350	1200000	1	1	0	0	0	uninitialized
+ukp_bb_favorable_2000_1p2M.ukp	ocaml_pyasukpbct	ok	0,008284	1764350		false			1	0	no bound          0 false          1          1 false         1764350    0.00132 0
+ukp_hardish_2000_8M.ukp	faithful	ok	0,190673	8143251	8000000	1	1	28457724	28457724	46	single_item
+ukp_hardish_2000_8M.ukp	optimized	ok	6,659534	8143251	8000000	1	1	8174894690	0	0	uninitialized
+ukp_hardish_2000_8M.ukp	ocaml_pyasukpbct	ok	9,245441	8143251		false			1058372	10001	Not a Saw ukp       1987 true          1    1058372 false         8143251    9.21999 10001
+ukp_intermediate_bb_2000_5M.ukp	faithful	ok	0,163126	5139742	4999992	1	1	30340315	30340315	43	single_item
+ukp_intermediate_bb_2000_5M.ukp	optimized	ok	3,705077	5139742	4999992	1	1	4530991500	0	0	uninitialized
+ukp_intermediate_bb_2000_5M.ukp	ocaml_pyasukpbct	ok	3,786190	5139742		false			262287	10001	Not a Saw ukp        895 true          1     262287 false         5139742    3.77404 10001
+ukp_large_compare_1000_250k.ukp	faithful	ok	0,004787	331359	249980	1	1	16	16	5815	single_item
+ukp_large_compare_1000_250k.ukp	optimized	ok	0,003214	331359	249980	1	1	0	0	18	uninitialized
+ukp_large_compare_1000_250k.ukp	ocaml_pyasukpbct	ok	0,006344	331359		false			1	15	Saw ukp          0 false          1          1 false          331359    0.00042 15
+ukp_moderate_bb_2000_900k.ukp	faithful	ok	0,098949	928539	900000	1	1	16087669	16087669	13	single_item
+ukp_moderate_bb_2000_900k.ukp	optimized	ok	0,337437	928539	900000	1	1	369031947	0	64	uninitialized
+ukp_moderate_bb_2000_900k.ukp	ocaml_pyasukpbct	ok	0,440212	928539		false			37433	10001	Not a Saw ukp        142 true          1      37433 false          928539    0.43356 10001
+ukp_target_eduk2_favorable_2000_1p5M.ukp	faithful	ok	0,003855	2303360	1500000	1	1	0	0	0	initial_bound
+ukp_target_eduk2_favorable_2000_1p5M.ukp	optimized	ok	0,012973	2303360	1500000	1	1	0	0	0	uninitialized
+ukp_target_eduk2_favorable_2000_1p5M.ukp	ocaml_pyasukpbct	ok	0,007988	2303360		false			1	0	no bound          0 false          1          1 false         2303360    0.00130 0
