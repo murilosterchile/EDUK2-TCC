@@ -26,10 +26,10 @@ declare -a DIFFERENT_OPTIMUM_INSTANCES=()
 
 # Results from the most recently executed solver.
 LAST_CPP_STATUS=""
-LAST_CPP_ELAPSED=""
+LAST_CPP_INTERNAL=""
 LAST_CPP_PROFIT=""
 LAST_REFERENCE_STATUS=""
-LAST_REFERENCE_ELAPSED=""
+LAST_REFERENCE_INTERNAL=""
 LAST_REFERENCE_PROFIT=""
 
 usage() {
@@ -156,12 +156,14 @@ mkdir -p "$(dirname "$OUTPUT_FILE")"
 
 printf '# EDUK2 solver execution report\n# generated_at: %s\n' \
     "$(date --iso-8601=seconds)" > "$OUTPUT_FILE"
+printf '# primary_time: internal_seconds (average over successful runs)\n' \
+    >> "$OUTPUT_FILE"
 
-printf 'instance\talgorithm\tstatus\truns\telapsed_seconds\tprofit\tweight\toptimal\tverified\tstates_scanned\tpoints_generated\tbb_nodes\tdetails\n' \
+printf 'instance\talgorithm\tstatus\truns\tinternal_seconds\tprofit\tweight\toptimal\tverified\tstates_scanned\tpoints_generated\tbb_nodes\tdetails\n' \
     >> "$OUTPUT_FILE"
 
 elapsed_seconds() {
-    awk -v begin="$1" -v end="$2" \
+    LC_ALL=C awk -v begin="$1" -v end="$2" \
         'BEGIN { printf "%.6f", (end - begin) / 1000000000 }'
 }
 
@@ -171,7 +173,8 @@ value_from_cpp_output() {
 }
 
 average_values() {
-    awk '{
+    LC_ALL=C awk '{
+        gsub(",", ".", $1)
         sum += $1
         count += 1
     }
@@ -229,6 +232,7 @@ run_cpp() {
 
     local start end output exit_code status="ok" stop_reason=""
     local -a elapsed_values=()
+    local -a internal_values=()
     local -a profit_values=()
     local -a weight_values=()
     local -a optimal_values=()
@@ -255,6 +259,11 @@ run_cpp() {
             status="failed"
             continue
         fi
+
+        internal_values+=(
+            "$(LC_ALL=C awk -v us="$(value_from_cpp_output "$output" time_us)" \
+                'BEGIN { printf "%.9f", us / 1000000 }')"
+        )
 
         profit_values+=(
             "$(value_from_cpp_output "$output" profit)"
@@ -289,10 +298,11 @@ run_cpp() {
         )"
     done
 
-    local avg_elapsed avg_profit avg_weight avg_optimal avg_verified
+    local avg_elapsed avg_internal avg_profit avg_weight avg_optimal avg_verified
     local avg_states avg_points avg_bb_nodes
 
     avg_elapsed="$(average_array "${elapsed_values[@]}")"
+    avg_internal="$(average_array "${internal_values[@]}")"
     avg_profit="$(average_array "${profit_values[@]}")"
     avg_weight="$(average_array "${weight_values[@]}")"
     avg_optimal="$(average_array "${optimal_values[@]}")"
@@ -306,7 +316,7 @@ run_cpp() {
         "$kind" \
         "$status" \
         "$RUNS" \
-        "$avg_elapsed" \
+        "$avg_internal" \
         "$avg_profit" \
         "$avg_weight" \
         "$avg_optimal" \
@@ -314,10 +324,10 @@ run_cpp() {
         "$avg_states" \
         "$avg_points" \
         "$avg_bb_nodes" \
-        "last_stop_reason=${stop_reason}"
+        "elapsed_seconds=${avg_elapsed} last_stop_reason=${stop_reason}"
 
     LAST_CPP_STATUS="$status"
-    LAST_CPP_ELAPSED="$avg_elapsed"
+    LAST_CPP_INTERNAL="$avg_internal"
     LAST_CPP_PROFIT="$avg_profit"
 }
 
@@ -362,6 +372,7 @@ run_ocaml() {
 
     local start end output exit_code status="ok" summary=""
     local -a elapsed_values=()
+    local -a internal_values=()
     local -a profit_values=()
     local -a optimal_values=()
     local -a points_values=()
@@ -393,6 +404,10 @@ run_ocaml() {
             awk 'NF { print; exit }' <<< "$output"
         )"
 
+        internal_values+=(
+            "$(awk 'NF { print $(NF - 1); exit }' <<< "$output")"
+        )
+
         profit_values+=(
             "$(awk 'NF { print $(NF - 2); exit }' <<< "$output")"
         )
@@ -410,9 +425,10 @@ run_ocaml() {
         )
     done
 
-    local avg_elapsed avg_profit avg_optimal avg_points avg_bb_nodes
+    local avg_elapsed avg_internal avg_profit avg_optimal avg_points avg_bb_nodes
 
     avg_elapsed="$(average_array "${elapsed_values[@]}")"
+    avg_internal="$(average_array "${internal_values[@]}")"
     avg_profit="$(average_array "${profit_values[@]}")"
     avg_optimal="$(average_array "${optimal_values[@]}")"
     avg_points="$(average_array "${points_values[@]}")"
@@ -423,7 +439,7 @@ run_ocaml() {
         "ocaml_pyasukpt" \
         "$status" \
         "$RUNS" \
-        "$avg_elapsed" \
+        "$avg_internal" \
         "$avg_profit" \
         "" \
         "$avg_optimal" \
@@ -431,10 +447,10 @@ run_ocaml() {
         "" \
         "$avg_points" \
         "$avg_bb_nodes" \
-        "$summary"
+        "elapsed_seconds=${avg_elapsed} ${summary}"
 
     LAST_REFERENCE_STATUS="$status"
-    LAST_REFERENCE_ELAPSED="$avg_elapsed"
+    LAST_REFERENCE_INTERNAL="$avg_internal"
     LAST_REFERENCE_PROFIT="$avg_profit"
 }
 
@@ -477,8 +493,9 @@ run_ukp5() {
         source="$converted"
     fi
 
-    local start end output exit_code status="ok" details=""
+    local start end output exit_code status="ok"
     local -a elapsed_values=()
+    local -a internal_values=()
     local -a profit_values=()
     local -a weight_values=()
     local run
@@ -498,11 +515,12 @@ run_ukp5() {
 
         profit_values+=("$(value_from_cpp_output "$output" 'opt:')")
         weight_values+=("$(value_from_cpp_output "$output" 'y_opt:')")
-        details="internal_seconds=$(value_from_cpp_output "$output" 'Seconds:')"
+        internal_values+=("$(value_from_cpp_output "$output" 'Seconds:')")
     done
 
-    local avg_elapsed avg_profit avg_weight
+    local avg_elapsed avg_internal avg_profit avg_weight
     avg_elapsed="$(average_array "${elapsed_values[@]}")"
+    avg_internal="$(average_array "${internal_values[@]}")"
     avg_profit="$(average_array "${profit_values[@]}")"
     avg_weight="$(average_array "${weight_values[@]}")"
 
@@ -511,7 +529,7 @@ run_ukp5() {
         "ukp5" \
         "$status" \
         "$RUNS" \
-        "$avg_elapsed" \
+        "$avg_internal" \
         "$avg_profit" \
         "$avg_weight" \
         "1" \
@@ -519,10 +537,10 @@ run_ukp5() {
         "" \
         "" \
         "" \
-        "$details"
+        "elapsed_seconds=${avg_elapsed}"
 
     LAST_REFERENCE_STATUS="$status"
-    LAST_REFERENCE_ELAPSED="$avg_elapsed"
+    LAST_REFERENCE_INTERNAL="$avg_internal"
     LAST_REFERENCE_PROFIT="$avg_profit"
 }
 
@@ -546,10 +564,10 @@ for instance in "${instances[@]}"; do
 
     # Reset per-instance results before running both solvers.
     LAST_CPP_STATUS=""
-    LAST_CPP_ELAPSED=""
+    LAST_CPP_INTERNAL=""
     LAST_CPP_PROFIT=""
     LAST_REFERENCE_STATUS=""
-    LAST_REFERENCE_ELAPSED=""
+    LAST_REFERENCE_INTERNAL=""
     LAST_REFERENCE_PROFIT=""
 
     run_cpp "$FAITHFUL_BIN" "$instance" faithful "$label"
@@ -559,13 +577,13 @@ for instance in "${instances[@]}"; do
         run_ukp5 "$instance" "$label"
     fi
 
-    # Compare execution time once per instance, using each solver's average
-    # over RUNS executions.
+    # Compare internal execution time once per instance, using each solver's
+    # average over RUNS executions.
     if [[ "$LAST_CPP_STATUS" == "ok" && "$LAST_REFERENCE_STATUS" == "ok" &&
-          -n "$LAST_CPP_ELAPSED" && -n "$LAST_REFERENCE_ELAPSED" ]]; then
+          -n "$LAST_CPP_INTERNAL" && -n "$LAST_REFERENCE_INTERNAL" ]]; then
         ((COMPARED_TIME_COUNT += 1))
 
-        if awk -v faithful="$LAST_CPP_ELAPSED" -v reference="$LAST_REFERENCE_ELAPSED" \
+        if LC_ALL=C awk -v faithful="$LAST_CPP_INTERNAL" -v reference="$LAST_REFERENCE_INTERNAL" \
             'BEGIN { exit !(faithful < reference) }'; then
             ((FAITHFUL_FASTER_COUNT += 1))
         fi
@@ -574,7 +592,7 @@ for instance in "${instances[@]}"; do
     # Compare the optimum once per instance, regardless of RUNS.
     if [[ "$LAST_CPP_STATUS" == "ok" && "$LAST_REFERENCE_STATUS" == "ok" &&
           -n "$LAST_CPP_PROFIT" && -n "$LAST_REFERENCE_PROFIT" ]]; then
-        if ! awk -v faithful="$LAST_CPP_PROFIT" -v reference="$LAST_REFERENCE_PROFIT" \
+        if ! LC_ALL=C awk -v faithful="$LAST_CPP_PROFIT" -v reference="$LAST_REFERENCE_PROFIT" \
             'BEGIN { exit !(faithful == reference) }'; then
             ((DIFFERENT_OPTIMUM_COUNT += 1))
             DIFFERENT_OPTIMUM_INSTANCES+=(
@@ -589,7 +607,7 @@ echo "completed ${#instances[@]} instances"
 echo "report: ${OUTPUT_FILE}"
 echo
 echo "=== Final comparison ==="
-echo "faithful faster than ${REFERENCE_LABEL}: ${FAITHFUL_FASTER_COUNT}/${COMPARED_TIME_COUNT} instances"
+echo "faithful faster than ${REFERENCE_LABEL} by average internal time: ${FAITHFUL_FASTER_COUNT}/${COMPARED_TIME_COUNT} instances"
 echo "instances with different optimum: ${DIFFERENT_OPTIMUM_COUNT}"
 
 if ((DIFFERENT_OPTIMUM_COUNT > 0)); then
