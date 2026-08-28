@@ -4,6 +4,7 @@
 #include "critical_sequence.hpp"
 #include "preprocessing.hpp"
 #include "incumbent.hpp"
+#include "instance_features.hpp"
 #include <algorithm>
 #include <array>
 #include <cassert>
@@ -240,6 +241,13 @@ struct CoreSearchResult {
     Profit profit = 0;
     std::vector<long long> multiplicity;
     long long nodes = 0;
+    long long branch_evaluations = 0;
+    long long incumbent_improvements = 0;
+    long long last_incumbent_improvement_node = 0;
+    long long fractional_bound_calls = 0;
+    long long fractional_bound_prunes = 0;
+    long long u3_calls = 0;
+    long long u3_prunes = 0;
     bool closed = false;
     long long multiple_removed = 0;
     long long modular_removed = 0;
@@ -348,6 +356,10 @@ bool remember_core_state(CoreTraversal& search, Weight used_weight, Profit used_
 void record_core_solution(CoreTraversal& search, Profit profit,
                           const std::vector<long long>& multiplicity) {
     if (profit > search.result.profit) {
+        if constexpr (kBasicStats) {
+            ++search.result.incumbent_improvements;
+            search.result.last_incumbent_improvement_node = search.result.nodes;
+        }
         search.result.profit = profit;
         search.result.multiplicity = multiplicity;
     }
@@ -370,13 +382,21 @@ void complete(CoreTraversal& search, std::size_t item_index, Weight used_weight,
 
     const Item& item = search.items[item_index];
     for (long long count = remaining / item.w; count >= 0; --count) {
+        if constexpr (kBasicStats) ++search.result.branch_evaluations;
         const Weight next_weight = used_weight + safe_mul(count, item.w);
         const Profit next_profit = safe_add(used_profit, safe_mul(count, item.p));
         const Profit residual_upper = compute_bound(search.bounds, search.capacity - next_weight, search.policy).upper;
+        if constexpr (kBasicStats) {
+            ++search.result.fractional_bound_calls;
+            if (search.policy == BoundPolicy::U3) ++search.result.u3_calls;
+        }
         if (safe_add(next_profit, residual_upper) > search.result.profit) {
             multiplicity[static_cast<std::size_t>(item.id)] = count;
             complete(search, item_index + 1, next_weight, next_profit, multiplicity);
             multiplicity[static_cast<std::size_t>(item.id)] = 0;
+        } else if constexpr (kBasicStats) {
+            ++search.result.fractional_bound_prunes;
+            if (search.policy == BoundPolicy::U3) ++search.result.u3_prunes;
         }
         if (count == 0 || search.result.closed || search.result.nodes >= search.limit) break;
     }
@@ -649,6 +669,8 @@ SolverResult Solver::solve(const Instance& inst) {
     const EffectiveOptions effective = effective_options(options_);
     UKP_BASIC_STATS(
         result.stats.original_items = static_cast<long long>(inst.items.size());
+        result.stats.selected_kernel = "eduk2";
+        result.stats.dispatch_reason = "dispatcher_not_enabled";
     );
     UKP_FULL_STATS(
         result.stats.backfill_attempts_by_item.assign(inst.items.size(), -1);
@@ -664,10 +686,33 @@ SolverResult Solver::solve(const Instance& inst) {
         return result;
     }
 
+    std::vector<Item> common_items;
+    {
+        PhaseTimer<kFullStats> phase(result.stats.phase_common_preprocessing_ns);
+        common_items = detail::common_preprocess_items(inst);
+    }
+    if constexpr (kFullStats) {
+        PhaseTimer<true> phase(result.stats.phase_feature_extraction_ns);
+        result.stats.instance_features =
+            detail::extract_instance_features(inst, common_items);
+    }
+    if (common_items.empty()) {
+        result.solution.multiplicity_by_id.assign(inst.items.size(), 0);
+        result.solution.optimal = true;
+        result.solution.solver_name = "optimized";
+        UKP_BASIC_STATS(
+            result.stats.after_preprocess_items = 0;
+            result.stats.stop_reason = "no_feasible_items";
+            result.stats.dp_stop_reason = "not_started";
+        );
+        return result;
+    }
+
     detail::PreprocessResult preprocessing;
     {
         PhaseTimer<kFullStats> phase(result.stats.phase_preprocessing_ns);
-        preprocessing = detail::preprocess_items(inst, effective.simple_dominance);
+        preprocessing = detail::preprocess_items_for_eduk2(
+            common_items, effective.simple_dominance);
     }
     std::vector<Item> items = std::move(preprocessing.items);
     UKP_BASIC_STATS(
@@ -893,6 +938,7 @@ SolverResult Solver::solve(const Instance& inst) {
         UKP_BASIC_STATS(result.stats.core_node_limit = core_node_limit;);
         std::vector<int>* selected_core_ids = nullptr;
         if constexpr (kFullStats) selected_core_ids = &result.stats.core_item_ids;
+        UKP_BASIC_STATS(result.stats.bb_initial_incumbent = incumbent;);
         CoreSearchResult core = traverse_core(dp_items, ctx, effective_bound_policy, inst.capacity,
                                                global_bound.upper, options_.core_size,
                                                core_node_limit, inst.items.size(), effective,
@@ -911,6 +957,15 @@ SolverResult Solver::solve(const Instance& inst) {
         incumbent_solution.consider(core.profit, core_weight, core.multiplicity);
         UKP_BASIC_STATS(
             result.stats.bb_nodes += core.nodes;
+            result.stats.bb_branch_evaluations += core.branch_evaluations;
+            result.stats.bb_incumbent_improvements += core.incumbent_improvements;
+            result.stats.bb_last_incumbent_improvement_node =
+                core.last_incumbent_improvement_node;
+            result.stats.bb_final_incumbent = incumbent;
+            result.stats.bb_fractional_bound_calls += core.fractional_bound_calls;
+            result.stats.bb_fractional_bound_prunes += core.fractional_bound_prunes;
+            result.stats.bb_u3_calls += core.u3_calls;
+            result.stats.bb_u3_prunes += core.u3_prunes;
             result.stats.items_removed_core_multiple += core.multiple_removed;
             result.stats.items_removed_modular += core.modular_removed;
         );

@@ -60,6 +60,7 @@ target_link_libraries(ukp_faithful_none PUBLIC ukp_common)
 
 set(UKP_OPTIMIZED_SOURCES
   src/optimized/optimized_solver.cpp
+  src/optimized/instance_features.cpp
   src/optimized/critical_sequence.cpp
   src/optimized/incumbent.cpp
   src/optimized/preprocessing.cpp
@@ -67,21 +68,29 @@ set(UKP_OPTIMIZED_SOURCES
 )
 
 add_library(ukp_optimized ${UKP_OPTIMIZED_SOURCES})
-target_compile_definitions(ukp_optimized PRIVATE UKP_STATS_MODE=2)
+target_compile_definitions(ukp_optimized PUBLIC UKP_STATS_MODE=2)
 target_link_libraries(ukp_optimized PUBLIC ukp_common)
 
-function(add_ukp_solve_variant target faithful_target)
+add_library(ukp_optimized_basic ${UKP_OPTIMIZED_SOURCES})
+target_compile_definitions(ukp_optimized_basic PUBLIC UKP_STATS_MODE=1)
+target_link_libraries(ukp_optimized_basic PUBLIC ukp_common)
+
+add_library(ukp_optimized_none ${UKP_OPTIMIZED_SOURCES})
+target_compile_definitions(ukp_optimized_none PUBLIC UKP_STATS_MODE=0)
+target_link_libraries(ukp_optimized_none PUBLIC ukp_common)
+
+function(add_ukp_solve_variant target faithful_target optimized_target)
   add_executable(${target} src/tools/ukp_solve.cpp)
   target_link_libraries(${target}
-    PRIVATE ${faithful_target} ukp_optimized ukp_common)
+    PRIVATE ${faithful_target} ${optimized_target} ukp_common)
 endfunction()
 
 # Backward-compatible full-telemetry executable.
-add_ukp_solve_variant(ukp_solve ukp_faithful)
+add_ukp_solve_variant(ukp_solve ukp_faithful ukp_optimized)
 # Explicit names for controlled experiments.
-add_ukp_solve_variant(ukp_solve_telemetry ukp_faithful)
-add_ukp_solve_variant(ukp_solve_basic ukp_faithful_basic)
-add_ukp_solve_variant(ukp_solve_benchmark ukp_faithful_none)
+add_ukp_solve_variant(ukp_solve_telemetry ukp_faithful ukp_optimized)
+add_ukp_solve_variant(ukp_solve_basic ukp_faithful_basic ukp_optimized_basic)
+add_ukp_solve_variant(ukp_solve_benchmark ukp_faithful_none ukp_optimized_none)
 
 add_executable(ukp_bench src/tools/ukp_bench.cpp)
 target_link_libraries(ukp_bench PRIVATE ukp_faithful ukp_optimized ukp_common)

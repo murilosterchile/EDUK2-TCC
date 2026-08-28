@@ -73,7 +73,29 @@ struct SliceStats {
     std::string contextual_bound_used = "none";
 };
 
+struct InstanceFeatures {
+    long long original_items = 0;
+    Weight capacity = 0;
+    Weight min_weight = 0;
+    Weight max_weight = 0;
+    Profit min_profit = 0;
+    Profit max_profit = 0;
+    int best_item_id = -1;
+    Weight best_item_weight = 0;
+    Profit best_item_profit = 0;
+    double capacity_over_best_weight = 0.0;
+    double capacity_over_min_weight = 0.0;
+    Weight weight_gcd = 0;
+    double mean_weight = 0.0;
+    double weight_variance = 0.0;
+    long long near_best_efficiency_items = 0;
+    double best_second_efficiency_gap = 0.0;
+    long long after_common_preprocessing_items = 0;
+    double common_reduction_ratio = 0.0;
+};
+
 struct Stats {
+    InstanceFeatures instance_features;
     long long original_items = 0;
     long long after_preprocess_items = 0;
     long long states_scanned = 0;
@@ -96,6 +118,17 @@ struct Stats {
     long long bound_calls = 0;
     long long periodicity_hits = 0;
     long long bb_nodes = 0;
+    long long bb_branch_evaluations = 0;
+    long long bb_incumbent_improvements = 0;
+    long long bb_last_incumbent_improvement_node = 0;
+    Profit bb_initial_incumbent = 0;
+    Profit bb_final_incumbent = 0;
+    long long bb_fractional_bound_calls = 0;
+    long long bb_fractional_bound_prunes = 0;
+    long long bb_u3_calls = 0;
+    long long bb_u3_prunes = 0;
+    long long bb_strong_bound_calls = 0;
+    long long bb_strong_bound_prunes = 0;
     long long core_node_limit = 0;
     long long items_removed_simple = 0;
     long long items_removed_multiple = 0;
@@ -165,6 +198,8 @@ struct Stats {
     long long duplicate_removal_requests = 0;
     // Full-mode wall-clock phase timings. They remain zero in None/Basic.
     long long phase_preprocessing_ns = 0;
+    long long phase_common_preprocessing_ns = 0;
+    long long phase_feature_extraction_ns = 0;
     long long phase_global_bounds_ns = 0;
     long long phase_context_maintenance_ns = 0;
     long long phase_core_bb_ns = 0;
@@ -181,6 +216,8 @@ struct Stats {
     Weight dp_capacity_processed = 0;
     long long active_items_at_periodicity = 0;
     std::string stop_reason = "uninitialized";
+    std::string selected_kernel = "none";
+    std::string dispatch_reason = "not_applicable";
     // Test/debug telemetry.  These identify the immutable post-global-
     // reduction DP list and the local B&B core selected from it.
     std::vector<int> dp_item_ids;

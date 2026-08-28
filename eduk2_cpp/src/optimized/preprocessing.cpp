@@ -4,17 +4,27 @@
 
 namespace ukp::optimized::detail {
 
-PreprocessResult preprocess_items(const Instance& instance, bool use_simple_dominance) {
+std::vector<Item> common_preprocess_items(const Instance& instance) {
+    std::vector<Item> items;
+    items.reserve(instance.items.size());
+    for (const Item& item : instance.items) {
+        if (item.w > 0 && item.p > 0 && item.w <= instance.capacity) items.push_back(item);
+    }
+    return items;
+}
+
+PreprocessResult preprocess_items_for_eduk2(
+    const std::vector<Item>& common_items, bool use_simple_dominance) {
     PreprocessResult result;
     // Stage 1's reference item belongs to the working instance, not to an
     // intermediate reduction.  In particular, simple dominance is optional
     // and must never change the item used for multiple dominance.
     const Item best = *std::max_element(
-        instance.items.begin(), instance.items.end(),
+        common_items.begin(), common_items.end(),
         [](const Item& a, const Item& b) { return better_ratio(b, a); });
     result.best_item = best;
     std::vector<Item>& items = result.items;
-    items = instance.items;
+    items = common_items;
     if (use_simple_dominance) {
         const auto before_simple = items.size();
         items = remove_simple_dominated(std::move(items));
