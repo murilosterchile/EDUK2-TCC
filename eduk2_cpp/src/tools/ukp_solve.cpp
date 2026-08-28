@@ -1,6 +1,7 @@
 #include "ukp/faithful_solver.hpp"
 #include "ukp/io.hpp"
 #include "ukp/optimized_solver.hpp"
+#include "ukp/terminating_step_off.hpp"
 #include "ukp/verify.hpp"
 
 #include <array>
@@ -23,6 +24,8 @@ void print_basic_stats(const Instance& inst, const SolverResult& res,
     }
 
     std::cout << "items_original " << res.stats.original_items << '\n';
+    std::cout << "kernel " << res.stats.selected_kernel << '\n';
+    std::cout << "dispatch_reason " << res.stats.dispatch_reason << '\n';
     std::cout << "items_after_preprocess " << res.stats.after_preprocess_items << '\n';
     std::cout << "states_scanned " << res.stats.states_scanned << '\n';
     std::cout << "states_expanded " << res.stats.states_expanded << '\n';
@@ -317,6 +320,7 @@ int main(int argc, char** argv) {
                " [--no-cheap-incumbent] [--cheap-incumbent-top-k=N]"
                " [--bb-strong-only|--bb-fractional] [--bb-u3]"
                " [--bb-work-budget=N]"
+               " [--kernel eduk2|tso]"
                " [--verbose]\n";
         return 2;
     }
@@ -325,10 +329,19 @@ int main(int argc, char** argv) {
     const Instance inst = read_instance_file(argv[2]);
     SolverOptions options;
     bool verbose = false;
+    std::string kernel = "eduk2";
 
     for (int i = 3; i < argc; ++i) {
         const std::string arg = argv[i];
-        if (arg == "--paper-faithful") options.paper_faithful_mode = true;
+        if (arg == "--kernel") {
+            if (++i >= argc) {
+                std::cerr << "--kernel requires eduk2 or tso\n";
+                return 2;
+            }
+            kernel = argv[i];
+        } else if (arg.rfind("--kernel=", 0) == 0) {
+            kernel = arg.substr(9);
+        } else if (arg == "--paper-faithful") options.paper_faithful_mode = true;
         else if (arg == "--no-paper-faithful") options.paper_faithful_mode = false;
         else if (arg == "--simple-dominance") options.use_simple_dominance = true;
         else if (arg == "--core-remainder-ordering") {
@@ -384,6 +397,36 @@ int main(int argc, char** argv) {
     }
 
     const auto start = std::chrono::steady_clock::now();
+    if (solver == "optimized" && kernel == "tso") {
+        const optimized::TsoResult tso = optimized::TerminatingStepOff().solve(inst);
+        const auto finish = std::chrono::steady_clock::now();
+        std::cout << "kernel tso\nstatus " << tso.status_message << '\n';
+        if (tso.status == optimized::TsoStatus::KernelNotApplicable) return 3;
+        write_solution(std::cout, tso.solution);
+        std::cout << "verified " << (verify_solution(inst, tso.solution) ? 1 : 0) << '\n';
+        std::cout << "time_us "
+                  << std::chrono::duration_cast<std::chrono::microseconds>(finish - start).count()
+                  << '\n';
+        std::cout << "items_original " << tso.telemetry.original_items << '\n'
+                  << "items_after_common_preprocess "
+                  << tso.telemetry.after_common_preprocessing_items << '\n'
+                  << "best_item_weight " << tso.telemetry.best_item_weight << '\n'
+                  << "capacity_over_best_weight "
+                  << (tso.telemetry.best_item_weight == 0 ? 0 :
+                      inst.capacity / tso.telemetry.best_item_weight) << '\n'
+                  << "weight_gcd " << tso.telemetry.weight_gcd << '\n'
+                  << "states_scanned " << tso.telemetry.states_scanned << '\n'
+                  << "transitions_considered "
+                  << tso.telemetry.transitions_considered << '\n'
+                  << "termination_level " << tso.telemetry.termination_level << '\n'
+                  << "terminated_early " << (tso.telemetry.terminated_early ? 1 : 0) << '\n'
+                  << "state_bytes_approx " << tso.telemetry.estimated_dp_bytes << '\n';
+        return 0;
+    }
+    if (kernel != "eduk2") {
+        std::cerr << "unknown kernel: " << kernel << '\n';
+        return 2;
+    }
     SolverResult result;
     if (solver == "faithful") {
         result = faithful::Solver(options).solve(inst);

@@ -60,6 +60,7 @@ target_link_libraries(ukp_faithful_none PUBLIC ukp_common)
 
 set(UKP_OPTIMIZED_SOURCES
   src/optimized/optimized_solver.cpp
+  src/optimized/terminating_step_off.cpp
   src/optimized/instance_features.cpp
   src/optimized/critical_sequence.cpp
   src/optimized/incumbent.cpp
@@ -95,6 +96,9 @@ add_ukp_solve_variant(ukp_solve_benchmark ukp_faithful_none ukp_optimized_none)
 add_executable(ukp_bench src/tools/ukp_bench.cpp)
 target_link_libraries(ukp_bench PRIVATE ukp_faithful ukp_optimized ukp_common)
 
+add_executable(ukp_kernel_bench src/tools/ukp_kernel_bench.cpp)
+target_link_libraries(ukp_kernel_bench PRIVATE ukp_optimized ukp_common)
+
 add_executable(ukp_tests tests/test_main.cpp)
 target_link_libraries(ukp_tests PRIVATE ukp_faithful ukp_common)
 target_compile_definitions(
@@ -107,3 +111,9 @@ target_link_libraries(
 target_compile_definitions(
   ukp_optimized_regression PRIVATE UKP_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
 add_test(NAME optimized_regression COMMAND ukp_optimized_regression)
+
+add_executable(ukp_tso_tests tests/test_tso.cpp)
+target_link_libraries(ukp_tso_tests PRIVATE ukp_faithful ukp_optimized ukp_common)
+target_compile_definitions(
+  ukp_tso_tests PRIVATE UKP_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+add_test(NAME tso_correctness COMMAND ukp_tso_tests)
