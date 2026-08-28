@@ -1,1152 +1,642 @@
 #include "ukp/optimized_solver.hpp"
-#include "ukp/bounds.hpp"
 #include "ukp/dominance.hpp"
-#include "core_branch_and_bound.hpp"
-
+#include "eduk2_bounds.hpp"
+#include "critical_sequence.hpp"
+#include "preprocessing.hpp"
+#include "incumbent.hpp"
 #include <algorithm>
-#include <limits>
-#include <numeric>
-#include <vector>
-#include <deque>
-#include <unordered_map>
-#include <unordered_set>
+#include <array>
+#include <cassert>
+#include <chrono>
 #include <map>
-#include <cstdint>
-#include <queue>
-#include <cstdlib>
-#include <iostream>
-#include <functional>
+#include <numeric>
+#include <type_traits>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
 namespace ukp::optimized {
 namespace {
 
-#if 0  // Moved to core_branch_and_bound.cpp; retained temporarily for reference.
+constexpr bool kBasicStats = stats_enabled_v<StatsMode::Basic>;
+constexpr bool kFullStats = stats_enabled_v<StatsMode::Full>;
 
-struct CoreBBResult {
-    Profit profit = 0;
-    Weight weight = 0;
-    std::vector<long long> multiplicity_by_id;
-    long long nodes = 0;
-    bool hit_limit = false;
-    bool closed_gap = false;
+struct EmptySliceStats {
+    Weight begin = 0;
+    Weight end = 0;
+    long long states_entered = 0;
+    long long states_expanded = 0;
+    long long successor_attempts = 0;
+    long long successor_item_scans = 0;
+    long long backfill_attempts = 0;
+    long long cursor_advances = 0;
+    long long historical_states_avoided = 0;
+    long long states_created = 0;
+    long long states_kept = 0;
+    long long states_fathomed_by_bound = 0;
+    long long items_removed_threshold = 0;
+    long long active_items_before = 0;
+    long long active_items_after = 0;
+    long long items_considered_for_introduction = 0;
+    long long items_introduced = 0;
+    long long items_rejected_by_envelope = 0;
+    long long items_rejected_by_bound = 0;
 };
+using LocalSliceStats = std::conditional_t<kFullStats, SliceStats, EmptySliceStats>;
 
-struct CoreBBState {
-    const std::vector<Item>* core = nullptr;
-    Weight capacity = 0;
-    long long node_limit = 0;
-    long long nodes = 0;
-    Profit best_profit = 0;
-    Weight best_weight = 0;
-    Profit target_upper = std::numeric_limits<Profit>::max();
-    std::vector<long long> current;
-    std::vector<long long> best;
-    bool hit_limit = false;
-    bool closed_gap = false;
-};
 
-Profit fractional_tail_bound(const std::vector<Item>& core, std::size_t k, Weight remaining) {
-    if (remaining <= 0 || k >= core.size()) return 0;
-    const Item& it = core[k];
-    return floor_mul_div(remaining, it.p, it.w);
+template <bool Enabled, typename Slice>
+void publish_slice_stats(std::vector<SliceStats>& destination, Slice&& slice) {
+    if constexpr (Enabled) {
+        destination.push_back(std::forward<Slice>(slice));
+    } else {
+        (void)destination;
+        (void)slice;
+    }
 }
 
-void core_bb_dfs(CoreBBState& st, std::size_t k, Weight used_w, Profit used_p) {
-    if (st.closed_gap) return;
-    if (st.nodes >= st.node_limit) {
-        st.hit_limit = true;
-        return;
-    }
-    ++st.nodes;
+template <bool Enabled>
+class PhaseTimer;
 
-    if (used_p > st.best_profit || (used_p == st.best_profit && used_w > st.best_weight)) {
-        st.best_profit = used_p;
-        st.best_weight = used_w;
-        st.best = st.current;
-        if (st.best_profit >= st.target_upper) {
-            st.closed_gap = true;
-            return;
+template <>
+class PhaseTimer<true> {
+public:
+    explicit PhaseTimer(long long& accumulator) noexcept
+        : accumulator_(accumulator), start_(Clock::now()) {}
+
+    PhaseTimer(const PhaseTimer&) = delete;
+    PhaseTimer& operator=(const PhaseTimer&) = delete;
+
+    ~PhaseTimer() { stop(); }
+
+    void stop() noexcept {
+        if (!running_) return;
+        accumulator_ += std::chrono::duration_cast<std::chrono::nanoseconds>(
+            Clock::now() - start_).count();
+        running_ = false;
+    }
+
+private:
+    using Clock = std::chrono::steady_clock;
+    long long& accumulator_;
+    Clock::time_point start_;
+    bool running_ = true;
+};
+
+template <>
+class PhaseTimer<false> {
+public:
+    explicit PhaseTimer(long long&) noexcept {}
+    void stop() noexcept {}
+};
+
+#define UKP_BASIC_STATS(...) \
+    do { if constexpr (kBasicStats) { __VA_ARGS__; } } while (false)
+#define UKP_FULL_STATS(...) \
+    do { if constexpr (kFullStats) { __VA_ARGS__; } } while (false)
+
+// Accumulates all residual-set changes requested during one DP slice.  The
+// request tables deduplicate IDs without sorting, so dp_items remains the
+// single source of the stable better_ratio order used to rebuild the context.
+struct ResidualDelta {
+    explicit ResidualDelta(std::size_t item_count)
+        : removal_requested_by_id(item_count, 0),
+          active_removal_requested_by_id(item_count, 0) {}
+
+    void begin_slice() {
+        for (const int item_id : removed_ids) {
+            removal_requested_by_id[static_cast<std::size_t>(item_id)] = 0;
         }
+        for (const detail::ActiveItem& item : active_items_to_remove) {
+            active_removal_requested_by_id[static_cast<std::size_t>(item.id)] = 0;
+        }
+        removed_ids.clear();
+        active_items_to_remove.clear();
+        incumbent_changed = false;
+        had_item_decisions = false;
+        duplicate_requests = 0;
     }
 
-    if (k >= st.core->size()) return;
+    bool request_removal(int item_id) {
+        if (item_id < 0 ||
+            static_cast<std::size_t>(item_id) >= removal_requested_by_id.size()) {
+            throw std::logic_error("residual removal item id is out of range");
+        }
+        unsigned char& requested =
+            removal_requested_by_id[static_cast<std::size_t>(item_id)];
+        if (requested != 0) {
+            ++duplicate_requests;
+            return false;
+        }
+        requested = 1;
+        removed_ids.push_back(item_id);
+        return true;
+    }
 
-    const auto& core = *st.core;
+    void request_threshold_removal(const detail::ActiveItem& item) {
+        request_removal(item.id);
+        unsigned char& active_requested = active_removal_requested_by_id[
+            static_cast<std::size_t>(item.id)];
+        if (active_requested == 0) {
+            active_requested = 1;
+            active_items_to_remove.push_back(item);
+        } else {
+            ++duplicate_requests;
+        }
+
+    }
+
+    [[nodiscard]] bool contains(int item_id) const {
+        if (item_id < 0 ||
+            static_cast<std::size_t>(item_id) >= removal_requested_by_id.size()) {
+            throw std::logic_error("residual query item id is out of range");
+        }
+        return removal_requested_by_id[static_cast<std::size_t>(item_id)] != 0;
+    }
+
+    [[nodiscard]] bool has_removals() const noexcept {
+        return !removed_ids.empty();
+    }
+
+    [[nodiscard]] bool requested() const noexcept {
+        return had_item_decisions || has_removals() ||
+               !active_items_to_remove.empty();
+    }
+
+    std::vector<int> removed_ids;
+    std::vector<detail::ActiveItem> active_items_to_remove;
+    std::vector<unsigned char> removal_requested_by_id;
+    std::vector<unsigned char> active_removal_requested_by_id;
+    bool incumbent_changed = false;
+    bool had_item_decisions = false;
+    long long duplicate_requests = 0;
+};
+
+struct Cell {
+    Profit profit = 0;
+    int last_item = -1;
+    Weight prev_capacity = 0;
+};
+
+constexpr std::size_t bound_type_index(BoundType type) {
+    switch (type) {
+        case BoundType::U3: return 0;
+        case BoundType::V: return 1;
+        case BoundType::TauStar: return 2;
+        case BoundType::BestItemStar: return 3;
+        case BoundType::Both: return 4;
+    }
+    return 4;
+}
+
+constexpr std::array<BoundType, 5> kBoundTypes{
+    BoundType::U3, BoundType::V, BoundType::TauStar,
+    BoundType::BestItemStar, BoundType::Both};
+
+const char* pyasukp_policy_name(BoundPolicy policy) {
+    switch (policy) {
+        case BoundPolicy::U3: return "MT";
+        case BoundPolicy::V: return "V";
+        case BoundPolicy::PyasukpBoth: return "Both";
+        default: return "none";
+    }
+}
+
+Profit run_core_bb_rec(const std::vector<Item>& core, Weight c, size_t k,
+                       Profit cur_profit, Weight cur_weight,
+                       Profit incumbent, long long& nodes, long long limit) {
+    if (nodes >= limit || k >= core.size()) return std::max(incumbent, cur_profit);
+    ++nodes;
     const Item& it = core[k];
-    const Weight remaining = st.capacity - used_w;
-    if (remaining <= 0) return;
-
-    const long long max_x = remaining / it.w;
-
-    // Explore high multiplicities first.  For favorable UKP instances this often
-    // closes the upper bound in only a few nodes; for unfavorable instances the
-    // adaptive node budget below prevents this search from dominating runtime.
+    long long max_x = (c - cur_weight) / it.w;
     for (long long x = max_x; x >= 0; --x) {
-        if (st.closed_gap) return;
-        if (st.nodes >= st.node_limit) {
-            st.hit_limit = true;
-            return;
-        }
-
-        const Weight nw = used_w + x * it.w;
-        const Profit np = safe_add(used_p, safe_mul(x, it.p));
-        const Weight rem = st.capacity - nw;
-
-        Profit optimistic = np;
+        Profit np = cur_profit + safe_mul(x, it.p);
+        Weight nw = cur_weight + x * it.w;
+        incumbent = std::max(incumbent, np);
         if (k + 1 < core.size()) {
-            optimistic = safe_add(optimistic, fractional_tail_bound(core, k + 1, rem));
-        }
-        if (optimistic < st.best_profit) {
-            if (x == 0) break;
-            continue;
-        }
-
-        st.current[k] = x;
-        if (np > st.best_profit || (np == st.best_profit && nw > st.best_weight)) {
-            st.best_profit = np;
-            st.best_weight = nw;
-            st.best = st.current;
-            if (st.best_profit >= st.target_upper) {
-                st.closed_gap = true;
-                st.current[k] = 0;
-                return;
+            Profit ub = np + floor_mul_div(c - nw, core[k + 1].p, core[k + 1].w);
+            if (ub > incumbent) {
+                incumbent = run_core_bb_rec(core, c, k + 1, np, nw, incumbent, nodes, limit);
             }
         }
-        if (k + 1 < core.size()) {
-            core_bb_dfs(st, k + 1, nw, np);
-        }
-        st.current[k] = 0;
-
         if (x == 0) break;
     }
+    return incumbent;
 }
 
-CoreBBResult run_core_bb(std::vector<Item> items,
-                         Weight capacity,
-                         long long node_limit,
-                         int requested_core_size,
-                         Profit incumbent,
-                         Profit global_upper,
-                         std::size_t original_item_count) {
-    CoreBBResult out;
-    out.multiplicity_by_id.assign(original_item_count, 0);
-    if (items.empty() || node_limit <= 0) return out;
-
+[[maybe_unused]] Profit run_core_bb(std::vector<Item> items, Weight c, int requested_core,
+                                    long long node_limit, long long& nodes) {
     std::sort(items.begin(), items.end(), better_ratio);
-
-    int core_size = requested_core_size > 0
-        ? requested_core_size
-        : std::min<int>(static_cast<int>(items.size()), 48);
+    const int default_core_size = std::min<int>(static_cast<int>(items.size()),
+                                                std::max(100, static_cast<int>(items.size() / 100)));
+    int core_size = requested_core > 0 ? requested_core : default_core_size;
     core_size = std::max(1, std::min<int>(core_size, static_cast<int>(items.size())));
-    items.resize(static_cast<std::size_t>(core_size));
-
-    CoreBBState st;
-    st.core = &items;
-    st.capacity = capacity;
-    st.node_limit = node_limit;
-    st.best_profit = incumbent;
-    st.target_upper = global_upper;
-    st.current.assign(items.size(), 0);
-    st.best.assign(items.size(), 0);
-
-    // Greedy incumbent from the best ratio item, if it improves the provided one.
-    const Item& best = items.front();
-    const long long xb = capacity / best.w;
-    const Profit greedy_profit = safe_mul(xb, best.p);
-    if (greedy_profit > st.best_profit) {
-        st.best_profit = greedy_profit;
-        st.best_weight = xb * best.w;
-        st.best[0] = xb;
-    }
-    if (st.best_profit >= st.target_upper) {
-        st.closed_gap = true;
-    } else {
-        core_bb_dfs(st, 0, 0, 0);
-    }
-
-    out.profit = st.best_profit;
-    out.weight = st.best_weight;
-    out.nodes = st.nodes;
-    out.hit_limit = st.hit_limit;
-    out.closed_gap = st.closed_gap || st.best_profit >= global_upper;
-    for (std::size_t i = 0; i < items.size(); ++i) {
-        if (items[i].id >= 0 && static_cast<std::size_t>(items[i].id) < out.multiplicity_by_id.size()) {
-            out.multiplicity_by_id[static_cast<std::size_t>(items[i].id)] += st.best[i];
-        }
-    }
-    return out;
+    items.resize(static_cast<size_t>(core_size));
+    nodes = 0;
+    return run_core_bb_rec(items, c, 0, 0, 0, 0, nodes, node_limit);
 }
 
-struct AdaptiveBBController {
-    long long probe_nodes = 0;
-    long long max_nodes = 0;
-    bool enabled = true;
-
-    explicit AdaptiveBBController(long long configured_limit) {
-        max_nodes = std::max<long long>(0, configured_limit);
-        // The probe is intentionally small.  It is large enough to catch easy
-        // core-dominated instances, but small enough not to penalize adverse ones.
-        probe_nodes = std::min<long long>(max_nodes, 128);
-    }
-
-    bool should_escalate(const CoreBBResult& probe,
-                         Profit old_incumbent,
-                         Profit global_upper,
-                         long long items_after_preprocess) const {
-        if (!enabled || max_nodes <= probe_nodes) return false;
-        if (probe.closed_gap) return false;
-
-        const bool improved = probe.profit > old_incumbent;
-        const Profit gap = std::max<Profit>(0, global_upper - probe.profit);
-        const long double relative_gap = global_upper > 0
-            ? static_cast<long double>(gap) / static_cast<long double>(global_upper)
-            : 1.0L;
-
-        // Escalate only if the B&B gave evidence that it is promising: either it
-        // improves the incumbent and leaves a very small gap, or preprocessing has
-        // already reduced the instance to a small effective core.
-        if (improved && relative_gap <= 0.0005L) return true;
-        if (items_after_preprocess <= 256 && relative_gap <= 0.002L) return true;
-        return false;
-    }
+struct CoreSearchResult {
+    Profit profit = 0;
+    std::vector<long long> multiplicity;
+    long long nodes = 0;
+    bool closed = false;
+    long long multiple_removed = 0;
+    long long modular_removed = 0;
 };
 
-#endif
+struct EffectiveOptions {
+    bool simple_dominance = false;
+    bool core_remainder_ordering = false;
+    bool modular_dominance = false;
+    bool core_multiple_dominance = false;
+};
 
-using detail::AdaptiveBBController;
-using detail::CoreBBResult;
-using detail::run_core_branch_and_bound;
+EffectiveOptions effective_options(const SolverOptions& options) {
+    if (options.paper_faithful_mode) return {};
+    return {options.use_simple_dominance, options.use_core_remainder_ordering,
+            options.use_modular_dominance, options.use_core_multiple_dominance};
+}
 
-struct BoundSampler {
-    const BoundContext& ctx;
-    Weight capacity = 0;
-    Profit incumbent = 0;
-    long long calls = 0;
-    long long fathomed = 0;
-    long long checks = 0;
-    long long states_seen = 0;
-    bool active = true;
-    long long interval = 32768;
-    long long window_calls = 0;
-    long long window_fathomed = 0;
-    long long max_calls = 8192;
-
-    BoundSampler(const BoundContext& c, Weight cap, Profit inc, long long initial_interval, long long call_budget)
-        : ctx(c), capacity(cap), incumbent(inc),
-          interval(std::max<long long>(1, initial_interval)),
-          max_calls(std::max<long long>(0, call_budget)) {}
-
-    bool should_check() const {
-        return active && calls < max_calls && interval > 0 && (states_seen % interval == 0);
-    }
-
-    void observe(Weight y, Profit prefix_profit) {
-        ++states_seen;
-        if (!should_check()) return;
-
-        BoundValue b = compute_bound(ctx, capacity - y);
-        ++calls;
-        ++checks;
-        ++window_calls;
-        if (safe_add(prefix_profit, b.upper) <= incumbent) {
-            ++fathomed;
-            ++window_fathomed;
-        }
-
-        // Bound sampling policy.  It reacts to the useful cuts per sampled bound,
-        // and intentionally becomes conservative quickly.  Correctness is not at
-        // risk because the dense DP remains exact even if sampling is disabled.
-        if (calls >= max_calls) {
-            active = false;
+void core_search(const std::vector<Item>& core, const BoundContext& bounds, BoundPolicy policy,
+                 Weight capacity, Profit global_upper, long long node_limit,
+                 std::size_t k, Weight used_weight, Profit used_profit,
+                 std::vector<long long>& current, CoreSearchResult& result) {
+    if (result.closed || result.nodes >= node_limit) return;
+    ++result.nodes;
+    if (used_profit > result.profit) {
+        result.profit = used_profit;
+        result.multiplicity = current;
+        if (result.profit >= global_upper) {
+            result.closed = true;
             return;
         }
-
-        if (window_calls >= 128) {
-            const long double cut_ratio = static_cast<long double>(window_fathomed) /
-                                          static_cast<long double>(window_calls);
-            if (cut_ratio < 0.01L) {
-                active = false;
-            } else if (cut_ratio < 0.10L) {
-                interval *= 8;
-            } else if (cut_ratio < 0.35L) {
-                interval *= 2;
-            }
-            // Do not make the interval denser in the DP fallback.  A favorable
-            // instance should normally have been solved by core B&B already;
-            // after that point bounds are just a sampled guardrail.
-            window_calls = 0;
-            window_fathomed = 0;
+    }
+    if (k == core.size()) return;
+    const Item& item = core[k];
+    const Weight remaining = capacity - used_weight;
+    for (long long count = remaining / item.w; count >= 0; --count) {
+        const Weight next_weight = used_weight + safe_mul(count, item.w);
+        const Profit next_profit = safe_add(used_profit, safe_mul(count, item.p));
+        const Profit upper = safe_add(next_profit,
+            compute_bound(bounds, capacity - next_weight, policy).upper);
+        if (upper > result.profit) {
+            current[static_cast<std::size_t>(item.id)] = count;
+            core_search(core, bounds, policy, capacity, global_upper, node_limit, k + 1,
+                        next_weight, next_profit, current, result);
+            current[static_cast<std::size_t>(item.id)] = 0;
         }
+        if (count == 0 || result.closed || result.nodes >= node_limit) break;
     }
-};
-
-
-
-struct ExactReducedCoreResult {
-    bool solved = false;
-    Solution solution;
-    long long states_scanned = 0;
-};
-
-// Exact full-capacity solver for structurally reduced cores.
-//
-// This is not selected by a fixed item-count rule.  The caller uses a dynamic
-// work estimate.  When the reduced core makes full DP cheaper than the
-// speculative sequence/half-split machinery, this path mimics PYAsUKP's short
-// exit behavior: solve the small remaining core directly and return.
-ExactReducedCoreResult solve_reduced_core_exact(const Instance& inst,
-                                                std::vector<Item> items,
-                                                long long transition_budget) {
-    ExactReducedCoreResult out;
-    if (items.empty() || inst.capacity < 0) return out;
-
-    std::sort(items.begin(), items.end(),
-        [](const Item& a, const Item& b) {
-            if (a.w != b.w) return a.w < b.w;
-            return better_ratio(a, b);
-        });
-
-    const size_t cap = static_cast<size_t>(inst.capacity);
-    std::vector<Profit> dp(cap + 1, 0);
-    std::vector<int> last(cap + 1, -1);
-    std::vector<Weight> prev(cap + 1, 0);
-
-    std::vector<Weight> w;
-    std::vector<Profit> p;
-    std::vector<int> id;
-    w.reserve(items.size());
-    p.reserve(items.size());
-    id.reserve(items.size());
-    for (const Item& it : items) {
-        if (it.w <= 0 || it.w > inst.capacity) continue;
-        w.push_back(it.w);
-        p.push_back(it.p);
-        id.push_back(it.id);
-    }
-
-    std::size_t usable = 0;
-    for (Weight y = 1; y <= inst.capacity; ++y) {
-        while (usable < w.size() && w[usable] <= y) ++usable;
-
-        Profit best_profit = dp[static_cast<size_t>(y)];
-        int best_last = last[static_cast<size_t>(y)];
-        Weight best_prev = prev[static_cast<size_t>(y)];
-
-        for (std::size_t i = 0; i < usable; ++i) {
-            ++out.states_scanned;
-            if (out.states_scanned > transition_budget) return out;
-
-            const Weight wi = w[i];
-            const Profit cand = safe_add(dp[static_cast<size_t>(y - wi)], p[i]);
-            if (cand > best_profit) {
-                best_profit = cand;
-                best_last = id[i];
-                best_prev = y - wi;
-            }
-        }
-
-        dp[static_cast<size_t>(y)] = best_profit;
-        last[static_cast<size_t>(y)] = best_last;
-        prev[static_cast<size_t>(y)] = best_prev;
-    }
-
-    Weight best_w = 0;
-    Profit best_p = 0;
-    for (Weight y = 0; y <= inst.capacity; ++y) {
-        if (dp[static_cast<size_t>(y)] > best_p ||
-            (dp[static_cast<size_t>(y)] == best_p && y > best_w)) {
-            best_p = dp[static_cast<size_t>(y)];
-            best_w = y;
-        }
-    }
-
-    Solution sol;
-    sol.profit = best_p;
-    sol.weight = 0;
-    sol.optimal = true;
-    sol.solver_name = "optimized";
-    sol.multiplicity_by_id.assign(inst.items.size(), 0);
-
-    Weight y = best_w;
-    while (y > 0) {
-        const int item_id = last[static_cast<size_t>(y)];
-        if (item_id < 0) break;
-
-        const auto it = std::find_if(inst.items.begin(), inst.items.end(),
-            [&](const Item& x) { return x.id == item_id; });
-        if (it == inst.items.end()) throw std::runtime_error("reduced-core backtracking failed");
-
-        sol.multiplicity_by_id[static_cast<std::size_t>(item_id)]++;
-        sol.weight += it->w;
-        y = prev[static_cast<size_t>(y)];
-    }
-
-    out.solved = true;
-    out.solution = std::move(sol);
-    return out;
 }
 
-// Safe collective dominance using only previously kept, better/equal-ratio items.
-//
-// This is a conservative C++ analogue of PYAsUKP's collective dominance stage:
-// item j is removed only when an explicit unbounded DP certificate from earlier
-// kept items achieves profit >= p_j within weight <= w_j.
-std::vector<Item> remove_collectively_dominated_safe(std::vector<Item> items, Weight capacity) {
-    if (items.size() <= 1 || capacity <= 0) return items;
-
+[[maybe_unused]] CoreSearchResult run_pyasukp_core_bb(std::vector<Item> items, const BoundContext& bounds,
+                                                       Weight capacity, Profit global_upper,
+                                                       int requested_core, long long node_limit,
+                                                       std::size_t original_count) {
     std::sort(items.begin(), items.end(), better_ratio);
-
-    Weight max_w = 0;
-    for (const Item& it : items) {
-        if (it.w > 0 && it.w <= capacity) max_w = std::max(max_w, it.w);
-    }
-    if (max_w <= 0) return items;
-
-    std::vector<Profit> best(static_cast<size_t>(max_w) + 1, 0);
-    std::vector<Item> kept;
-    kept.reserve(items.size());
-
-    for (const Item& it : items) {
-        if (it.w <= 0 || it.w > capacity) continue;
-
-        if (best[static_cast<size_t>(it.w)] >= it.p) {
-            continue;
-        }
-
-        kept.push_back(it);
-        for (Weight y = it.w; y <= max_w; ++y) {
-            const Profit cand = safe_add(best[static_cast<size_t>(y - it.w)], it.p);
-            if (cand > best[static_cast<size_t>(y)]) {
-                best[static_cast<size_t>(y)] = cand;
-            }
-        }
-    }
-
-    return kept.empty() ? items : kept;
+    const int default_size = std::min<int>(items.size(), std::max(500, static_cast<int>(items.size() / 100)));
+    items.resize(static_cast<std::size_t>(std::max(1, std::min(requested_core > 0 ? requested_core : default_size,
+                                                                static_cast<int>(items.size())))));
+    CoreSearchResult result;
+    result.multiplicity.assign(original_count, 0);
+    std::vector<long long> current(original_count, 0);
+    core_search(items, bounds, BoundPolicy::BestCertified, capacity, global_upper, std::max<long long>(0, node_limit),
+                0, 0, 0, current, result);
+    return result;
 }
 
-// Immediate exact stop for the case where the dynamic reductions leave one item.
-// This is the C++ counterpart of PYAsUKP reporting "Remaining undominated items: 1"
-// and finishing without running the full sequence machinery.
-bool try_single_remaining_item_stop(const Instance& inst,
-                                    const std::vector<Item>& items,
-                                    Solution& sol) {
-    if (items.size() != 1) return false;
+// Structural C++ counterpart of bandbukp2.ml: greedy_fill establishes the
+// incumbent, complete explores a completion, and traverse controls the node
+// budget.  The state table is the Dynefflist equivalent: for equal used weight
+// only the greatest profit can lead to a useful residual subproblem.
+struct CoreTraversal {
+    const std::vector<Item>& items;
+    const BoundContext& bounds;
+    BoundPolicy policy;
+    Weight capacity;
+    Profit global_upper;
+    long long limit;
+    CoreSearchResult result;
+    std::unordered_map<Weight, Profit> best_profit_at_weight;
+    std::vector<Weight> min_remaining_weight;
+    // PYAsUKP's default bandbukp2 path has bbnewv=false and therefore does
+    // not use the Dynefflist state table.  Keep the memoization available for
+    // experimental modes only; keying solely by used_weight is not a valid
+    // equivalence relation across different B&B levels.
+    bool use_state_memo = true;
+};
 
-    const Item& it = items.front();
-    if (it.w <= 0) return false;
-
-    const long long x = inst.capacity / it.w;
-    sol.profit = safe_mul(x, it.p);
-    sol.weight = safe_mul(x, it.w);
-    sol.optimal = true;
-    sol.solver_name = "optimized";
-    sol.multiplicity_by_id.assign(inst.items.size(), 0);
-    if (it.id >= 0 && static_cast<std::size_t>(it.id) < sol.multiplicity_by_id.size()) {
-        sol.multiplicity_by_id[static_cast<std::size_t>(it.id)] = x;
+std::vector<Weight> lightest_worse(const std::vector<Item>& items) {
+    std::vector<Weight> minweights(items.size(), 0);
+    if (items.size() < 2) return minweights;
+    minweights[items.size() - 2] = items[items.size() - 1].w;
+    for (std::size_t i = items.size() - 2; i > 0; --i) {
+        minweights[i - 1] = std::min(items[i].w, minweights[i]);
     }
+    return minweights;
+}
+
+bool remember_core_state(CoreTraversal& search, Weight used_weight, Profit used_profit) {
+    if (!search.use_state_memo) return true;
+    const auto known = search.best_profit_at_weight.find(used_weight);
+    if (known != search.best_profit_at_weight.end() && known->second >= used_profit) return false;
+    search.best_profit_at_weight[used_weight] = used_profit;
     return true;
 }
 
-
-struct ExactCoreClosureResult {
-    bool closed = false;
-    Solution solution;
-    long long nodes = 0;
-};
-
-// Exact OCaml-like bound stop for a reduced core.
-//
-// PYAsUKP often stops before forward DP when the bound/core machinery proves the
-// value.  This routine gives the C++ implementation the same opportunity: after
-// preprocessing and dominance reductions, try to solve the remaining core with a
-// depth-first bounded enumeration ordered by profit/weight.  It is exact when it
-// returns closed=true; otherwise it is ignored and the normal exact DP path runs.
-//
-// The decision to call this routine is made by work estimates in Solver::solve,
-// not by a fixed item-count threshold.
-ExactCoreClosureResult try_exact_core_bound_stop(const Instance& inst,
-                                                 std::vector<Item> core,
-                                                 Profit global_upper,
-                                                 Profit incumbent,
-                                                 const std::vector<long long>& incumbent_mult,
-                                                 long long node_budget) {
-    ExactCoreClosureResult out;
-    if (core.empty() || node_budget <= 0 || inst.capacity < 0) return out;
-
-    std::sort(core.begin(), core.end(), better_ratio);
-
-    Solution best_sol;
-    best_sol.profit = incumbent;
-    best_sol.weight = 0;
-    best_sol.optimal = true;
-    best_sol.solver_name = "optimized";
-    best_sol.multiplicity_by_id = incumbent_mult;
-    if (best_sol.multiplicity_by_id.size() != inst.items.size()) {
-        best_sol.multiplicity_by_id.assign(inst.items.size(), 0);
+void record_core_solution(CoreTraversal& search, Profit profit,
+                          const std::vector<long long>& multiplicity) {
+    if (profit > search.result.profit) {
+        search.result.profit = profit;
+        search.result.multiplicity = multiplicity;
     }
-    for (const Item& it : inst.items) {
-        if (it.id >= 0 && static_cast<std::size_t>(it.id) < best_sol.multiplicity_by_id.size()) {
-            best_sol.weight += safe_mul(best_sol.multiplicity_by_id[static_cast<std::size_t>(it.id)], it.w);
+    if (search.result.profit >= search.global_upper) search.result.closed = true;
+}
+
+void complete(CoreTraversal& search, std::size_t item_index, Weight used_weight,
+              Profit used_profit, std::vector<long long>& multiplicity) {
+    if (search.result.closed || search.result.nodes >= search.limit) return;
+    ++search.result.nodes;
+    if (!remember_core_state(search, used_weight, used_profit)) return;
+    record_core_solution(search, used_profit, multiplicity);
+    if (item_index + 1 >= search.items.size()) return;
+
+    const Weight remaining = search.capacity - used_weight;
+    if (item_index < search.min_remaining_weight.size() &&
+        remaining < search.min_remaining_weight[item_index]) {
+        return;
+    }
+
+    const Item& item = search.items[item_index];
+    for (long long count = remaining / item.w; count >= 0; --count) {
+        const Weight next_weight = used_weight + safe_mul(count, item.w);
+        const Profit next_profit = safe_add(used_profit, safe_mul(count, item.p));
+        const Profit residual_upper = compute_bound(search.bounds, search.capacity - next_weight, search.policy).upper;
+        if (safe_add(next_profit, residual_upper) > search.result.profit) {
+            multiplicity[static_cast<std::size_t>(item.id)] = count;
+            complete(search, item_index + 1, next_weight, next_profit, multiplicity);
+            multiplicity[static_cast<std::size_t>(item.id)] = 0;
+        }
+        if (count == 0 || search.result.closed || search.result.nodes >= search.limit) break;
+    }
+}
+
+void greedy_fill(CoreTraversal& search, std::vector<long long>& multiplicity) {
+    Weight used_weight = 0;
+    Profit profit = 0;
+    for (const Item& item : search.items) {
+        const long long count = (search.capacity - used_weight) / item.w;
+        if (count == 0) continue;
+        for (long long copy = 0; copy < count; ++copy) {
+            multiplicity[static_cast<std::size_t>(item.id)] += 1;
+            used_weight += item.w;
+            profit = safe_add(profit, item.p);
+            remember_core_state(search, used_weight, profit);
         }
     }
+    record_core_solution(search, profit, multiplicity);
+    std::fill(multiplicity.begin(), multiplicity.end(), 0);
+}
 
-    // Greedy incumbent.  Accept equal profit if it gives a concrete/non-empty
-    // certificate.  This avoids the invalid "profit with zero weight" failure.
-    if (!core.empty() && core.front().w > 0) {
-        const long long x = inst.capacity / core.front().w;
-        const Profit gp = safe_mul(x, core.front().p);
-        const Weight gw = safe_mul(x, core.front().w);
-        if (gp > best_sol.profit || (gp == best_sol.profit && gw > best_sol.weight)) {
-            best_sol.profit = gp;
-            best_sol.weight = gw;
-            best_sol.multiplicity_by_id.assign(inst.items.size(), 0);
-            if (core.front().id >= 0 &&
-                static_cast<std::size_t>(core.front().id) < best_sol.multiplicity_by_id.size()) {
-                best_sol.multiplicity_by_id[static_cast<std::size_t>(core.front().id)] = x;
-            }
+// `backtrack` is the MTU/PYAsUKP branch controller.  Multiplicity choices are
+// undone by complete after every child, so the same vector can be reused.
+void backtrack(CoreTraversal& search, std::vector<long long>& multiplicity) {
+    complete(search, 0, 0, 0, multiplicity);
+}
+
+CoreSearchResult traverse_core(const std::vector<Item>& dp_items, const BoundContext& bounds, BoundPolicy policy,
+                               Weight capacity, Profit global_upper, int requested_core,
+                               long long limit, std::size_t original_count,
+                               const EffectiveOptions& effective, bool paper_faithful_mode,
+                               BoundContextTelemetry* context_telemetry,
+                               std::vector<int>* selected_core_ids = nullptr) {
+    std::vector<Item> core_items;
+    if (paper_faithful_mode) {
+        // dp_items is already globally reduced and sorted by better_ratio.
+        // The faithful core is exactly its prefix: no local ordering or
+        // filtering is permitted on this path.
+        const std::size_t n = dp_items.size();
+        const std::size_t core_size = std::min(n, std::max<std::size_t>(500, n / 100));
+        core_items.assign(dp_items.begin(), dp_items.begin() + core_size);
+    } else {
+        core_items = dp_items;
+        const int default_size = std::min<int>(core_items.size(), std::max(100, static_cast<int>(core_items.size() / 100)));
+        const int core_size = std::max(1, std::min(requested_core > 0 ? requested_core : default_size,
+                                                    static_cast<int>(core_items.size())));
+        if (effective.core_remainder_ordering) {
+            std::sort(core_items.begin(), core_items.end(), [capacity](const Item& left, const Item& right) {
+                const Weight left_remainder = capacity % left.w;
+                const Weight right_remainder = capacity % right.w;
+                if (left_remainder != right_remainder) return left_remainder < right_remainder;
+                return better_ratio(left, right);
+            });
+        } else {
+            std::sort(core_items.begin(), core_items.end(), better_ratio);
         }
+        core_items.resize(static_cast<std::size_t>(core_size));
+    }
+    if (selected_core_ids != nullptr) {
+        selected_core_ids->clear();
+        selected_core_ids->reserve(core_items.size());
+        for (const Item& item : core_items) selected_core_ids->push_back(item.id);
     }
 
-    std::vector<long long> cur(inst.items.size(), 0);
-    std::vector<long long> best_mult = best_sol.multiplicity_by_id;
-    Profit best_profit = best_sol.profit;
-    Weight best_weight = best_sol.weight;
-    bool exhausted = true;
-
-    auto suffix_fractional_bound = [&](std::size_t k, Weight rem) -> Profit {
-        if (rem <= 0 || k >= core.size()) return 0;
-        const Item& it = core[k];
-        return floor_mul_div(rem, it.p, it.w);
-    };
-
-    std::function<void(std::size_t, Weight, Profit)> dfs =
-        [&](std::size_t k, Weight used_w, Profit used_p) {
-            if (out.nodes >= node_budget) {
-                exhausted = false;
-                return;
-            }
-            ++out.nodes;
-
-            if (used_p > best_profit || (used_p == best_profit && used_w > best_weight)) {
-                best_profit = used_p;
-                best_weight = used_w;
-                best_mult = cur;
-                if (best_profit >= global_upper) {
-                    return;
+    std::vector<Item> filtered = core_items;
+    long long core_multiple_removed = 0;
+    long long core_modular_removed = 0;
+    if (!paper_faithful_mode) {
+        filtered.clear();
+        // Core-local reductions are experimental and apply only to this copy.
+        for (const Item& candidate : core_items) {
+            bool dominated = false;
+            bool modular = false;
+            for (const Item& kept : filtered) {
+                if (effective.core_multiple_dominance) {
+                    const long long copies = candidate.w / kept.w;
+                    if (copies > 0 && safe_mul(copies, kept.p) >= candidate.p) { dominated = true; break; }
                 }
-            }
-
-            if (k >= core.size()) return;
-
-            const Weight rem = inst.capacity - used_w;
-            if (rem <= 0) return;
-
-            // Fractional upper bound from the current best remaining item.  If
-            // this cannot beat the incumbent, the whole subtree is closed.
-            const Profit optimistic = safe_add(used_p, suffix_fractional_bound(k, rem));
-            if (optimistic <= best_profit) return;
-
-            const Item& it = core[k];
-            if (it.w <= 0) return;
-
-            const long long max_x = rem / it.w;
-
-            // High multiplicities first, as in the existing core B&B and in the
-            // spirit of PYAsUKP's bound-first behavior.
-            for (long long x = max_x; x >= 0; --x) {
-                if (best_profit >= global_upper) return;
-                if (out.nodes >= node_budget) {
-                    exhausted = false;
-                    return;
-                }
-
-                const Weight nw = used_w + safe_mul(x, it.w);
-                const Profit np = safe_add(used_p, safe_mul(x, it.p));
-                const Weight nrem = inst.capacity - nw;
-
-                Profit child_bound = np;
-                if (k + 1 < core.size()) {
-                    child_bound = safe_add(child_bound, suffix_fractional_bound(k + 1, nrem));
-                }
-                if (child_bound <= best_profit) {
-                    if (x == 0) break;
-                    continue;
-                }
-
-                if (it.id >= 0 && static_cast<std::size_t>(it.id) < cur.size()) {
-                    cur[static_cast<std::size_t>(it.id)] = x;
-                }
-
-                if (np > best_profit || (np == best_profit && nw > best_weight)) {
-                    best_profit = np;
-                    best_weight = nw;
-                    best_mult = cur;
-                    if (best_profit >= global_upper) {
-                        if (it.id >= 0 && static_cast<std::size_t>(it.id) < cur.size()) {
-                            cur[static_cast<std::size_t>(it.id)] = 0;
-                        }
-                        return;
+                if (effective.modular_dominance && kept.w <= candidate.w && bounds.best.w != candidate.w) {
+                    const Weight candidate_remainder = candidate.w % bounds.best.w;
+                    const Weight kept_remainder = kept.w % bounds.best.w;
+                    const Profit kept_z = safe_add(safe_mul(kept.w, bounds.best.p),
+                                                    -safe_mul(bounds.best.w, kept.p));
+                    const Profit candidate_z = safe_add(safe_mul(candidate.w, bounds.best.p),
+                                                         -safe_mul(bounds.best.w, candidate.p));
+                    if (candidate_remainder == 0 ||
+                        (candidate_remainder == kept_remainder && kept_z <= candidate_z)) {
+                        dominated = true;
+                        modular = true;
+                        break;
                     }
                 }
-
-                if (k + 1 < core.size()) {
-                    dfs(k + 1, nw, np);
-                }
-
-                if (it.id >= 0 && static_cast<std::size_t>(it.id) < cur.size()) {
-                    cur[static_cast<std::size_t>(it.id)] = 0;
-                }
-
-                if (x == 0) break;
             }
-        };
-
-    dfs(0, 0, 0);
-
-    // Closed if either the theoretical upper bound was reached, or the complete
-    // bounded enumeration exhausted all remaining candidates within budget.
-    if (best_profit >= global_upper || exhausted) {
-        Solution sol;
-        sol.profit = best_profit;
-        sol.weight = 0;
-        sol.optimal = true;
-        sol.solver_name = "optimized";
-        sol.multiplicity_by_id = std::move(best_mult);
-        for (const Item& it : inst.items) {
-            if (it.id >= 0 && static_cast<std::size_t>(it.id) < sol.multiplicity_by_id.size()) {
-                sol.weight += safe_mul(sol.multiplicity_by_id[static_cast<std::size_t>(it.id)], it.w);
-            }
-        }
-        out.closed = true;
-        out.solution = std::move(sol);
-    }
-
-    return out;
-}
-
-struct SparseSequenceEntry {
-    Profit profit = 0;
-    Weight prev_weight = 0;
-    int last_item = -1;
-};
-
-struct SparseSequenceResult {
-    bool solved = false;
-    Solution solution;
-    long long states_scanned = 0;
-    long long critical_points = 0;
-};
-
-// Experimental sequence_result-style backend.  It stores only capacities that
-// are actually reached by generated transitions instead of allocating a full
-// table first.  The method is exact when it runs to completion.  If the number
-// of points or transitions grows beyond the configured budget, the caller falls
-// back to the dense exact DP below.
-//
-// This is not a line-by-line port of PYAsUKP's Seq/Slice modules yet, but it is
-// the first safe replacement of the dense table by an explicit sequence of
-// critical/reachable states in this C++ implementation.
-SparseSequenceResult try_sparse_sequence_dp(const Instance& inst,
-                                            const std::vector<Item>& items,
-                                            std::size_t max_points,
-                                            long long max_transitions) {
-    SparseSequenceResult out;
-    if (items.empty()) return out;
-
-    std::unordered_map<Weight, SparseSequenceEntry> best;
-    best.reserve(std::min<std::size_t>(max_points, 1u << 20));
-
-    std::deque<Weight> queue;
-    std::unordered_set<Weight> in_queue;
-    in_queue.reserve(std::min<std::size_t>(max_points, 1u << 20));
-
-    best.emplace(0, SparseSequenceEntry{0, 0, -1});
-    queue.push_back(0);
-    in_queue.insert(0);
-
-    Profit best_profit = 0;
-    Weight best_weight = 0;
-
-    while (!queue.empty()) {
-        Weight y = queue.front();
-        queue.pop_front();
-        in_queue.erase(y);
-
-        const Profit base_profit = best.find(y)->second.profit;
-
-        for (const Item& it : items) {
-            const Weight ny = y + it.w;
-            if (ny > inst.capacity) continue;
-
-            ++out.states_scanned;
-            if (out.states_scanned > max_transitions) {
-                return out;
-            }
-
-            const Profit np = safe_add(base_profit, it.p);
-            auto pos = best.find(ny);
-            if (pos == best.end() || np > pos->second.profit) {
-                best[ny] = SparseSequenceEntry{np, y, it.id};
-
-                if (np > best_profit || (np == best_profit && ny > best_weight)) {
-                    best_profit = np;
-                    best_weight = ny;
-                }
-
-                if (best.size() > max_points) {
-                    return out;
-                }
-
-                if (in_queue.insert(ny).second) {
-                    queue.push_back(ny);
-                }
+            if (!dominated) {
+                filtered.push_back(candidate);
+            } else if (modular) {
+                ++core_modular_removed;
+            } else {
+                ++core_multiple_removed;
             }
         }
     }
-
-    Solution sol;
-    sol.profit = best_profit;
-    sol.weight = 0;
-    sol.optimal = true;
-    sol.solver_name = "optimized";
-    sol.multiplicity_by_id.assign(inst.items.size(), 0);
-
-    Weight y = best_weight;
-    while (y > 0) {
-        auto pos = best.find(y);
-        if (pos == best.end() || pos->second.last_item < 0) {
-            out.solved = false;
-            return out;
-        }
-
-        const int id = pos->second.last_item;
-        const auto it = std::find_if(inst.items.begin(), inst.items.end(),
-            [&](const Item& x) { return x.id == id; });
-        if (it == inst.items.end()) {
-            out.solved = false;
-            return out;
-        }
-
-        sol.multiplicity_by_id[static_cast<std::size_t>(id)]++;
-        sol.weight += it->w;
-        y = pos->second.prev_weight;
-    }
-
-    out.solved = true;
-    out.solution = std::move(sol);
-    out.critical_points = static_cast<long long>(best.size());
-    return out;
+    // Bounds in the core must describe its locally filtered items, while the
+    // global upper remains the global certificate used for closure.
+    const bool include_optional_bounds =
+        policy == BoundPolicy::BestCertified ||
+        policy == BoundPolicy::TauStar ||
+        policy == BoundPolicy::BestItemStar;
+    BoundContext core_bounds = make_bound_context(
+        filtered, context_telemetry, include_optional_bounds);
+    CoreTraversal search{filtered, core_bounds, policy, capacity, global_upper,
+                         std::max<long long>(0, limit), {}, {},
+                         lightest_worse(filtered), !paper_faithful_mode};
+    search.result.multiple_removed = core_multiple_removed;
+    search.result.modular_removed = core_modular_removed;
+    search.result.multiplicity.assign(original_count, 0);
+    std::vector<long long> multiplicity(original_count, 0);
+    greedy_fill(search, multiplicity);
+    backtrack(search, multiplicity);
+    return search.result;
 }
 
 
-struct SequenceDrivenHalfResult {
-    bool solved = false;
-    Solution solution;
-    long long states_scanned = 0;
-    long long critical_points = 0;
-};
+std::vector<const Item*> pyasukp_variable_reduction_order(
+    const std::vector<Item>& items, Weight capacity) {
+    // Prepro.ends_bests_others scans the input in increasing index order while
+    // `place` conses every remaining item.  Init.structures then builds
+    // `imin1 :: remains`, so after the minimum-weight item the candidates are
+    // visited in reverse input order.  C++ item ids are assigned in input
+    // order, allowing us to reproduce that order for the stage-1 survivors.
+    const Item* lightest = nullptr;
+    for (const Item& item : items) {
+        if (item.w > capacity) continue;
+        if (lightest == nullptr || item.w < lightest->w ||
+            (item.w == lightest->w && item.p > lightest->p) ||
+            (item.w == lightest->w && item.p == lightest->p &&
+             item.id < lightest->id)) {
+            lightest = &item;
+        }
+    }
 
-// Exact sequence_result-driven half-split solver.
-//
-// The dense half-split DP scans capacities and items.  This routine is instead
-// driven by a queue of exact-weight states whose value improved.  It computes
-// exact-weight closure up to prefix_limit, converts it to capacity values by a
-// prefix maximum, and composes two prefix solutions.  If the reachable graph
-// becomes dense, it returns solved=false and the caller uses the existing exact
-// half-split DP.
-SequenceDrivenHalfResult try_sequence_driven_half_split(
+    std::vector<const Item*> order;
+    order.reserve(items.size());
+    if (lightest != nullptr) order.push_back(lightest);
+
+    std::vector<const Item*> remaining;
+    remaining.reserve(items.size());
+    for (const Item& item : items) {
+        if (item.w <= capacity && &item != lightest) remaining.push_back(&item);
+    }
+    std::sort(remaining.begin(), remaining.end(),
+              [](const Item* left, const Item* right) {
+                  return left->id > right->id;
+              });
+    order.insert(order.end(), remaining.begin(), remaining.end());
+    return order;
+}
+
+std::vector<Item> reduce_variables_with_pyasukp_incumbent(
     const Instance& inst,
-    const std::vector<Item>& items,
-    Weight prefix_limit,
-    long long max_transitions,
-    std::size_t max_critical_points) {
+    const std::vector<Item>& ratio_ordered_items,
+    const BoundContext& immutable_bound_context,
+    Weight capacity,
+    Profit& incumbent,
+    detail::Incumbent& incumbent_solution,
+    long long& bound_calls,
+    BoundPolicy resolved_pyasukp_policy,
+    detail::BoundDecisionTelemetry* decision_telemetry) {
+    if (resolved_pyasukp_policy != BoundPolicy::U3 &&
+        resolved_pyasukp_policy != BoundPolicy::V &&
+        resolved_pyasukp_policy != BoundPolicy::PyasukpBoth) {
+        throw std::invalid_argument(
+            "PYAsUKP variable reduction requires resolved MT/V/Both policy");
+    }
 
-    SequenceDrivenHalfResult out;
-    if (items.empty() || prefix_limit < 0) return out;
-
-    const size_t limit = static_cast<size_t>(prefix_limit);
-    const Profit neg_inf = std::numeric_limits<Profit>::min() / 4;
-
-    std::vector<Profit> exact_profit(limit + 1, neg_inf);
-    std::vector<int> exact_last(limit + 1, -1);
-    std::vector<Weight> exact_prev(limit + 1, 0);
-    std::vector<unsigned char> in_queue(limit + 1, 0);
-    std::deque<Weight> queue;
-
-    exact_profit[0] = 0;
-    queue.push_back(0);
-    in_queue[0] = 1;
-
-    std::vector<Weight> sequence_result;
-    sequence_result.reserve(std::min<std::size_t>(max_critical_points, 1u << 20));
-    sequence_result.push_back(0);
-
-    while (!queue.empty()) {
-        const Weight y = queue.front();
-        queue.pop_front();
-        in_queue[static_cast<size_t>(y)] = 0;
-
-        const Profit base = exact_profit[static_cast<size_t>(y)];
-        if (base == neg_inf) continue;
-
-        for (const Item& it : items) {
-            const Weight ny = y + it.w;
-            if (ny > prefix_limit) continue;
-
-            ++out.states_scanned;
-            if (out.states_scanned > max_transitions) return out;
-
-            const Profit np = safe_add(base, it.p);
-            const size_t ni = static_cast<size_t>(ny);
-            if (np > exact_profit[ni]) {
-                if (exact_profit[ni] == neg_inf) {
-                    sequence_result.push_back(ny);
-                    if (sequence_result.size() > max_critical_points) return out;
-                }
-
-                exact_profit[ni] = np;
-                exact_last[ni] = it.id;
-                exact_prev[ni] = y;
-
-                if (!in_queue[ni]) {
-                    queue.push_back(ny);
-                    in_queue[ni] = 1;
-                }
-            }
+    std::vector<unsigned char> keep(inst.items.size(), 0);
+    for (const Item& item : ratio_ordered_items) {
+        if (item.id < 0 || static_cast<std::size_t>(item.id) >= keep.size()) {
+            throw std::logic_error("item id is outside variable-reduction table");
+        }
+        if (item.w <= capacity || item.id == immutable_bound_context.best.id) {
+            keep[static_cast<std::size_t>(item.id)] = 1;
         }
     }
 
-    std::vector<Profit> best_leq_profit(limit + 1, 0);
-    std::vector<Weight> best_leq_weight(limit + 1, 0);
-
-    Profit running_best = 0;
-    Weight running_weight = 0;
-    for (Weight y = 0; y <= prefix_limit; ++y) {
-        const Profit v = exact_profit[static_cast<size_t>(y)];
-        if (v > running_best) {
-            running_best = v;
-            running_weight = y;
-        }
-        best_leq_profit[static_cast<size_t>(y)] = running_best;
-        best_leq_weight[static_cast<size_t>(y)] = running_weight;
-    }
-
-    Profit best_profit = 0;
-    Weight best_a_weight = 0;
-    Weight best_b_weight = 0;
-
-    for (Weight a = 0; a <= prefix_limit; ++a) {
-        const Weight remaining = inst.capacity - a;
-        const Weight bcap = std::min<Weight>(prefix_limit, std::max<Weight>(0, remaining));
-        const Profit val = safe_add(best_leq_profit[static_cast<size_t>(a)],
-                                    best_leq_profit[static_cast<size_t>(bcap)]);
-        if (val > best_profit) {
-            best_profit = val;
-            best_a_weight = best_leq_weight[static_cast<size_t>(a)];
-            best_b_weight = best_leq_weight[static_cast<size_t>(bcap)];
-        }
-    }
-
-    Solution sol;
-    sol.profit = best_profit;
-    sol.weight = 0;
-    sol.optimal = true;
-    sol.solver_name = "optimized";
-    sol.multiplicity_by_id.assign(inst.items.size(), 0);
-
-    auto add_exact_trace = [&](Weight start_w) {
-        Weight y = start_w;
-        while (y > 0) {
-            const size_t yi = static_cast<size_t>(y);
-            const int id = exact_last[yi];
-            if (id < 0) throw std::runtime_error("sequence-driven backtracking failed");
-
-            const auto it = std::find_if(inst.items.begin(), inst.items.end(),
-                [&](const Item& x) { return x.id == id; });
-            if (it == inst.items.end()) throw std::runtime_error("sequence-driven item id not found");
-
-            sol.multiplicity_by_id[static_cast<std::size_t>(id)]++;
-            sol.weight += it->w;
-            y = exact_prev[yi];
-        }
-    };
-
-    add_exact_trace(best_a_weight);
-    add_exact_trace(best_b_weight);
-
-    out.solved = true;
-    out.solution = std::move(sol);
-    out.critical_points = static_cast<long long>(sequence_result.size());
-    return out;
-}
-
-
-struct SliceMergeHalfResult {
-    bool solved = false;
-    Solution solution;
-    long long states_scanned = 0;
-    long long critical_points = 0;
-};
-
-struct SliceCandidate {
-    Weight w = 0;
-    Profit p = 0;
-    Weight prev_w = 0;
-    int last_item = -1;
-
-    bool operator>(const SliceCandidate& other) const {
-        if (w != other.w) return w > other.w;
-        return p < other.p;
-    }
-};
-
-// A closer C++ analogue of PYAsUKP's Slice.one + merge/filter idea.
-//
-// The solver is driven by the current sequence_result rather than by scanning
-// every capacity for every item.  For each slice [lo, hi], it generates only
-// transitions from current critical points into that slice, merges candidates
-// by target weight, and filters dominated points.  It is exact if it completes.
-// If the number of generated transitions or critical points exceeds the budget,
-// it returns solved=false and the caller keeps the existing exact half-split DP.
-SliceMergeHalfResult try_slice_one_merge_half_split(
-    const Instance& inst,
-    const std::vector<Item>& input_items,
-    Weight prefix_limit,
-    Weight slice_height,
-    long long max_transitions,
-    std::size_t max_critical_points) {
-
-    SliceMergeHalfResult out;
-    if (input_items.empty() || prefix_limit < 0) return out;
-
-    std::vector<Item> items = input_items;
-    std::sort(items.begin(), items.end(),
-        [](const Item& a, const Item& b) {
-            if (a.w != b.w) return a.w < b.w;
-            return better_ratio(a, b);
-        });
-
-    struct SeqPoint {
-        Weight w = 0;
-        Profit p = 0;
-        Weight prev_w = 0;
-        int last_item = -1;
-    };
-
-    const size_t limit = static_cast<size_t>(prefix_limit);
-    const Profit neg_inf = std::numeric_limits<Profit>::min() / 4;
-
-    // exact_profit is a membership/profit oracle, not the driver.  The driver is
-    // sequence_result.  Keeping this array avoids unordered_map overhead and
-    // keeps correctness checks O(1).
-    std::vector<Profit> exact_profit(limit + 1, neg_inf);
-    std::vector<int> exact_last(limit + 1, -1);
-    std::vector<Weight> exact_prev(limit + 1, 0);
-
-    std::vector<SeqPoint> sequence_result;
-    sequence_result.reserve(std::min<std::size_t>(max_critical_points, 1u << 20));
-    sequence_result.push_back(SeqPoint{0, 0, 0, -1});
-    exact_profit[0] = 0;
-
-    Weight lo = 1;
-    while (lo <= prefix_limit) {
-        const Weight hi = std::min<Weight>(prefix_limit, lo + slice_height - 1);
-
-        // Active item filtering by slice.
-        //
-        // This is a conservative filter: an item is considered in this slice only
-        // if it can land at least one transition inside [lo, hi] from some current
-        // critical point.  It does not remove the item globally and therefore does
-        // not affect the fallback exact DP.  The goal is to avoid generating the
-        // full item set for slices where many items cannot contribute.
-        std::vector<const Item*> slice_items;
-        slice_items.reserve(items.size());
-
-        for (const Item& it : items) {
-            if (it.w > hi) break;
-
-            bool reaches_slice = false;
-            for (const SeqPoint& sp : sequence_result) {
-                if (sp.w >= hi) break;
-                if (sp.w + it.w > hi) continue;
-
-                const Weight gap = lo > sp.w ? lo - sp.w : 0;
-                const long long kmin = gap <= 0 ? 1 : std::max<long long>(1, (gap + it.w - 1) / it.w);
-                const Weight first = sp.w + safe_mul(kmin, it.w);
-                if (first >= lo && first <= hi) {
-                    reaches_slice = true;
-                    break;
-                }
-            }
-
-            if (reaches_slice) {
-                slice_items.push_back(&it);
-            }
-        }
-
-        if (slice_items.empty()) {
-            lo = hi + 1;
+    const std::vector<const Item*> reduction_order =
+        pyasukp_variable_reduction_order(ratio_ordered_items, capacity);
+    for (const Item* item_ptr : reduction_order) {
+        const Item& item = *item_ptr;
+        if (item.id == immutable_bound_context.best.id) {
+            // The initial incumbent already contains the maximal number of b1.
             continue;
         }
 
-        // Priority-queue merge of generated candidates, similar in spirit to a
-        // k-way merge of shifted sequences.  The queue stores candidate states
-        // landing in the current slice.
-        std::priority_queue<SliceCandidate,
-                            std::vector<SliceCandidate>,
-                            std::greater<SliceCandidate>> pq;
+        // Bounds.with_wp first builds a feasible residual completion and uses
+        // it to strengthen bound.z.  Only then does Init.structures call
+        // is_context_dominated.  The context itself remains the original,
+        // pre-reduction bound exactly as in PYAsUKP.
+        const Weight residual_capacity = capacity - item.w;
+        const detail::FeasibleCompletion completion = detail::complete_with_bound(
+            immutable_bound_context, resolved_pyasukp_policy, residual_capacity);
+        const Profit candidate_profit = safe_add(item.p, completion.profit);
+        const Weight candidate_weight = safe_add(item.w, completion.weight);
 
-        for (const SeqPoint& sp : sequence_result) {
-            if (sp.p == neg_inf) continue;
-
-            for (const Item* pit : slice_items) {
-                const Item& it = *pit;
-                Weight nw = sp.w + it.w;
-                if (nw > hi) {
-                    continue;
+        if (candidate_profit > incumbent_solution.profit ||
+            (candidate_profit == incumbent_solution.profit &&
+             candidate_weight > incumbent_solution.weight)) {
+            std::vector<long long> multiplicity(inst.items.size(), 0);
+            multiplicity[static_cast<std::size_t>(item.id)] = 1;
+            for (std::size_t index = 0; index < completion.term_count; ++index) {
+                const detail::CompletionTerm& term = completion.terms[index];
+                if (term.item_id < 0 ||
+                    static_cast<std::size_t>(term.item_id) >= multiplicity.size()) {
+                    throw std::logic_error(
+                        "bound completion item id is outside multiplicity");
                 }
-
-                // Generate multiples of this item from this sequence point only
-                // inside the current slice.  This is the key difference from the
-                // dense loop: capacities that are not induced by a critical point
-                // are not used as drivers.
-                Profit np = safe_add(sp.p, it.p);
-                while (nw <= hi) {
-                    if (nw >= lo) {
-                        pq.push(SliceCandidate{nw, np, sp.w, it.id});
-                    }
-
-                    ++out.states_scanned;
-                    if (out.states_scanned > max_transitions) return out;
-
-                    nw += it.w;
-                    np = safe_add(np, it.p);
-                }
+                multiplicity[static_cast<std::size_t>(term.item_id)] += term.count;
+            }
+            if (incumbent_solution.consider(candidate_profit, candidate_weight,
+                                            std::move(multiplicity))) {
+                incumbent = incumbent_solution.profit;
             }
         }
 
-        // Merge candidates with same target weight, keeping only best profit.
-        std::vector<SeqPoint> new_points;
-        Profit best_profit_seen = sequence_result.empty() ? 0 : sequence_result.back().p;
-
-        while (!pq.empty()) {
-            SliceCandidate cur = pq.top();
-            pq.pop();
-
-            Weight w = cur.w;
-            Profit best_p = cur.p;
-            Weight best_prev = cur.prev_w;
-            int best_last = cur.last_item;
-
-            while (!pq.empty() && pq.top().w == w) {
-                SliceCandidate other = pq.top();
-                pq.pop();
-                if (other.p > best_p) {
-                    best_p = other.p;
-                    best_prev = other.prev_w;
-                    best_last = other.last_item;
-                }
-            }
-
-            const size_t wi = static_cast<size_t>(w);
-            if (best_p > exact_profit[wi]) {
-                exact_profit[wi] = best_p;
-                exact_prev[wi] = best_prev;
-                exact_last[wi] = best_last;
-
-                // Filter: append only critical points, i.e., points that improve
-                // the upper envelope f(y)=max_{x<=y} profit[x].
-                if (best_p > best_profit_seen) {
-                    new_points.push_back(SeqPoint{w, best_p, best_prev, best_last});
-                    best_profit_seen = best_p;
-                }
-            }
-        }
-
-        if (!new_points.empty()) {
-            // Merge/filter with previous sequence_result.  Since new_points are
-            // in increasing weight order and strictly improve the envelope, this
-            // is append-only for the current slice.
-            for (const SeqPoint& p : new_points) {
-                sequence_result.push_back(p);
-                if (sequence_result.size() > max_critical_points) return out;
-            }
-        }
-
-        // If no new critical point appeared in the slice, continue.  This is not
-        // a proof of periodicity by itself, but it keeps the solver exact.
-        lo = hi + 1;
-    }
-
-    if (sequence_result.empty()) return out;
-
-    // Convert the critical sequence to capacity values by walking the envelope.
-    std::vector<Profit> best_leq_profit(limit + 1, 0);
-    std::vector<Weight> best_leq_weight(limit + 1, 0);
-
-    std::size_t k = 0;
-    Profit current_p = 0;
-    Weight current_w = 0;
-    for (Weight y = 0; y <= prefix_limit; ++y) {
-        while (k < sequence_result.size() && sequence_result[k].w <= y) {
-            if (sequence_result[k].p > current_p) {
-                current_p = sequence_result[k].p;
-                current_w = sequence_result[k].w;
-            }
-            ++k;
-        }
-        best_leq_profit[static_cast<size_t>(y)] = current_p;
-        best_leq_weight[static_cast<size_t>(y)] = current_w;
-    }
-
-    Profit best_profit = 0;
-    Weight best_a_weight = 0;
-    Weight best_b_weight = 0;
-
-    for (Weight a = 0; a <= prefix_limit; ++a) {
-        const Weight remaining = inst.capacity - a;
-        const Weight bcap = std::min<Weight>(prefix_limit, std::max<Weight>(0, remaining));
-        const Profit val = safe_add(best_leq_profit[static_cast<size_t>(a)],
-                                    best_leq_profit[static_cast<size_t>(bcap)]);
-        if (val > best_profit) {
-            best_profit = val;
-            best_a_weight = best_leq_weight[static_cast<size_t>(a)];
-            best_b_weight = best_leq_weight[static_cast<size_t>(bcap)];
+        const detail::BoundDecision decision = detail::evaluate_candidate(
+            immutable_bound_context, item.w, item.p, capacity, incumbent,
+            resolved_pyasukp_policy);
+        detail::accumulate_bound_decision_telemetry(decision_telemetry, decision);
+        if (decision.evaluated_mask != 0) ++bound_calls;
+        if (decision.can_fathom) {
+            keep[static_cast<std::size_t>(item.id)] = 0;
         }
     }
 
+    // The DP relies on stable better_ratio order.  Evaluate candidates in the
+    // PYAsUKP preprocessing order above, but publish survivors in the original
+    // ratio order used by the C++ CriticalSequence.
+    std::vector<Item> reduced;
+    reduced.reserve(ratio_ordered_items.size());
+    for (const Item& item : ratio_ordered_items) {
+        if (item.id == immutable_bound_context.best.id ||
+            keep[static_cast<std::size_t>(item.id)] != 0) {
+            reduced.push_back(item);
+        }
+    }
+    return reduced;
+}
+
+Solution solution_from_best_item(const Instance& inst, const Item& best, long long count) {
     Solution sol;
-    sol.profit = best_profit;
-    sol.weight = 0;
+    sol.profit = safe_mul(count, best.p);
+    sol.weight = count * best.w;
     sol.optimal = true;
     sol.solver_name = "optimized";
     sol.multiplicity_by_id.assign(inst.items.size(), 0);
-
-    auto add_trace = [&](Weight start_w) {
-        Weight y = start_w;
-        while (y > 0) {
-            const size_t yi = static_cast<size_t>(y);
-            const int id = exact_last[yi];
-            if (id < 0) throw std::runtime_error("slice-merge backtracking failed");
-
-            const auto it = std::find_if(inst.items.begin(), inst.items.end(),
-                [&](const Item& x) { return x.id == id; });
-            if (it == inst.items.end()) throw std::runtime_error("slice-merge item id not found");
-
-            sol.multiplicity_by_id[static_cast<std::size_t>(id)]++;
-            sol.weight += it->w;
-            y = exact_prev[yi];
-        }
-    };
-
-    add_trace(best_a_weight);
-    add_trace(best_b_weight);
-
-    out.solved = true;
-    out.solution = std::move(sol);
-    out.critical_points = static_cast<long long>(sequence_result.size());
-    return out;
+    if (best.id >= 0 && static_cast<std::size_t>(best.id) < sol.multiplicity_by_id.size()) {
+        sol.multiplicity_by_id[static_cast<std::size_t>(best.id)] = count;
+    }
+    return sol;
 }
 
 }  // namespace
@@ -1155,874 +645,1226 @@ Solver::Solver(SolverOptions options) : options_(options) {}
 
 SolverResult Solver::solve(const Instance& inst) {
     if (inst.capacity < 0) throw std::invalid_argument("negative capacity");
-
     SolverResult result;
-    result.stats.original_items = static_cast<long long>(inst.items.size());
+    const EffectiveOptions effective = effective_options(options_);
+    UKP_BASIC_STATS(
+        result.stats.original_items = static_cast<long long>(inst.items.size());
+    );
+    UKP_FULL_STATS(
+        result.stats.backfill_attempts_by_item.assign(inst.items.size(), -1);
+    );
     if (inst.items.empty() || inst.capacity == 0) {
         result.solution.multiplicity_by_id.assign(inst.items.size(), 0);
         result.solution.optimal = true;
         result.solution.solver_name = "optimized";
+        UKP_BASIC_STATS(
+            result.stats.stop_reason = "empty_instance";
+            result.stats.dp_stop_reason = "empty_instance";
+        );
         return result;
     }
 
-    std::vector<Item> items = inst.items;
-    // Keep the optimized solver's historical preprocessing policy independent
-    // from the faithful solver's explicit experimental switches.
+    detail::PreprocessResult preprocessing;
     {
-        items = remove_simple_dominated(items);
-        Item best = *std::max_element(items.begin(), items.end(),
-            [](const Item& a, const Item& b) { return better_ratio(b, a); });
-        items = remove_multiple_dominated_by_best(items, best);
-
-        // Collective dominance, with explicit replacement certificate.  This is
-        // safe and placed before all path-selection decisions so the controller
-        // sees the true reduced core.
-        items = remove_collectively_dominated_safe(std::move(items), inst.capacity);
+        PhaseTimer<kFullStats> phase(result.stats.phase_preprocessing_ns);
+        preprocessing = detail::preprocess_items(inst, effective.simple_dominance);
     }
-    std::sort(items.begin(), items.end(), better_ratio);
-    result.stats.after_preprocess_items = static_cast<long long>(items.size());
+    std::vector<Item> items = std::move(preprocessing.items);
+    UKP_BASIC_STATS(
+        result.stats.items_removed_simple = preprocessing.simple_removed;
+        result.stats.items_removed_multiple = preprocessing.multiple_removed;
+        result.stats.after_preprocess_items = static_cast<long long>(items.size());
+    );
 
-    {
-        Solution one_item_solution;
-        if (try_single_remaining_item_stop(inst, items, one_item_solution)) {
-            result.solution = std::move(one_item_solution);
-            return result;
+    BoundContextTelemetry context_telemetry;
+    BoundContextTelemetry* context_telemetry_ptr = nullptr;
+    detail::BoundDecisionTelemetry bound_decision_telemetry;
+    detail::BoundDecisionTelemetry* bound_decision_telemetry_ptr = nullptr;
+    if constexpr (kFullStats) {
+        context_telemetry_ptr = &context_telemetry;
+        bound_decision_telemetry_ptr = &bound_decision_telemetry;
+    }
+    auto publish_context_telemetry = [&]() {
+        if constexpr (kFullStats) {
+            result.stats.bound_context_rebuilds = context_telemetry.rebuilds;
+            result.stats.bound_context_incremental_updates =
+                context_telemetry.incremental_updates;
+            result.stats.bound_context_items_processed = context_telemetry.items_processed;
+            result.stats.phase_context_maintenance_ns =
+                context_telemetry.incremental_maintenance_ns;
+            result.stats.bound_context_tau_q_recomputations =
+                context_telemetry.tau_q_recomputations;
+            result.stats.bound_context_tau_q_items_scanned =
+                context_telemetry.tau_q_items_scanned;
+            result.stats.bound_context_best_q_recomputations =
+                context_telemetry.best_q_recomputations;
+            result.stats.bound_context_best_q_items_scanned =
+                context_telemetry.best_q_items_scanned;
+            result.stats.bound_context_alpha_recomputations =
+                context_telemetry.alpha_recomputations;
+            result.stats.bound_context_alpha_items_scanned =
+                context_telemetry.alpha_items_scanned;
+            result.stats.bound_context_dominance_full_searches =
+                context_telemetry.dominance_full_searches;
+            result.stats.bound_context_dominance_searches_avoided_by_witness =
+                context_telemetry.dominance_searches_avoided_by_witness;
+            result.stats.bound_context_dominance_witness_invalidations =
+                context_telemetry.dominance_witness_invalidations;
+            result.stats.bound_context_dominance_pair_checks =
+                context_telemetry.dominance_pair_checks;
+            result.stats.lower_filter_hits =
+                bound_decision_telemetry.lower_filter_hits;
+            result.stats.bounds_short_circuited =
+                bound_decision_telemetry.bounds_short_circuited;
+            for (std::size_t index = 0; index < 4; ++index) {
+                if (bound_decision_telemetry.bounds_evaluated[index] != 0) {
+                    result.stats.bounds_evaluated[
+                        ::ukp::bound_type_name(kBoundTypes[index])] =
+                            bound_decision_telemetry.bounds_evaluated[index];
+                }
+            }
         }
+    };
+    PhaseTimer<kFullStats> global_bounds_phase(result.stats.phase_global_bounds_ns);
+    long long discarded_bound_calls = 0;
+    long long& bound_calls_counter = kBasicStats
+        ? result.stats.bound_calls : discarded_bound_calls;
+    BoundContext ctx;
+    BoundValue global_bound{};
+    global_bound.upper = std::numeric_limits<Profit>::max();
+    long long best_count = 0;
+    Profit incumbent = 0;
+    BoundPolicy effective_bound_policy = options_.bound_policy;
+    BoundPolicy pyasukp_completion_policy = BoundPolicy::U3;
+    BoundContext pyasukp_completion_bound_ctx;
+    const BoundContext* bound_completion_context = nullptr;
+    const bool use_bound_completion =
+        options_.use_bounds && options_.use_pyasukp_bound_completion;
+    if (options_.use_bounds) {
+        // initialize_bounds is the only initial BoundContext construction on
+        // the bounded path.  The previous code built the same context twice.
+        detail::BoundPhase bound_phase = detail::initialize_bounds(
+            items, inst.capacity, options_.bound_policy, context_telemetry_ptr);
+        ctx = std::move(bound_phase.context);
+        global_bound = bound_phase.global;
+        best_count = bound_phase.best_count;
+        incumbent = bound_phase.incumbent;
+        effective_bound_policy = bound_phase.effective_policy;
+        if (options_.bound_policy == BoundPolicy::PyasukpFaithful) {
+            pyasukp_completion_policy = effective_bound_policy;
+            UKP_BASIC_STATS(
+                result.stats.pyasukp_bound_mode =
+                    pyasukp_policy_name(pyasukp_completion_policy);
+            );
+        }
+        if (use_bound_completion &&
+            options_.bound_policy != BoundPolicy::PyasukpFaithful) {
+            // Configuration B keeps BestCertified for upper bounds, but its
+            // incumbent completion must use the minimum-weight V parameters
+            // from PYAsUKP rather than the generic C++ V/Tau* context.
+            pyasukp_completion_bound_ctx =
+                make_bound_context(items, nullptr, false);
+            pyasukp_completion_policy = resolve_pyasukp_policy(
+                pyasukp_completion_bound_ctx, inst.capacity);
+            UKP_BASIC_STATS(
+                result.stats.pyasukp_bound_mode =
+                    pyasukp_policy_name(pyasukp_completion_policy);
+            );
+        }
+        UKP_BASIC_STATS(
+            ++result.stats.bound_calls;
+            result.stats.global_bound_used = ::ukp::bound_type_name(global_bound.type);
+            result.stats.bound_winner = result.stats.global_bound_used;
+        );
+    } else {
+        ctx = make_bound_context(items, context_telemetry_ptr);
+        best_count = inst.capacity / ctx.best.w;
+        incumbent = safe_mul(best_count, ctx.best.p);
     }
 
-    BoundContext ctx = make_bound_context(items);
-    BoundValue global_bound = compute_bound(ctx, inst.capacity);
-    result.stats.bound_calls++;
+    detail::Incumbent incumbent_solution(inst.items.size());
+    incumbent_solution.consider(incumbent, safe_mul(best_count, ctx.best.w),
+                                solution_from_best_item(inst, ctx.best, best_count).multiplicity_by_id,
+                                detail::no_point, ctx.best.id, best_count);
 
-    Profit incumbent = safe_mul(inst.capacity / ctx.best.w, ctx.best.p);
-    std::vector<long long> incumbent_mult(inst.items.size(), 0);
-    if (ctx.best.id >= 0 && static_cast<std::size_t>(ctx.best.id) < incumbent_mult.size()) {
-        incumbent_mult[static_cast<std::size_t>(ctx.best.id)] = inst.capacity / ctx.best.w;
-    }
-
-    // Bound-stop faithful to the PYAsUKP behavior: if the initial incumbent
-    // already closes the upper bound, do not enter sequence/DP machinery.
+    // EDUK2 bound-stop shortcut.  This is exact only when the certified incumbent
+    // is the one reconstructed here, so it is applied before the core B&B changes
+    // the incumbent without storing its multiplicities.
     if (options_.use_bounds && incumbent >= global_bound.upper) {
-        Solution sol;
-        sol.profit = incumbent;
-        sol.weight = 0;
-        sol.multiplicity_by_id = incumbent_mult;
-        sol.optimal = true;
-        sol.solver_name = "optimized";
-        for (const Item& it : inst.items) {
-            if (it.id >= 0 && static_cast<std::size_t>(it.id) < sol.multiplicity_by_id.size()) {
-                sol.weight += it.w * sol.multiplicity_by_id[static_cast<std::size_t>(it.id)];
-            }
-        }
-        result.solution = std::move(sol);
+        result.solution = solution_from_best_item(inst, ctx.best, best_count);
+        UKP_BASIC_STATS(
+            result.stats.active_items_final = static_cast<long long>(items.size());
+            result.stats.stop_reason = "initial_bound";
+        );
+        publish_context_telemetry();
         return result;
     }
 
-    const long double preprocess_ratio = result.stats.original_items > 0
-        ? static_cast<long double>(result.stats.after_preprocess_items) /
-              static_cast<long double>(result.stats.original_items)
-        : 1.0L;
+    // PYAsUKP builds its context-dominance bound before removing context-
+    // dominated variables and reuses that immutable bound for every later item
+    // introduction.  Keep the same pre-reduction context as a correctness guard
+    // for irreversible pruning decisions made by the shrinking residual context.
+    BoundContext introduction_bound_ctx;
+    if (options_.use_bounds) introduction_bound_ctx = ctx;
+    if (use_bound_completion) {
+        bound_completion_context =
+            options_.bound_policy == BoundPolicy::PyasukpFaithful
+                ? &introduction_bound_ctx
+                : &pyasukp_completion_bound_ctx;
+    }
 
-    // Structural diagnosis used by the adaptive policy.  When preprocessing
-    // removes almost nothing, the original EDUK2 hybrid machinery tends to pay
-    // for many bound/B&B operations without reducing the DP space enough.  In
-    // that regime we keep only a very small B&B probe and fall back to the dense
-    // cache-friendly DP.
-    const bool structurally_bb_friendly =
-        result.stats.after_preprocess_items <= 256 || preprocess_ratio <= 0.35L;
-
-    // If preprocessing did not reduce the instance, the EDUK2 hybrid machinery
-    // is usually expensive: B&B explores its full budget and contextual bounds
-    // cut too few states.  In this regime the optimized solver deliberately
-    // skips the hybrid phase and falls back to the exact cache-friendly DP.
-    //
-    // Keep this variable name stable: it is useful to verify that this file is
-    // really the one being compiled:
-    //   grep -n "skip_hybrid" src/optimized/optimized_solver.cpp
-    const bool structurally_adverse =
-        result.stats.after_preprocess_items > 512 && preprocess_ratio >= 0.80L;
-    const bool skip_hybrid = structurally_adverse;
-
-    bool enable_dp_bound_sampling = structurally_bb_friendly && !skip_hybrid;
-
-    // Important: if the structural diagnosis says the instance is adverse,
-    // the optimized solver does not even run the B&B probe.  Earlier versions
-    // still spent the full B&B budget in this regime; that is exactly the
-    // overhead this policy is meant to avoid.  Correctness is preserved because
-    // the subsequent dynamic program is exact.
-
-    // Hybrid/adaptive B&B.  First run a small probe.  Escalate only when the
-    // probe gives evidence that the instance is B&B-friendly.
-    if (options_.use_core_bb && options_.bb_node_limit > 0 && !skip_hybrid) {
-        AdaptiveBBController controller(options_.bb_node_limit);
-        if (!structurally_bb_friendly) {
-            controller.max_nodes = std::min<long long>(controller.max_nodes, 512);
-            controller.probe_nodes = std::min<long long>(controller.max_nodes, 64);
+    if (options_.use_bounds) {
+        const long long items_before_bound_reduction = static_cast<long long>(items.size());
+#ifndef NDEBUG
+        assert(std::is_sorted(items.begin(), items.end(), better_ratio));
+#endif
+        if (options_.bound_policy == BoundPolicy::PyasukpFaithful &&
+            use_bound_completion) {
+            items = reduce_variables_with_pyasukp_incumbent(
+                inst, items, introduction_bound_ctx, inst.capacity, incumbent,
+                incumbent_solution, bound_calls_counter, effective_bound_policy,
+                bound_decision_telemetry_ptr);
+        } else {
+            items = detail::reduce_variables_by_bound(
+                items, ctx, inst.capacity, incumbent, bound_calls_counter,
+                effective_bound_policy, bound_decision_telemetry_ptr);
         }
-        const Profit before_probe = incumbent;
-        CoreBBResult probe = run_core_branch_and_bound(items, inst.capacity, controller.probe_nodes,
-                                         options_.core_size, incumbent,
-                                         global_bound.upper, inst.items.size());
-        result.stats.bb_nodes += probe.nodes;
-        if (probe.profit > incumbent) {
-            incumbent = probe.profit;
-            incumbent_mult = probe.multiplicity_by_id;
-        }
-        {
-            const Profit gap = std::max<Profit>(0, global_bound.upper - incumbent);
-            const long double relative_gap = global_bound.upper > 0
-                ? static_cast<long double>(gap) / static_cast<long double>(global_bound.upper)
-                : 1.0L;
-            if (probe.profit > before_probe && relative_gap <= 0.002L) {
-                enable_dp_bound_sampling = true;
-            }
-        }
-        if (options_.use_bounds && (probe.closed_gap || incumbent >= global_bound.upper)) {
-            Solution sol;
-            sol.profit = incumbent;
-            sol.weight = 0;
-            sol.multiplicity_by_id = incumbent_mult;
-            sol.optimal = true;
-            sol.solver_name = "optimized";
-            for (const Item& it : inst.items) {
-                if (it.id >= 0 && static_cast<std::size_t>(it.id) < sol.multiplicity_by_id.size()) {
-                    sol.weight += it.w * sol.multiplicity_by_id[static_cast<std::size_t>(it.id)];
-                }
-            }
-            result.solution = std::move(sol);
+        // reduce_variables_by_bound is a stable filter, so survivors retain
+        // the exact better_ratio order of the input.
+#ifndef NDEBUG
+        assert(std::is_sorted(items.begin(), items.end(), better_ratio));
+#endif
+        UKP_BASIC_STATS(
+            result.stats.items_removed_bound =
+                items_before_bound_reduction - static_cast<long long>(items.size());
+        );
+        rebuild_bound_context_ratio_ordered(ctx, items, context_telemetry_ptr);
+        UKP_BASIC_STATS(
+            result.stats.after_preprocess_items = static_cast<long long>(items.size());
+        );
+
+        // Bounds.with_wp raises Optimal as soon as its feasible z reaches the
+        // original certified upper bound.  The incumbent stored above is fully
+        // reconstructible, so the C++ faithful path can close at the same point.
+        if (incumbent >= global_bound.upper) {
+            global_bounds_phase.stop();
+            result.solution = incumbent_solution.solution("optimized");
+            UKP_BASIC_STATS(
+                result.stats.active_items_final = static_cast<long long>(items.size());
+                result.stats.stop_reason = "preprocessing_bound";
+                result.stats.dp_stop_reason = "not_started";
+            );
+            publish_context_telemetry();
             return result;
         }
+    }
+    global_bounds_phase.stop();
 
-        if (controller.should_escalate(probe, before_probe, global_bound.upper,
-                                       result.stats.after_preprocess_items)) {
-            const long long remaining_nodes = controller.max_nodes - result.stats.bb_nodes;
-            if (remaining_nodes > 0) {
-                CoreBBResult extended = run_core_branch_and_bound(items, inst.capacity, remaining_nodes,
-                                                    options_.core_size, incumbent,
-                                                    global_bound.upper, inst.items.size());
-                result.stats.bb_nodes += extended.nodes;
-                if (extended.profit > incumbent) {
-                    incumbent = extended.profit;
-                    incumbent_mult = extended.multiplicity_by_id;
-                    enable_dp_bound_sampling = true;
-                }
-                if (options_.use_bounds && (extended.closed_gap || incumbent >= global_bound.upper)) {
-                    Solution sol;
-                    sol.profit = incumbent;
-                    sol.weight = 0;
-                    sol.multiplicity_by_id = incumbent_mult;
-                    sol.optimal = true;
-                    sol.solver_name = "optimized";
-                    for (const Item& it : inst.items) {
-                        if (it.id >= 0 && static_cast<std::size_t>(it.id) < sol.multiplicity_by_id.size()) {
-                            sol.weight += it.w * sol.multiplicity_by_id[static_cast<std::size_t>(it.id)];
-                        }
-                    }
-                    result.solution = std::move(sol);
-                    return result;
-                }
-            }
-        }
+    // This is the global post-reduction list used by the DP.  The core B&B
+    // only receives a const view and performs every experimental reduction on
+    // its own local copy.
+    const std::vector<Item> dp_items = items;
+    // Gilmore-Gomory periodicity, as used by EDUK2, is defined with respect
+    // to the ratio-best item.  Keep this witness stable while the residual
+    // bound context shrinks during the DP.
+    const Item periodic_best = dp_items.front();
+    if constexpr (kFullStats) {
+        result.stats.dp_item_ids.reserve(dp_items.size());
+        for (const Item& item : dp_items) result.stats.dp_item_ids.push_back(item.id);
     }
 
-
-
-
-
-    // OCaml-like bound stop on the reduced core.
-    //
-    // This is attempted before any sequence/DP machinery.  It is driven by a
-    // work estimate: when the reduced core can plausibly be closed cheaper than
-    // the half-split DP prefix, try an exact bounded enumeration.  If it closes,
-    // return immediately, matching PYAsUKP's "THE BOUND STOPPED THE COMPUTATION"
-    // behavior.  If it does not close within budget, the result is ignored.
-    {
-        Weight core_wmax = 0;
-        long long feasible_items = 0;
-        for (const Item& it : items) {
-            if (it.w > 0 && it.w <= inst.capacity) {
-                core_wmax = std::max(core_wmax, it.w);
-                ++feasible_items;
+    // The residual bound set is monotone: a candidate leaves it only after an
+    // envelope/bound rejection or threshold removal. Keep membership by id for
+    // duplicate/removal accounting; BoundContext itself now applies the same
+    // removals incrementally while preserving dp_items' stable ratio order.
+    std::vector<unsigned char> residual_item_alive(inst.items.size(), 0);
+    auto residual_slot = [&](const auto& item) -> unsigned char& {
+        if (item.id < 0 || static_cast<std::size_t>(item.id) >= residual_item_alive.size()) {
+            throw std::logic_error("item id is outside residual bound membership");
+        }
+        return residual_item_alive[static_cast<std::size_t>(item.id)];
+    };
+    for (const Item& item : dp_items) residual_slot(item) = 1;
+    if (options_.use_core_bb) {
+        PhaseTimer<kFullStats> core_bb_phase(result.stats.phase_core_bb_ns);
+        constexpr long long kFaithfulCoreNodeLimit = 10'000;
+        const long long core_node_limit = options_.paper_faithful_mode
+            ? kFaithfulCoreNodeLimit : options_.bb_node_limit;
+        UKP_BASIC_STATS(result.stats.core_node_limit = core_node_limit;);
+        std::vector<int>* selected_core_ids = nullptr;
+        if constexpr (kFullStats) selected_core_ids = &result.stats.core_item_ids;
+        CoreSearchResult core = traverse_core(dp_items, ctx, effective_bound_policy, inst.capacity,
+                                               global_bound.upper, options_.core_size,
+                                               core_node_limit, inst.items.size(), effective,
+                                               options_.paper_faithful_mode, context_telemetry_ptr,
+                                               selected_core_ids);
+        incumbent = std::max(incumbent, core.profit);
+        UKP_BASIC_STATS(
+            if (core.profit > incumbent_solution.profit) {
+                ++result.stats.incumbent_improvements_bb;
             }
+        );
+        Weight core_weight = 0;
+        for (const Item& item : inst.items) {
+            core_weight += safe_mul(core.multiplicity[static_cast<std::size_t>(item.id)], item.w);
         }
-        if (core_wmax <= 0) core_wmax = 1;
-
-        const Weight prefix =
-            std::min<Weight>(inst.capacity, ((inst.capacity + 1) / 2) + core_wmax);
-
-        const long double estimated_half_work =
-            static_cast<long double>(std::max<Weight>(1, prefix)) *
-            static_cast<long double>(std::max<long long>(1, feasible_items));
-
-        const bool core_closure_is_cheap =
-            estimated_half_work <= 5'000'000.0L ||
-            (global_bound.upper > 0 &&
-             static_cast<long double>(std::max<Profit>(0, global_bound.upper - incumbent)) /
-             static_cast<long double>(global_bound.upper) <= 0.0001L);
-
-        if (core_closure_is_cheap) {
-            const long long core_budget = static_cast<long long>(
-                std::min<long double>(50'000.0L,
-                    std::max<long double>(2'000.0L, estimated_half_work / 4.0L)));
-
-            ExactCoreClosureResult closed =
-                try_exact_core_bound_stop(inst, items, global_bound.upper, incumbent,
-                                          incumbent_mult, core_budget);
-
-            result.stats.bb_nodes += closed.nodes;
-            if (closed.closed) {
-                result.solution = std::move(closed.solution);
-                return result;
-            }
-        }
-    }
-
-    // Dynamic reduced-core exact path.
-    //
-    // This replaces the bad behavior where a very reduced core still paid for
-    // half-split/sequence infrastructure.  The decision is not a fixed item
-    // threshold: it compares estimated exact full-DP work with the structural
-    // prefix work that the half-split would have to do.  If the reduced core is
-    // cheap enough to solve directly, do so and return.
-    {
-        Weight reduced_wmax = 0;
-        long long feasible_items = 0;
-        for (const Item& it : items) {
-            if (it.w > 0 && it.w <= inst.capacity) {
-                reduced_wmax = std::max(reduced_wmax, it.w);
-                ++feasible_items;
-            }
-        }
-        if (reduced_wmax <= 0) reduced_wmax = 1;
-
-        const Weight reduced_prefix =
-            std::min<Weight>(inst.capacity, ((inst.capacity + 1) / 2) + reduced_wmax);
-
-        const long double full_work =
-            static_cast<long double>(std::max<Weight>(1, inst.capacity)) *
-            static_cast<long double>(std::max<long long>(1, feasible_items));
-        const long double half_work =
-            static_cast<long double>(std::max<Weight>(1, reduced_prefix)) *
-            static_cast<long double>(std::max<long long>(1, feasible_items));
-
-        const bool reduced_core_is_cheaper =
-            full_work <= std::max<long double>(2'000'000.0L, 1.35L * half_work);
-
-        if (reduced_core_is_cheaper) {
-            const long long exact_budget = static_cast<long long>(
-                std::min<long double>(50'000'000.0L, std::max<long double>(2'000'000.0L, 2.0L * full_work)));
-
-            ExactReducedCoreResult exact =
-                solve_reduced_core_exact(inst, items, exact_budget);
-
-            result.stats.states_scanned += exact.states_scanned;
-            if (exact.solved) {
-                result.solution = std::move(exact.solution);
-                return result;
-            }
-        }
-    }
-
-    // ---------------------------------------------------------------------
-    // Dynamic OCaml-like backend controller.
-    //
-    // PYAsUKP does not choose a path using a fixed item-count cutoff.  It lets
-    // the structure of the sequence/slice computation decide: if the sequence is
-    // sparse and progresses quickly, the sequence backend is useful; if it starts
-    // behaving like a dense table, the algorithm should not keep paying that
-    // overhead.
-    //
-    // This controller therefore runs only short probes of the sequence/slice
-    // backends.  A probe may finish the instance exactly.  If it does not, the
-    // solver does not spend a large fixed budget there; it falls through to the
-    // exact half-split hot loop with PYAsUKP threshold dominance.  Correctness is
-    // unchanged because an unfinished probe is ignored.
-    // ---------------------------------------------------------------------
-    {
-        Weight probe_wmax = 0;
-        Weight probe_wmin = inst.capacity;
-        for (const Item& it : items) {
-            probe_wmax = std::max(probe_wmax, it.w);
-            probe_wmin = std::min(probe_wmin, it.w);
-        }
-        if (probe_wmax <= 0) probe_wmax = 1;
-        if (probe_wmin <= 0 || probe_wmin > inst.capacity) probe_wmin = 1;
-
-        const Weight probe_prefix_limit =
-            std::min<Weight>(inst.capacity, ((inst.capacity + 1) / 2) + probe_wmax);
-
-        const Weight probe_slice_height = std::max<Weight>(
-            1,
-            std::max<Weight>(probe_wmin,
-                             std::min<Weight>(32768,
-                                              std::max<Weight>(4096, probe_wmax / 8))));
-
-        // Probe budget is capacity-relative, not item-count-relative.  This is a
-        // dynamic guard against dense sequence behavior: if the sequence backend
-        // cannot solve with a small amount of work relative to the prefix, it is
-        // not behaving like PYAsUKP's compact sequence on this instance.
-        const long long prefix_scale = static_cast<long long>(
-            std::max<Weight>(1, std::min<Weight>(probe_prefix_limit, 2'000'000)));
-        const long long slice_probe_budget =
-            std::max<long long>(64'000, std::min<long long>(5'000'000, 4 * prefix_scale));
-        const long long seq_probe_budget =
-            std::max<long long>(64'000, std::min<long long>(4'000'000, 3 * prefix_scale));
-
-        const std::size_t probe_points =
-            static_cast<std::size_t>(std::min<Weight>(probe_prefix_limit + 1, 750'000));
-
-        SliceMergeHalfResult merge =
-            try_slice_one_merge_half_split(inst, items, probe_prefix_limit,
-                                           probe_slice_height,
-                                           slice_probe_budget,
-                                           probe_points);
-
-        result.stats.states_scanned += merge.states_scanned;
-        if (merge.solved) {
-            result.stats.states_kept += merge.critical_points;
-            result.solution = std::move(merge.solution);
+        incumbent_solution.consider(core.profit, core_weight, core.multiplicity);
+        UKP_BASIC_STATS(
+            result.stats.bb_nodes += core.nodes;
+            result.stats.items_removed_core_multiple += core.multiple_removed;
+            result.stats.items_removed_modular += core.modular_removed;
+        );
+        if (core.closed) {
+            result.solution = incumbent_solution.solution("optimized");
+            UKP_BASIC_STATS(
+                result.stats.active_items_final = static_cast<long long>(dp_items.size());
+                result.stats.stop_reason = "core_bound_closed";
+            );
+            publish_context_telemetry();
             return result;
         }
-
-        // Try the queue-driven sequence probe only if the slice probe did not
-        // already exhaust a dense amount of work.  This avoids the pathological
-        // behavior observed on highly reduced instances, where speculative
-        // sequence attempts were more expensive than the exact small-core DP.
-        if (merge.states_scanned < slice_probe_budget / 2) {
-            SequenceDrivenHalfResult seq =
-                try_sequence_driven_half_split(inst, items, probe_prefix_limit,
-                                               seq_probe_budget,
-                                               probe_points);
-
-            result.stats.states_scanned += seq.states_scanned;
-            if (seq.solved) {
-                result.stats.states_kept += seq.critical_points;
-                result.solution = std::move(seq.solution);
-                return result;
-            }
-        }
     }
 
-    // ---------------------------------------------------------------------
-    // EDUK2-inspired optimized DP phase.
-    //
-    // This version preserves the previous adaptive B&B/bound policy, but
-    // replaces the full-capacity dense DP by a half-capacity split in the
-    // spirit of EDUK2/PYAsUKP's c/2 stopping behavior.  The solver computes
-    // exact DP values only up to
-    //
-    //     L = ceil(c/2) + wmax(active items),
-    //
-    // then composes two partial solutions with capacities a and b such that
-    // a + b <= c.  This is exact for UKP: any feasible solution of total
-    // weight <= c can be partitioned into two submultisets whose weights are
-    // both <= ceil(c/2)+wmax, because each item has weight at most wmax.
-    //
-    // The implementation also keeps:
-    //   - sequence_result-like critical points;
-    //   - last contribution per item;
-    //   - slice/layer execution;
-    //   - PYAsUKP threshold dominance at slice boundaries;
-    //   - sparse backtracking metadata for critical points;
-    //   - contiguous arrays for cache efficiency.
-    // ---------------------------------------------------------------------
+    // State fathoming must use the immutable global post-reduction context.
+    // Threshold dominance shrinks `ctx` during the DP, but states already
+    // materialized in CriticalSequence can still contain items removed from
+    // that residual context and can later participate in the c/2 split.
+    // Using the shrinking context here can therefore underestimate a state's
+    // remaining potential and incorrectly suppress descendants needed by the
+    // final historical-state reconstruction.
+    const BoundContext state_bound_ctx = ctx;
 
-    std::vector<Item> dp_items = items;
-    std::sort(dp_items.begin(), dp_items.end(),
-        [](const Item& a, const Item& b) {
-            if (a.w != b.w) return a.w < b.w;
-            return better_ratio(a, b);
+    PhaseTimer<kFullStats> dp_phase(result.stats.phase_dp_ns);
+
+    // Select.next_lightest traverses the residual items by nondecreasing
+    // weight.  Equal-weight candidates retain the ratio/id order already
+    // prescribed by better_ratio, so an inferior duplicate is never made
+    // active before its dominating peer.
+    std::vector<detail::ActiveItem> items_by_weight;
+    items_by_weight.reserve(dp_items.size());
+    for (std::size_t rank = 0; rank < dp_items.size(); ++rank) {
+        const Item& item = dp_items[rank];
+        if (item.w <= inst.capacity) {
+            items_by_weight.push_back(detail::ActiveItem{
+                item.id, static_cast<int>(rank), item.w, item.p});
+        }
+    }
+    std::stable_sort(items_by_weight.begin(), items_by_weight.end(),
+        [](const detail::ActiveItem& left, const detail::ActiveItem& right) {
+            if (left.w != right.w) return left.w < right.w;
+            return left.tie_rank < right.tie_rank;
         });
+    std::size_t next_item = 0;
 
-    // Cache-friendly representation for the hot DP loop.
-    //
-    // The EDUK2/PYAsUKP mechanisms above still determine the algorithmic flow:
-    // c/2 stopping, sequence attempts, slices, threshold dominance, and sparse
-    // backtracking.  This block only changes the physical representation used by
-    // the fallback exact DP.  It keeps the current semantics, but avoids repeated
-    // Item object loads and the branch `it.w > y` inside the innermost loop.
-    std::vector<Weight> item_w;
-    std::vector<Profit> item_p;
-    std::vector<int> item_id;
-    item_w.reserve(dp_items.size());
-    item_p.reserve(dp_items.size());
-    item_id.reserve(dp_items.size());
-    for (const Item& it : dp_items) {
-        item_w.push_back(it.w);
-        item_p.push_back(it.p);
-        item_id.push_back(it.id);
-    }
+    // `active_items` has the same role as PYAsUKP's decreasingS: it contains
+    // only introduced, threshold-undominated items and stays ratio ordered.
+    std::vector<detail::ActiveItem> active_items;
+    active_items.reserve(dp_items.size());
 
-    const Item best_periodic = ctx.best;
-
-    Weight wmax_active = 0;
-    Weight wmin_active = inst.capacity;
-    for (const Item& it : dp_items) {
-        wmax_active = std::max(wmax_active, it.w);
-        wmin_active = std::min(wmin_active, it.w);
-    }
-    if (wmin_active <= 0 || wmin_active > inst.capacity) wmin_active = 1;
-    if (wmax_active <= 0) wmax_active = 1;
-
+    // The sequence is the DP representation: it stores only strict increases
+    // of f(N, y), in topological weight order.
+    detail::CriticalSequence sequence;
+    sequence.configure_item_order(dp_items);
+    constexpr Weight kNoContribution = std::numeric_limits<Weight>::min();
+    std::vector<Weight> last_contribution(inst.items.size(), kNoContribution);
+    auto contribution_slot = [&](int item_id) -> Weight& {
+        if (item_id < 0 || static_cast<std::size_t>(item_id) >= last_contribution.size()) {
+            throw std::logic_error("item id is outside contribution table");
+        }
+        return last_contribution[static_cast<std::size_t>(item_id)];
+    };
+    const Weight wmin = items_by_weight.empty() ? Weight{1} : items_by_weight.front().w;
+    // PYAsUKP's executable defaults layer_height to 100 and then takes the
+    // maximum with the lightest weight during reduction.
+    Weight h = options_.slice_height > 0 ? options_.slice_height : std::max<Weight>(100, wmin);
+    if (h <= 0) h = 1;
     const Weight half_capacity = (inst.capacity + 1) / 2;
-    const Weight compute_limit_w = std::min<Weight>(inst.capacity, half_capacity + wmax_active);
-    const size_t cap = static_cast<size_t>(compute_limit_w);
-
-    std::vector<Profit> dp(cap + 1, 0);
-    std::vector<int> last(cap + 1, -1);
-    std::vector<Weight> prev(cap + 1, 0);
-
-    const std::size_t id_count = inst.items.size();
-    std::vector<unsigned char> active_by_id(id_count, 1);
-    std::vector<unsigned char> active_local(dp_items.size(), 1);
-    bool has_inactive_local = false;
-    std::vector<Weight> last_contribution_by_id(id_count, 0);
-    std::vector<long long> contribution_count_by_id(id_count, 0);
-
-    // Runtime instrumentation for comparison with PYAsUKP.
-    //
-    // PYAsUKP reports dynamic quantities such as "Remaining undominated items"
-    // and "Not collectively dominated items" after the slice/dominance process.
-    // items_after_preprocess is static, so it should not be compared directly.
-    long long active_items_final = static_cast<long long>(dp_items.size());
-    long long not_collectively_dominated_final = static_cast<long long>(dp_items.size());
-    long long dynamic_collective_removed = 0;
-    long long period_last_contribution_hits = 0;
-
-    // The last-contribution observation is useful instrumentation, but it is
-    // not by itself a replacement certificate for a capacity-indexed DP.  In
-    // particular, an item that has not won a state in one slice can still be
-    // required as the predecessor of a later capacity.  Treating that
-    // observation as a global deletion caused exnsdbis10.ukp to lose a feasible
-    // solution of value 1,028,035 and return 1,028,030 instead.
-    //
-    // Keep the exact DP item set unchanged until a formal contextual
-    // dominance certificate is implemented.  Likewise, do not use the
-    // last-contribution observation to stop for periodicity.  The final c/2
-    // composition below remains exact with the complete reduced item set.
-    constexpr bool kEnableUncertifiedDynamicReduction = false;
-    constexpr bool kEnableUncertifiedPeriodStop = false;
-
-    auto rebuild_compact_active_items = [&]() {
-        std::vector<Item> compact;
-        compact.reserve(dp_items.size());
-        for (const Item& it : dp_items) {
-            if (it.id >= 0 && static_cast<std::size_t>(it.id) < active_by_id.size() &&
-                active_by_id[static_cast<std::size_t>(it.id)]) {
-                compact.push_back(it);
+    const Weight introduction_limit = items_by_weight.empty() ? Weight{0} : items_by_weight.back().w;
+    // EDUK first finishes its reduction through the heaviest candidate item;
+    // EDUK2 then reaches c/2 and extends once by the heaviest item that
+    // survived threshold dominance.
+    const Weight initial_process_limit = std::max(half_capacity, introduction_limit);
+    const Weight candidate_limit = inst.capacity;
+    Weight process_limit = initial_process_limit;
+    constexpr Weight kMaximumSliceReserve = 1U << 16;
+    const __int128 desired_process_limit =
+        static_cast<__int128>(initial_process_limit) + introduction_limit;
+    const Weight expected_process_limit = desired_process_limit >= inst.capacity
+        ? inst.capacity : static_cast<Weight>(desired_process_limit);
+    const Weight estimated_slice_count = std::min(
+        kMaximumSliceReserve, expected_process_limit / h + 2);
+    UKP_FULL_STATS(
+        result.stats.slices.reserve(static_cast<std::size_t>(estimated_slice_count));
+    );
+    bool half_capacity_extension_done = false;
+    bool closed_by_bound = false;
+    bool periodicity_detected = false;
+    detail::PointId periodicity_base = detail::no_point;
+    long long periodicity_best_copies = 0;
+    std::array<long long, kBoundTypes.size()> contextual_bound_counts{};
+    std::array<long long, kBoundTypes.size()> contextual_bound_evaluations{};
+    std::array<long long, kBoundTypes.size()> contextual_bound_state_wins{};
+    std::array<long long, kBoundTypes.size()> contextual_bound_item_wins{};
+    std::array<long long, kBoundTypes.size()> contextual_bound_fathoms{};
+    auto record_contextual_bound = [&](const detail::BoundDecision& decision,
+                                       auto& slice) {
+        if constexpr (kFullStats) {
+            for (std::size_t index = 0; index < 4; ++index) {
+                if ((decision.evaluated_mask & (std::uint8_t{1} << index)) != 0) {
+                    ++contextual_bound_evaluations[index];
+                }
             }
+            if (decision.evaluated_mask == 0 || decision.witness == BoundType::Both) {
+                return;
+            }
+            ++contextual_bound_counts[bound_type_index(decision.witness)];
+            const char* name = ::ukp::bound_type_name(decision.witness);
+            if (slice.contextual_bound_used != name) slice.contextual_bound_used = name;
+        } else {
+            (void)decision;
+            (void)slice;
         }
-        dp_items.swap(compact);
-        item_w.clear();
-        item_p.clear();
-        item_id.clear();
-        item_w.reserve(dp_items.size());
-        item_p.reserve(dp_items.size());
-        item_id.reserve(dp_items.size());
-        for (const Item& it : dp_items) {
-            item_w.push_back(it.w);
-            item_p.push_back(it.p);
-            item_id.push_back(it.id);
+    };
+    auto record_bound_decision = [&](const detail::BoundDecision& decision) {
+        if constexpr (kFullStats) {
+            detail::accumulate_bound_decision_telemetry(
+                bound_decision_telemetry_ptr, decision);
+        } else {
+            (void)decision;
         }
-        active_local.assign(dp_items.size(), 1);
-        has_inactive_local = false;
+    };
+    auto publish_dp_telemetry = [&]() {
+        if constexpr (kFullStats) {
+            for (std::size_t index = 0; index < kBoundTypes.size(); ++index) {
+                if (contextual_bound_counts[index] != 0) {
+                    result.stats.contextual_bound_calls[
+                        ::ukp::bound_type_name(kBoundTypes[index])] =
+                            contextual_bound_counts[index];
+                    result.stats.contextual_bound_wins[
+                        ::ukp::bound_type_name(kBoundTypes[index])] =
+                            contextual_bound_counts[index];
+                }
+                if (contextual_bound_evaluations[index] != 0) {
+                    result.stats.contextual_bound_evaluations[
+                        ::ukp::bound_type_name(kBoundTypes[index])] =
+                            contextual_bound_evaluations[index];
+                }
+                if (contextual_bound_state_wins[index] != 0) {
+                    result.stats.contextual_bound_state_wins[
+                        ::ukp::bound_type_name(kBoundTypes[index])] =
+                            contextual_bound_state_wins[index];
+                }
+                if (contextual_bound_item_wins[index] != 0) {
+                    result.stats.contextual_bound_item_wins[
+                        ::ukp::bound_type_name(kBoundTypes[index])] =
+                            contextual_bound_item_wins[index];
+                }
+                if (contextual_bound_fathoms[index] != 0) {
+                    result.stats.contextual_bound_fathoms[
+                        ::ukp::bound_type_name(kBoundTypes[index])] =
+                            contextual_bound_fathoms[index];
+                }
+            }
+            result.stats.candidates_stored = sequence.candidates_stored();
+            result.stats.computed_window_collisions =
+                sequence.computed_window_collisions();
+            result.stats.computed_window_replacements =
+                sequence.computed_window_replacements();
+            result.stats.computed_window_rejections =
+                sequence.computed_window_rejections();
+            result.stats.computed_window_index_collisions =
+                sequence.computed_window_index_collisions();
+            publish_context_telemetry();
+        }
+    };
+    // Most greedy completions do not improve the incumbent.  Keep one
+    // reconstruction buffer for the rare candidates that do, and remember the
+    // positions written so clearing it does not become another O(n) pass.
+    std::vector<long long> reconstruction_multiplicity;
+    std::vector<int> reconstruction_touched_ids;
+    reconstruction_touched_ids.reserve(dp_items.size());
+
+    // Greedy completion retains the active-item order.  This suffix minimum
+    // only lets it stop once no remaining item can fit; it never changes
+    // which item would be considered next.
+    std::vector<Weight> active_suffix_min_weight;
+    auto rebuild_active_suffix_min_weight = [&]() {
+        if (use_bound_completion) {
+            active_suffix_min_weight.clear();
+            return;
+        }
+        UKP_FULL_STATS(++result.stats.suffix_rebuilds;);
+        active_suffix_min_weight.resize(active_items.size());
+        if (active_items.empty()) return;
+        Weight minimum_weight = active_items.back().w;
+        for (std::size_t index = active_items.size(); index-- > 0;) {
+            minimum_weight = std::min(minimum_weight, active_items[index].w);
+            active_suffix_min_weight[index] = minimum_weight;
+        }
+    };
+    rebuild_active_suffix_min_weight();
+
+    auto ensure_active_suffix_min_weight = [&]() {
+        if (active_suffix_min_weight.size() != active_items.size()) {
+            rebuild_active_suffix_min_weight();
+        }
     };
 
-    struct CriticalPoint {
-        Weight w = 0;
-        Profit p = 0;
-        Weight prev_w = 0;
-        int last_item = -1;
-    };
+    ResidualDelta residual_delta(inst.items.size());
+    std::vector<detail::ActiveItem> residual_survivors;
+    residual_survivors.reserve(dp_items.size());
 
-    std::vector<CriticalPoint> sequence_result;
-    sequence_result.reserve(static_cast<std::size_t>(
-        std::min<Weight>(compute_limit_w + 1, 2'000'000)));
-    sequence_result.push_back(CriticalPoint{0, 0, 0, -1});
-
-    std::unordered_map<Weight, CriticalPoint> sparse_pred;
-    sparse_pred.reserve(1 << 20);
-    sparse_pred.emplace(0, CriticalPoint{0, 0, 0, -1});
-
-    // PYAsUKP threshold dominance.
-    //
-    // OCaml dominance.ml:
-    //   threshold_test last_contribution weight capacity =
-    //       last_contribution + weight <= capacity
-    //
-    // Interpretation: once item k has not contributed in a whole interval of
-    // length at least w_k up to the current slice upper bound, it is threshold
-    // dominated and never needs to be used again.  This is the key dynamic
-    // reduction that the earlier C++ versions were missing.
-    auto threshold_dominated_dynamic = [&](const Item& it, Weight capacity) -> bool {
-        if (it.id < 0 || static_cast<std::size_t>(it.id) >= last_contribution_by_id.size()) {
-            return false;
+    auto consider_greedy_completion = [&](detail::PointId state_index) {
+        UKP_BASIC_STATS(++result.stats.greedy_completion_calls;);
+        ensure_active_suffix_min_weight();
+        const detail::State& state = sequence.state(state_index);
+        Weight used_weight = state.weight;
+        Weight remaining = inst.capacity - used_weight;
+        Profit candidate_profit = state.profit;
+        for (std::size_t index = 0; index < active_items.size(); ++index) {
+            UKP_BASIC_STATS(++result.stats.greedy_completion_item_scans;);
+            if (remaining < active_suffix_min_weight[index]) break;
+            const detail::ActiveItem& item = active_items[index];
+            if (item.w > remaining) continue;
+            const long long copies = remaining / item.w;
+            const Weight added_weight = safe_mul(copies, item.w);
+            used_weight += added_weight;
+            remaining -= added_weight;
+            candidate_profit = safe_add(candidate_profit, safe_mul(copies, item.p));
         }
-        const Weight last_contribution = last_contribution_by_id[static_cast<std::size_t>(it.id)];
-        return safe_add(last_contribution, it.w) <= capacity;
+
+        // Keep this predicate in sync with Incumbent::consider.  In particular,
+        // a tied profit only wins when it uses more weight.
+        if (candidate_profit < incumbent_solution.profit ||
+            (candidate_profit == incumbent_solution.profit &&
+             used_weight <= incumbent_solution.weight)) {
+            return;
+        }
+
+        if (reconstruction_multiplicity.empty()) {
+            reconstruction_multiplicity.assign(inst.items.size(), 0);
+        }
+        for (detail::PointId cursor = state_index; cursor != detail::no_point;
+             cursor = sequence.state(cursor).predecessor) {
+            const int item_id = sequence.state(cursor).item_id;
+            if (item_id < 0) break;
+            UKP_BASIC_STATS(++result.stats.greedy_completion_reconstruction_steps;);
+            long long& count = reconstruction_multiplicity[static_cast<std::size_t>(item_id)];
+            if (count == 0) reconstruction_touched_ids.push_back(item_id);
+            ++count;
+        }
+        Weight reconstruction_weight = state.weight;
+        Weight reconstruction_remaining = inst.capacity - reconstruction_weight;
+        for (std::size_t index = 0; index < active_items.size(); ++index) {
+            UKP_BASIC_STATS(++result.stats.greedy_completion_reconstruction_steps;);
+            if (reconstruction_remaining < active_suffix_min_weight[index]) break;
+            const detail::ActiveItem& item = active_items[index];
+            if (item.w > reconstruction_remaining) continue;
+            const long long copies = reconstruction_remaining / item.w;
+            long long& count = reconstruction_multiplicity[static_cast<std::size_t>(item.id)];
+            if (count == 0) reconstruction_touched_ids.push_back(item.id);
+            count += copies;
+            const Weight added_weight = safe_mul(copies, item.w);
+            reconstruction_weight += added_weight;
+            reconstruction_remaining -= added_weight;
+        }
+
+        if (incumbent_solution.consider_sparse(candidate_profit, used_weight,
+                                               reconstruction_multiplicity,
+                                               reconstruction_touched_ids)) {
+            incumbent = incumbent_solution.profit;
+            residual_delta.incumbent_changed = true;
+            UKP_BASIC_STATS(
+                ++result.stats.incumbent_improvements_dp;
+                ++result.stats.greedy_completion_improvements;
+            );
+        }
+        for (const int item_id : reconstruction_touched_ids) {
+            reconstruction_multiplicity[static_cast<std::size_t>(item_id)] = 0;
+        }
+        reconstruction_touched_ids.clear();
     };
 
-    auto active_count = [&]() -> long long {
-        long long count = 0;
-        for (const Item& it : dp_items) {
-            if (it.id >= 0 && static_cast<std::size_t>(it.id) < active_by_id.size() &&
-                active_by_id[static_cast<std::size_t>(it.id)]) {
+    auto consider_bound_completion = [&](detail::PointId state_index) {
+        UKP_BASIC_STATS(
+            ++result.stats.bound_completion_calls;
+            switch (pyasukp_completion_policy) {
+                case BoundPolicy::U3:
+                    ++result.stats.bound_completion_u3_calls;
+                    break;
+                case BoundPolicy::V:
+                    ++result.stats.bound_completion_v_calls;
+                    break;
+                case BoundPolicy::PyasukpBoth:
+                    ++result.stats.bound_completion_both_calls;
+                    break;
+                default:
+                    break;
+            }
+        );
+
+        const detail::State& state = sequence.state(state_index);
+        const Weight residual_capacity = inst.capacity - state.weight;
+        if (bound_completion_context == nullptr) {
+            throw std::logic_error("bound completion context was not initialized");
+        }
+        const detail::FeasibleCompletion completion =
+            detail::complete_with_bound(
+                *bound_completion_context, pyasukp_completion_policy,
+                residual_capacity);
+        const Profit candidate_profit =
+            safe_add(state.profit, completion.profit);
+        const Weight candidate_weight =
+            safe_add(state.weight, completion.weight);
+
+        if (candidate_profit < incumbent_solution.profit ||
+            (candidate_profit == incumbent_solution.profit &&
+             candidate_weight <= incumbent_solution.weight)) {
+            return;
+        }
+
+        if (reconstruction_multiplicity.empty()) {
+            reconstruction_multiplicity.assign(inst.items.size(), 0);
+        }
+        for (detail::PointId cursor = state_index; cursor != detail::no_point;
+             cursor = sequence.state(cursor).predecessor) {
+            const int item_id = sequence.state(cursor).item_id;
+            if (item_id < 0) break;
+            UKP_BASIC_STATS(++result.stats.bound_completion_reconstruction_steps;);
+            long long& count =
+                reconstruction_multiplicity[static_cast<std::size_t>(item_id)];
+            if (count == 0) reconstruction_touched_ids.push_back(item_id);
+            ++count;
+        }
+        for (std::size_t index = 0; index < completion.term_count; ++index) {
+            const detail::CompletionTerm& term = completion.terms[index];
+            if (term.count <= 0) continue;
+            if (term.item_id < 0 ||
+                static_cast<std::size_t>(term.item_id) >=
+                    reconstruction_multiplicity.size()) {
+                throw std::logic_error(
+                    "bound completion item id is outside multiplicity");
+            }
+            UKP_BASIC_STATS(++result.stats.bound_completion_reconstruction_steps;);
+            long long& count = reconstruction_multiplicity[
+                static_cast<std::size_t>(term.item_id)];
+            if (count == 0) reconstruction_touched_ids.push_back(term.item_id);
+            count += term.count;
+        }
+
+        if (incumbent_solution.consider_sparse(
+                candidate_profit, candidate_weight,
+                reconstruction_multiplicity, reconstruction_touched_ids,
+                state_index)) {
+            incumbent = incumbent_solution.profit;
+            residual_delta.incumbent_changed = true;
+            UKP_BASIC_STATS(
+                ++result.stats.incumbent_improvements_dp;
+                ++result.stats.bound_completion_improvements;
+            );
+        }
+        for (const int item_id : reconstruction_touched_ids) {
+            reconstruction_multiplicity[static_cast<std::size_t>(item_id)] = 0;
+        }
+        reconstruction_touched_ids.clear();
+    };
+
+    // PYAsUKP switches Init.rwith_wp to Bounds.bound_up_half_c once c' has
+    // been reached.  From that point on, every residual capacity c-y is in
+    // the already solved prefix, so sequence_result gives an exact residual
+    // completion rather than an MT/V estimate.
+    auto consider_half_capacity_completion = [&](detail::PointId state_index) {
+        const detail::State& state = sequence.state(state_index);
+        const Weight residual_capacity = inst.capacity - state.weight;
+        const detail::PointId partner_index =
+            sequence.expandable_state_at_or_before(residual_capacity);
+        const detail::State& partner = sequence.state(partner_index);
+        const Profit candidate_profit = safe_add(state.profit, partner.profit);
+        const Weight candidate_weight = safe_add(state.weight, partner.weight);
+
+        if (candidate_profit < incumbent_solution.profit ||
+            (candidate_profit == incumbent_solution.profit &&
+             candidate_weight <= incumbent_solution.weight)) {
+            return candidate_profit;
+        }
+
+        if (reconstruction_multiplicity.empty()) {
+            reconstruction_multiplicity.assign(inst.items.size(), 0);
+        }
+        auto add_chain = [&](detail::PointId cursor) {
+            for (; cursor != detail::no_point;
+                 cursor = sequence.state(cursor).predecessor) {
+                const int item_id = sequence.state(cursor).item_id;
+                if (item_id < 0) break;
+                long long& count = reconstruction_multiplicity[
+                    static_cast<std::size_t>(item_id)];
+                if (count == 0) reconstruction_touched_ids.push_back(item_id);
                 ++count;
             }
+        };
+        add_chain(state_index);
+        add_chain(partner_index);
+
+        if (incumbent_solution.consider_sparse(
+                candidate_profit, candidate_weight,
+                reconstruction_multiplicity, reconstruction_touched_ids,
+                state_index)) {
+            incumbent = incumbent_solution.profit;
+            residual_delta.incumbent_changed = true;
+            UKP_BASIC_STATS(++result.stats.incumbent_improvements_dp;);
         }
-        return count;
+        for (const int item_id : reconstruction_touched_ids) {
+            reconstruction_multiplicity[static_cast<std::size_t>(item_id)] = 0;
+        }
+        reconstruction_touched_ids.clear();
+        return candidate_profit;
     };
 
-    auto refresh_dynamic_item_counters = [&]() {
-        active_items_final = active_count();
-        not_collectively_dominated_final = active_items_final;
-    };
+    auto commit_residual_delta = [&](bool solver_will_continue) {
+        if (!residual_delta.requested()) return;
 
-    auto recompute_active_wmax = [&]() {
-        Weight wm = 0;
-        for (const Item& it : dp_items) {
-            if (it.id >= 0 && static_cast<std::size_t>(it.id) < active_by_id.size() &&
-                active_by_id[static_cast<std::size_t>(it.id)]) {
-                wm = std::max(wm, it.w);
-            }
-        }
-        wmax_active = std::max<Weight>(1, wm);
-    };
+        UKP_FULL_STATS(
+            ++result.stats.residual_transactions;
+            result.stats.duplicate_removal_requests +=
+                residual_delta.duplicate_requests;
+        );
 
-    // Periodicity by last contribution.
-    //
-    // Conservative PYAsUKP-like certificate: after a finalized slice yb, if
-    // every active non-best item has completed at least one own-weight interval
-    // without contributing to the envelope, the suffix can be completed with the
-    // best item periodically.  This may detect the period earlier than the
-    // contiguous best-item window certificate.
-    auto period_by_last_contribution = [&](Weight yb) -> bool {
-        if (yb < safe_add(wmax_active, best_periodic.w)) {
-            return false;
-        }
-
-        for (const Item& it : dp_items) {
-            if (it.id < 0) continue;
-            const std::size_t id = static_cast<std::size_t>(it.id);
-            if (id >= active_by_id.size() || !active_by_id[id]) continue;
-            if (it.id == best_periodic.id) continue;
-
-            const Weight last_y = last_contribution_by_id[id];
-
-            if (contribution_count_by_id[id] == 0) {
-                if (yb < safe_add(wmax_active, it.w)) {
-                    return false;
-                }
+        long long removed_now = 0;
+        for (const int item_id : residual_delta.removed_ids) {
+            unsigned char& alive =
+                residual_item_alive[static_cast<std::size_t>(item_id)];
+            if (alive == 0) {
+                UKP_FULL_STATS(++result.stats.duplicate_removal_requests;);
                 continue;
             }
+            alive = 0;
+            ++removed_now;
+        }
+        UKP_FULL_STATS(result.stats.residual_items_removed += removed_now;);
 
-            if (safe_add(last_y, it.w) > yb) {
-                return false;
+        // Threshold dominance is decided only after the slice has been fully
+        // materialized. Removing the item from active_items here preserves all
+        // candidates from this slice and permanently stops its cursor before
+        // the next one.
+        if (!residual_delta.active_items_to_remove.empty()) {
+            for (const detail::ActiveItem& item :
+                 residual_delta.active_items_to_remove) {
+                sequence.stop_item_after_slice(item);
+            }
+            residual_survivors.clear();
+            for (const detail::ActiveItem& item : active_items) {
+                if (!residual_delta.contains(item.id)) {
+                    residual_survivors.push_back(item);
+                }
+            }
+            if (residual_survivors.size() != active_items.size()) {
+                active_items.swap(residual_survivors);
+                rebuild_active_suffix_min_weight();
             }
         }
 
-        return true;
+        // A terminal slice never queries the context again.  With bounds
+        // disabled, the shrinking residual context is likewise unused.
+        if (!solver_will_continue || !options_.use_bounds) return;
+
+        UKP_FULL_STATS(++result.stats.context_rebuilds_requested;);
+        if (removed_now == 0) {
+            UKP_FULL_STATS(++result.stats.context_rebuilds_skipped_no_change;);
+            return;
+        }
+
+        const std::size_t previous_context_size = ctx.items.size();
+        apply_bound_context_removals(
+            ctx, residual_delta.removed_ids,
+            residual_delta.removal_requested_by_id, context_telemetry_ptr);
+        if (previous_context_size - ctx.items.size() !=
+            static_cast<std::size_t>(removed_now)) {
+            throw std::logic_error(
+                "incremental BoundContext removed an unexpected number of items");
+        }
+#ifndef NDEBUG
+        verify_bound_context_against_full_rebuild(ctx);
+#else
+        if constexpr (kFullStats) {
+            // Full telemetry keeps the same oracle used during development,
+            // but benchmark builds compile this branch away entirely.
+            verify_bound_context_against_full_rebuild(ctx);
+        }
+#endif
     };
 
-    const Weight slice_height = std::max<Weight>(1, wmin_active);
-
-    std::vector<unsigned char> uses_best(cap + 1, 0);
-    long long periodic_window_count = 0;
-    Weight periodic_window = std::max<Weight>(1, wmax_active + 1);
-    Weight period_level = -1;
-    Weight computed_until = compute_limit_w;
-
-    // Residue-class periodicity certificate.
-    //
-    // The existing window certificate requires a full contiguous window where
-    // every capacity y satisfies:
-    //     dp[y] = dp[y - w_best] + p_best.
-    //
-    // This equivalent residue-based monitor can certify the same phenomenon
-    // earlier in practice.  For each residue modulo w_best, it counts consecutive
-    // successful applications of the best item recurrence.  Once every residue
-    // has been stable for enough consecutive cycles to cover the active maximum
-    // item weight, the remaining capacities are periodic and can be completed
-    // with copies of the best item.
-    //
-    // Correctness is preserved because stopping is allowed only after this
-    // explicit recurrence certificate is observed on finalized DP values.
-    const Weight best_w_period = std::max<Weight>(1, best_periodic.w);
-    const long long residue_required_streak =
-        std::max<long long>(1, (wmax_active + best_w_period - 1) / best_w_period + 1);
-    std::vector<int> residue_streak(static_cast<std::size_t>(best_w_period), 0);
-    std::vector<unsigned char> residue_certified(static_cast<std::size_t>(best_w_period), 0);
-    long long certified_residues = 0;
-
-    long long initial_interval = 65536;
-    long long bound_call_budget = 0;
-    if (!skip_hybrid && structurally_bb_friendly) {
-        initial_interval = 8192;
-        bound_call_budget = 8192;
-    } else if (!skip_hybrid && enable_dp_bound_sampling) {
-        initial_interval = 65536;
-        bound_call_budget = 1024;
-    }
-    BoundSampler sampler(ctx, inst.capacity, incumbent, initial_interval, bound_call_budget);
-
-    Weight ya = 0;
-    while (ya < compute_limit_w) {
-        const Weight yb = std::min<Weight>(compute_limit_w, ya + slice_height);
-
-        std::size_t usable_items = 0;
-        while (usable_items < item_w.size() && item_w[usable_items] <= ya) {
-            ++usable_items;
+    // Listing 1 mapping: build/process a slice; fathom its states with
+    // f(y)+U(c-y)<=z; greedily complete survivors; update contributions;
+    // apply threshold dominance at the completed boundary; then test stopping.
+    // After crossing c/2, extend once through the largest active-item range,
+    // as in EDUK2's `standard` recurrence.
+    for (Weight ya = 0; ya < process_limit;) {
+        const Weight yb = std::min(process_limit, ya + h);
+        residual_delta.begin_slice();
+        LocalSliceStats slice;
+        if constexpr (kFullStats) {
+            slice.begin = ya;
+            slice.end = yb;
+            slice.active_items_before = static_cast<long long>(active_items.size());
         }
-
-        for (Weight y = ya + 1; y <= yb; ++y) {
-            while (usable_items < item_w.size() && item_w[usable_items] <= y) {
-                ++usable_items;
-            }
-
-            Profit best_profit_y = dp[static_cast<size_t>(y)];
-            int best_last_y = last[static_cast<size_t>(y)];
-            Weight best_prev_y = prev[static_cast<size_t>(y)];
-
-            if (!has_inactive_local) {
-                for (std::size_t ii = 0; ii < usable_items; ++ii) {
-                    const Weight wi = item_w[ii];
-                    const Profit cand = safe_add(dp[static_cast<size_t>(y - wi)], item_p[ii]);
-                    if (cand > best_profit_y) {
-                        best_profit_y = cand;
-                        best_last_y = item_id[ii];
-                        best_prev_y = y - wi;
+        const std::size_t previous_next_item = next_item;
+        const detail::SliceBuildResult build = sequence.process_slice_incremental(
+            ya, yb, candidate_limit, active_items, items_by_weight, next_item,
+            [&](const detail::ActiveItem& item, Profit) {
+                if (options_.use_bounds && item.id != periodic_best.id) {
+                    // The residual BoundContext can be smaller than the set of
+                    // continuations already materialized in CriticalSequence.
+                    // Before allowing that context to reject a newly introduced
+                    // item, preserve the item whenever it can already combine
+                    // with a historical DP state to improve the incumbent.
+                    //
+                    // This is a feasible lower-bound witness, not a new pruning
+                    // rule: if item.p + f(c - item.w) > incumbent, no valid upper
+                    // bound may fathom the item at this introduction point.
+                    const Weight historical_residual = inst.capacity - item.w;
+                    const Profit historical_feasible = safe_add(
+                        item.p, sequence.value_at(historical_residual));
+                    if (historical_feasible > incumbent) {
+                        contribution_slot(item.id) = item.w;
+                        return true;
                     }
-                    result.stats.states_scanned++;
-                }
-            } else {
-                for (std::size_t ii = 0; ii < usable_items; ++ii) {
-                    if (!active_local[ii]) continue;
-                    const Weight wi = item_w[ii];
-                    const Profit cand = safe_add(dp[static_cast<size_t>(y - wi)], item_p[ii]);
-                    if (cand > best_profit_y) {
-                        best_profit_y = cand;
-                        best_last_y = item_id[ii];
-                        best_prev_y = y - wi;
+
+                    const detail::BoundDecision decision =
+                        detail::evaluate_candidate(
+                            ctx, item.w, item.p, inst.capacity, incumbent,
+                            effective_bound_policy);
+                    record_bound_decision(decision);
+                    if (decision.lower_filter_hit) {
+                        UKP_FULL_STATS(
+                            ++result.stats.contextual_bound_calls_avoided_by_lower;
+                            ++result.stats.contextual_bound_item_calls_avoided_by_lower;
+                        );
                     }
-                    result.stats.states_scanned++;
-                }
-            }
-
-            const bool changed = (best_profit_y != dp[static_cast<size_t>(y)] ||
-                                  best_last_y != last[static_cast<size_t>(y)]);
-
-            dp[static_cast<size_t>(y)] = best_profit_y;
-            last[static_cast<size_t>(y)] = best_last_y;
-            prev[static_cast<size_t>(y)] = best_prev_y;
-            if (best_profit_y > incumbent) incumbent = best_profit_y;
-
-            if (changed && best_last_y >= 0) {
-                CriticalPoint cp{y, best_profit_y, best_prev_y, best_last_y};
-                sequence_result.push_back(cp);
-                sparse_pred[y] = cp;
-
-                const std::size_t lid = static_cast<std::size_t>(best_last_y);
-                if (lid < last_contribution_by_id.size()) {
-                    last_contribution_by_id[lid] = y;
-                    ++contribution_count_by_id[lid];
-                }
-            }
-
-            if (options_.use_bounds && enable_dp_bound_sampling) {
-                sampler.incumbent = incumbent;
-                sampler.observe(y, best_profit_y);
-            }
-
-            bool has_optimal_with_best = false;
-            if (y >= best_periodic.w) {
-                const Profit with_best =
-                    safe_add(dp[static_cast<size_t>(y - best_periodic.w)], best_periodic.p);
-                has_optimal_with_best = (with_best == best_profit_y);
-            }
-
-            uses_best[static_cast<size_t>(y)] = has_optimal_with_best ? 1 : 0;
-            periodic_window_count += uses_best[static_cast<size_t>(y)];
-
-            if (y >= periodic_window) {
-                periodic_window_count -= uses_best[static_cast<size_t>(y - periodic_window)];
-            }
-
-            if (has_optimal_with_best && y >= best_w_period) {
-                const std::size_t r = static_cast<std::size_t>(y % best_w_period);
-                if (residue_streak[r] < std::numeric_limits<int>::max()) {
-                    ++residue_streak[r];
-                }
-                if (!residue_certified[r] &&
-                    residue_streak[r] >= residue_required_streak) {
-                    residue_certified[r] = 1;
-                    ++certified_residues;
-                }
-            } else if (best_w_period > 0) {
-                const std::size_t r = static_cast<std::size_t>(y % best_w_period);
-                if (r < residue_streak.size()) {
-                    residue_streak[r] = 0;
-                    if (residue_certified[r]) {
-                        residue_certified[r] = 0;
-                        --certified_residues;
+                    if (decision.evaluated_mask != 0) {
+                        UKP_BASIC_STATS(++result.stats.bound_calls;);
+                        UKP_FULL_STATS(++result.stats.contextual_bound_item_queries;);
+                        record_contextual_bound(decision, slice);
+                        UKP_FULL_STATS(
+                            ++contextual_bound_item_wins[
+                                bound_type_index(decision.witness)];
+                        );
+                    }
+                    if (decision.can_fathom) {
+                        // `ctx` is only the residual active context.  Threshold
+                        // dominance and earlier introduction decisions can remove
+                        // variables from it even though a not-yet-introduced item
+                        // may still need continuations represented by those
+                        // variables in the original EDUK recurrence.  Therefore a
+                        // residual-context fathom is only provisional.
+                        //
+                        // Recheck only prospective rejections against the immutable
+                        // pre-reduction context, matching PYAsUKP's `bound` lifetime.
+                        // The residual context remains the fast first-stage filter;
+                        // the item is rejected only if the stable context independently
+                        // certifies the same pruning decision.
+                        const detail::BoundDecision stable_decision =
+                            detail::evaluate_candidate(
+                                introduction_bound_ctx, item.w, item.p,
+                                inst.capacity, incumbent, effective_bound_policy);
+                        record_bound_decision(stable_decision);
+                        if (stable_decision.lower_filter_hit) {
+                            UKP_FULL_STATS(
+                                ++result.stats.contextual_bound_calls_avoided_by_lower;
+                                ++result.stats.contextual_bound_item_calls_avoided_by_lower;
+                            );
+                        }
+                        if (stable_decision.evaluated_mask != 0) {
+                            UKP_BASIC_STATS(++result.stats.bound_calls;);
+                            UKP_FULL_STATS(++result.stats.contextual_bound_item_queries;);
+                            record_contextual_bound(stable_decision, slice);
+                            UKP_FULL_STATS(
+                                ++contextual_bound_item_wins[
+                                    bound_type_index(stable_decision.witness)];
+                            );
+                        }
+                        if (stable_decision.can_fathom) return false;
                     }
                 }
-            }
-
-            if (kEnableUncertifiedPeriodStop && periodic_window > 0 &&
-                y >= periodic_window &&
-                periodic_window_count == static_cast<long long>(periodic_window)) {
-                period_level = y;
-                computed_until = y;
-                break;
-            }
-
-            if (kEnableUncertifiedPeriodStop && best_w_period > 0 &&
-                certified_residues == static_cast<long long>(best_w_period) &&
-                y >= periodic_window) {
-                period_level = y;
-                computed_until = y;
-                break;
-            }
-        }
-
-        if (period_level >= 0) break;
-
-        bool removed_any = false;
-        for (const Item& it : dp_items) {
-            if (it.id < 0 || static_cast<std::size_t>(it.id) >= active_by_id.size()) continue;
-            const std::size_t id = static_cast<std::size_t>(it.id);
-            if (!active_by_id[id]) continue;
-            if (kEnableUncertifiedDynamicReduction && threshold_dominated_dynamic(it, yb)) {
-                active_by_id[id] = 0;
-                ++dynamic_collective_removed;
-                const std::size_t local = static_cast<std::size_t>(&it - dp_items.data());
-                if (local < active_local.size()) {
-                    active_local[local] = 0;
-                    has_inactive_local = true;
+                contribution_slot(item.id) = item.w;
+                return true;
+            },
+            [&](detail::PointId state_index) {
+            const detail::State& state = sequence.state(state_index);
+            const int state_item_id = state.item_id;
+            UKP_FULL_STATS(++slice.states_entered;);
+            // PYAsUKP's transfert_in_sequence_result never fathoms a state
+            // whose last item is b.  Preserving that chain is an invariant of
+            // the threshold-based periodicity certificate and of fill_with_best.
+            if (options_.use_bounds && state_item_id != periodic_best.id &&
+                options_.paper_faithful_mode && half_capacity_extension_done) {
+                const Profit exact_completion =
+                    consider_half_capacity_completion(state_index);
+                // Bounds.is_context_dominated uses a strict comparison
+                // (u < z).  bound_up_half_c has u == z for this state, so an
+                // equal completion is kept exactly as in PYAsUKP.
+                if (exact_completion < incumbent) {
+                    UKP_BASIC_STATS(++result.stats.states_fathomed;);
+                    UKP_FULL_STATS(++slice.states_fathomed_by_bound;);
+                    return false;
                 }
-                removed_any = true;
+            } else if (options_.use_bounds && state_item_id != periodic_best.id) {
+                const detail::BoundDecision decision =
+                    detail::evaluate_candidate(
+                        state_bound_ctx, state.weight, state.profit, inst.capacity,
+                        incumbent, effective_bound_policy);
+                record_bound_decision(decision);
+                if (decision.lower_filter_hit) {
+                    UKP_FULL_STATS(
+                        ++result.stats.contextual_bound_calls_avoided_by_lower;
+                        ++result.stats.contextual_bound_state_calls_avoided_by_lower;
+                    );
+                }
+                if (decision.evaluated_mask != 0) {
+                    UKP_BASIC_STATS(++result.stats.bound_calls;);
+                    UKP_FULL_STATS(++result.stats.contextual_bound_state_queries;);
+                    record_contextual_bound(decision, slice);
+                    UKP_FULL_STATS(
+                        ++contextual_bound_state_wins[
+                            bound_type_index(decision.witness)];
+                    );
+                }
+                if (decision.can_fathom) {
+                    UKP_FULL_STATS(
+                        if (decision.evaluated_mask != 0) {
+                            ++contextual_bound_fathoms[
+                                bound_type_index(decision.witness)];
+                        }
+                        ++slice.states_fathomed_by_bound;
+                    );
+                    UKP_BASIC_STATS(++result.stats.states_fathomed;);
+                    return false;
+                }
+            }
+            // Change B replaces the later C++ greedy active-item scan with the
+            // O(1) feasible completion attached to PYAsUKP's selected bound.
+            // The switch is explicit so A/C retain the original baseline and
+            // B/BC differ only in incumbent completion.
+            if (!(options_.paper_faithful_mode && half_capacity_extension_done)) {
+                if (use_bound_completion) {
+                    consider_bound_completion(state_index);
+                } else {
+                    consider_greedy_completion(state_index);
+                }
+            }
+            // Every state exposed by the sequence is a strict skip-point.
+            if (state_item_id >= 0) contribution_slot(state_item_id) = state.weight;
+            UKP_BASIC_STATS(++result.stats.states_kept;);
+            UKP_FULL_STATS(++slice.states_kept;);
+            return true;
+        });
+        UKP_BASIC_STATS(
+            result.stats.states_scanned += build.states_entered;
+            result.stats.states_expanded += build.states_expanded;
+            result.stats.successor_attempts += build.successor_attempts;
+            result.stats.successor_item_scans += build.successor_item_scans;
+            result.stats.backfill_attempts += build.backfill_attempts;
+            result.stats.cursor_advances += build.cursor_advances;
+            result.stats.items_considered_for_introduction +=
+                build.items_considered_for_introduction;
+            result.stats.items_introduced += build.items_introduced;
+            result.stats.items_rejected_by_envelope += build.items_rejected_by_envelope;
+            result.stats.items_rejected_by_bound += build.items_rejected_by_bound;
+            result.stats.points_generated += build.points_generated;
+            result.stats.dp_capacity_processed = yb;
+        );
+        UKP_FULL_STATS(
+            result.stats.active_item_samples += build.active_item_samples;
+            result.stats.active_items_sum += build.active_items_sum;
+            result.stats.active_items_max = std::max(
+                result.stats.active_items_max, build.active_items_max);
+            for (std::size_t decile = 0;
+                 decile < result.stats.items_introduced_by_capacity_decile.size();
+                 ++decile) {
+                result.stats.items_introduced_by_capacity_decile[decile] +=
+                    build.items_introduced_by_capacity_decile[decile];
+                result.stats.items_introduced_by_reduction_decile[decile] +=
+                    build.items_introduced_by_reduction_decile[decile];
+            }
+        );
+        residual_delta.had_item_decisions = next_item != previous_next_item;
+        // Introduced items receive their initial contribution in the callback.
+        // A considered item that still has no contribution was rejected by the
+        // envelope or contextual bound and leaves the residual set.
+        for (std::size_t index = previous_next_item; index < next_item; ++index) {
+            const detail::ActiveItem& item = items_by_weight[index];
+            if (contribution_slot(item.id) == kNoContribution) {
+                residual_delta.request_removal(item.id);
             }
         }
-
-        if (removed_any) {
-            rebuild_compact_active_items();
-            recompute_active_wmax();
-            periodic_window = std::max<Weight>(1, wmax_active + 1);
-        }
-
-        refresh_dynamic_item_counters();
-
-        if (kEnableUncertifiedPeriodStop && period_by_last_contribution(yb)) {
-            ++period_last_contribution_hits;
-            period_level = yb;
-            computed_until = yb;
+        UKP_FULL_STATS(
+            slice.successor_attempts += build.successor_attempts;
+            slice.states_expanded += build.states_expanded;
+            slice.successor_item_scans += build.successor_item_scans;
+            slice.backfill_attempts += build.backfill_attempts;
+            slice.cursor_advances += build.cursor_advances;
+            slice.states_created += build.states_created;
+            slice.items_considered_for_introduction +=
+                build.items_considered_for_introduction;
+            slice.items_introduced += build.items_introduced;
+            slice.items_rejected_by_envelope += build.items_rejected_by_envelope;
+            slice.items_rejected_by_bound += build.items_rejected_by_bound;
+        );
+        if (options_.use_bounds && incumbent >= global_bound.upper) {
+            closed_by_bound = true;
+            commit_residual_delta(false);
+            UKP_FULL_STATS(
+                slice.active_items_after = static_cast<long long>(active_items.size());
+            );
+            publish_slice_stats<kFullStats>(
+                result.stats.slices, std::move(slice));
             break;
         }
 
-        if (kEnableUncertifiedPeriodStop && active_items_final <= 1 && yb >= best_periodic.w) {
-            period_level = yb;
-            computed_until = yb;
-            break;
+        // Dynamic threshold dominance from EDUK/PYAsUKP. Record every
+        // decision first; the transaction below updates membership, cursors,
+        // active_items, suffix minima, and BoundContext exactly once.
+        if (!active_items.empty()) {
+            std::size_t remaining_active = active_items.size();
+            for (const detail::ActiveItem& item : active_items) {
+                const Weight contribution = contribution_slot(item.id);
+                if (contribution == kNoContribution) {
+                    throw std::logic_error("active item has no introduction contribution");
+                }
+                if (remaining_active > 1 &&
+                    safe_add(contribution, item.w) <= yb) {
+                    --remaining_active;
+                    residual_delta.request_threshold_removal(item);
+                    UKP_BASIC_STATS(++result.stats.items_removed_threshold;);
+                    UKP_FULL_STATS(++slice.items_removed_threshold;);
+                }
+            }
         }
 
+        // Active-item bound fathoming is intentionally disabled. A residual
+        // BoundContext does not cover every historical continuation already
+        // materialized in CriticalSequence, so using it to eliminate an
+        // already-active item can underestimate that item's true remaining
+        // potential. Item introduction keeps its historical feasible guard,
+        // while state fathoming uses the immutable global `state_bound_ctx`.
+
+        commit_residual_delta(true);
+        UKP_FULL_STATS(
+            slice.active_items_after = static_cast<long long>(active_items.size());
+        );
+        publish_slice_stats<kFullStats>(
+            result.stats.slices, std::move(slice));
+        const std::size_t active_count = active_items.size();
+        // EDUK2 tests Chainlist.is_single only after reduction, i.e. after
+        // Select.next_lightest has considered every item.  At that point a
+        // singleton decreasingS containing b is the implementation's
+        // threshold-dominance certificate for the paper's y+ level.
+        const bool all_items_introduced = next_item == items_by_weight.size();
+        if (options_.use_periodicity && all_items_introduced && active_count == 1 &&
+            active_items.front().id == periodic_best.id) {
+            periodicity_detected = true;
+            UKP_BASIC_STATS(
+                result.stats.periodicity_level = yb;
+                ++result.stats.periodicity_hits;
+                result.stats.active_items_at_periodicity =
+                    static_cast<long long>(active_count);
+            );
+
+            // Direct counterpart of PYAsUKP's fill_with_best.  Select a
+            // critical point in the capacity's residue class and complete it
+            // with copies of b; no new DP states are required beyond y+.
+            periodicity_base = sequence.stored_states() - 1;
+            const detail::State& last_state = sequence.state(periodicity_base);
+            const Weight difference = inst.capacity - last_state.weight;
+            const Weight remainder = difference % periodic_best.w;
+            periodicity_best_copies = difference / periodic_best.w;
+            if (remainder != 0) {
+                const Weight target_weight =
+                    last_state.weight - (periodic_best.w - remainder);
+                periodicity_base = sequence.state_at_or_before(target_weight);
+                ++periodicity_best_copies;
+            }
+            const detail::State& base_state = sequence.state(periodicity_base);
+            if (base_state.item_id == periodic_best.id) {
+                periodicity_best_copies =
+                    (inst.capacity - base_state.weight) / periodic_best.w;
+            }
+            break;
+        }
+        if (!half_capacity_extension_done && yb >= initial_process_limit) {
+            const Weight active_wmax = active_items.empty() ? Weight{0} :
+                std::max_element(active_items.begin(), active_items.end(),
+                    [](const detail::ActiveItem& left,
+                       const detail::ActiveItem& right) { return left.w < right.w; })->w;
+            process_limit = std::min(inst.capacity, safe_add(yb, active_wmax));
+            half_capacity_extension_done = true;
+        }
+        if (active_count == 1 && half_capacity_extension_done && yb >= process_limit) break;
         ya = yb;
     }
 
-    result.stats.bound_calls += sampler.calls;
-    result.stats.states_fathomed += sampler.fathomed;
-    result.stats.states_kept += static_cast<long long>(sequence_result.size());
+    dp_phase.stop();
 
-    refresh_dynamic_item_counters();
-
-    // Optional diagnostics, disabled by default to keep CLI/tests unchanged.
-    // Run with:
-    //   UKP_DEBUG_ACTIVE=1 ./ukp_solve optimized <instance>
-    //
-    // Printed to stderr so stdout remains compatible with the current parser.
-    if (std::getenv("UKP_DEBUG_ACTIVE") != nullptr) {
-        std::cerr
-            << "debug_active_items_final " << active_items_final << '\n'
-            << "debug_not_collectively_dominated_final " << not_collectively_dominated_final << '\n'
-            << "debug_dynamic_collective_removed " << dynamic_collective_removed << '\n'
-            << "debug_period_last_contribution_hits " << period_last_contribution_hits << '\n'
-            << "debug_sequence_result_size " << sequence_result.size() << '\n';
+    // Cursor suffixes still represented when the exact stopping certificate
+    // fires are work the eager implementation had already materialized.
+    // Publish per-item totals and the capacity-feasible deferred suffix.
+    if constexpr (kFullStats) {
+        long long final_historical_avoided = 0;
+        for (const detail::ActiveItem& item : items_by_weight) {
+            if (sequence.item_was_introduced(item)) {
+                result.stats.backfill_attempts_by_item[
+                    static_cast<std::size_t>(item.id)] =
+                        sequence.item_backfill_attempts(item);
+                final_historical_avoided += static_cast<long long>(
+                    sequence.unprocessed_historical_states(item, candidate_limit));
+            }
+        }
+        result.stats.historical_states_avoided += final_historical_avoided;
+        if (!result.stats.slices.empty()) {
+            result.stats.slices.back().historical_states_avoided +=
+                final_historical_avoided;
+        }
     }
 
-    auto add_trace = [&](Solution& sol, Weight start_y) {
-        Weight y = start_y;
-        while (y > 0) {
-            int id = -1;
-            Weight py = 0;
+    PhaseTimer<kFullStats> reconstruction_phase(
+        result.stats.phase_reconstruction_ns);
 
-            auto sp = sparse_pred.find(y);
-            if (sp != sparse_pred.end() && sp->second.last_item >= 0) {
-                id = sp->second.last_item;
-                py = sp->second.prev_w;
-            } else if (y <= compute_limit_w && last[static_cast<size_t>(y)] >= 0) {
-                id = last[static_cast<size_t>(y)];
-                py = prev[static_cast<size_t>(y)];
-            } else {
-                break;
+    if (periodicity_detected) {
+        const detail::State& base_state = sequence.state(periodicity_base);
+        std::vector<long long> multiplicity(inst.items.size(), 0);
+        for (detail::PointId cursor = periodicity_base; cursor != detail::no_point;
+             cursor = sequence.state(cursor).predecessor) {
+            const int item_id = sequence.state(cursor).item_id;
+            if (item_id < 0) break;
+            if (static_cast<std::size_t>(item_id) >= multiplicity.size()) {
+                throw std::runtime_error("periodic backtracking failed");
             }
-
-            const auto it = std::find_if(inst.items.begin(), inst.items.end(),
-                [&](const Item& x) { return x.id == id; });
-            if (it == inst.items.end()) throw std::runtime_error("backtracking failed");
-
-            sol.multiplicity_by_id[static_cast<std::size_t>(id)]++;
-            sol.weight += it->w;
-            y = py;
+            ++multiplicity[static_cast<std::size_t>(item_id)];
         }
-    };
+        if (periodic_best.id < 0 ||
+            static_cast<std::size_t>(periodic_best.id) >= multiplicity.size()) {
+            throw std::runtime_error("periodic best item is outside multiplicity");
+        }
+        multiplicity[static_cast<std::size_t>(periodic_best.id)] +=
+            periodicity_best_copies;
+        const Profit periodic_profit = safe_add(
+            base_state.profit, safe_mul(periodicity_best_copies, periodic_best.p));
+        const Weight periodic_weight = safe_add(
+            base_state.weight, safe_mul(periodicity_best_copies, periodic_best.w));
+        incumbent_solution.consider(periodic_profit, periodic_weight,
+                                    std::move(multiplicity));
+
+        reconstruction_phase.stop();
+        publish_dp_telemetry();
+        result.solution = incumbent_solution.solution("optimized");
+        UKP_BASIC_STATS(
+            result.stats.estimated_state_bytes =
+                static_cast<long long>(sequence.estimated_bytes());
+            result.stats.active_items_final = 1;
+            result.stats.dp_stop_reason = "periodicity";
+            result.stats.stop_reason = "periodicity";
+        );
+        return result;
+    }
+
+    // c/2 cut: the sequence query is the prefix maximum, because its profits
+    // are strictly increasing with its skip-point weights.
+    detail::PointId first_index = 0;
+    detail::PointId second_index = 0;
+    Profit split_profit = 0;
+    const std::vector<detail::State>& states = sequence.states();
+    std::size_t partner_position = states.size() - 1;
+    for (detail::PointId index = 0; index < states.size(); ++index) {
+        const detail::State& state = states[index];
+        const Weight residual_capacity = inst.capacity - state.weight;
+        // State weights increase while the complementary capacity decreases,
+        // so the best feasible partner moves only toward the sequence front.
+        while (partner_position > 0 &&
+               states[partner_position].weight > residual_capacity) {
+            --partner_position;
+        }
+        const detail::PointId partner = partner_position;
+        const Profit candidate = safe_add(state.profit, states[partner].profit);
+        if (candidate > split_profit) {
+            split_profit = candidate;
+            first_index = index;
+            second_index = partner;
+        }
+    }
+
+    if (split_profit <= incumbent_solution.profit) {
+        reconstruction_phase.stop();
+        publish_dp_telemetry();
+        result.solution = incumbent_solution.solution("optimized");
+        const std::size_t active_count = active_items.size();
+        UKP_BASIC_STATS(
+            result.stats.estimated_state_bytes =
+                static_cast<long long>(sequence.estimated_bytes());
+            result.stats.active_items_final = static_cast<long long>(active_count);
+            result.stats.dp_stop_reason = closed_by_bound ? "bound_closed" :
+                (active_count == 1 ? "single_active_item" : "half_capacity_cut");
+            result.stats.stop_reason = closed_by_bound ? "dp_bound_closed" :
+                (active_count == 1 ? "single_item" : "half_capacity");
+        );
+        return result;
+    }
 
     Solution sol;
+    sol.profit = split_profit;
     sol.weight = 0;
     sol.optimal = true;
     sol.solver_name = "optimized";
     sol.multiplicity_by_id.assign(inst.items.size(), 0);
 
-    // If a strict period was certified before the half split limit, complete by
-    // adding copies of the best item.  Otherwise, compose two partial DP
-    // solutions a+b<=c using only the prefix [0,L].
-    if (period_level >= 0 && inst.capacity > period_level) {
-        long long added_best = (inst.capacity - period_level + best_periodic.w - 1) / best_periodic.w;
-        Weight reconstruction_capacity = inst.capacity - added_best * best_periodic.w;
-        if (reconstruction_capacity < 0 || reconstruction_capacity > computed_until) {
-            reconstruction_capacity = compute_limit_w;
-            added_best = 0;
+    // Solutions and the DP reconstruction are indexed by item ID.  Build the
+    // direct lookup once, retaining the first matching item just as find_if
+    // did when duplicate IDs are supplied.
+    std::vector<Weight> item_weight_by_id(inst.items.size());
+    std::vector<bool> item_id_present(inst.items.size(), false);
+    for (const Item& item : inst.items) {
+        if (item.id < 0 || static_cast<std::size_t>(item.id) >= item_weight_by_id.size()) {
+            throw std::runtime_error("backtracking failed");
         }
-
-        sol.profit = safe_add(dp[static_cast<size_t>(reconstruction_capacity)],
-                              safe_mul(added_best, best_periodic.p));
-        if (added_best > 0 && best_periodic.id >= 0 &&
-            static_cast<std::size_t>(best_periodic.id) < sol.multiplicity_by_id.size()) {
-            sol.multiplicity_by_id[static_cast<std::size_t>(best_periodic.id)] += added_best;
-            sol.weight += safe_mul(added_best, best_periodic.w);
+        const std::size_t item_index = static_cast<std::size_t>(item.id);
+        if (!item_id_present[item_index]) {
+            item_weight_by_id[item_index] = item.w;
+            item_id_present[item_index] = true;
         }
-        add_trace(sol, reconstruction_capacity);
-    } else {
-        Weight best_a = 0;
-        Weight best_b = 0;
-        Profit best_split_profit = 0;
-
-        for (Weight a = 0; a <= compute_limit_w; ++a) {
-            const Weight remaining = inst.capacity - a;
-            const Weight b = std::min<Weight>(compute_limit_w, std::max<Weight>(0, remaining));
-            const Profit val = safe_add(dp[static_cast<size_t>(a)], dp[static_cast<size_t>(b)]);
-            if (val > best_split_profit) {
-                best_split_profit = val;
-                best_a = a;
-                best_b = b;
-            }
-        }
-
-        sol.profit = best_split_profit;
-        add_trace(sol, best_a);
-        add_trace(sol, best_b);
     }
 
+    auto add_trace = [&](detail::PointId index) {
+      while (index != detail::no_point) {
+        const detail::State& state = sequence.state(index);
+        const int item_id = state.item_id;
+        if (item_id < 0) break;
+        if (static_cast<std::size_t>(item_id) >= item_weight_by_id.size() ||
+            !item_id_present[static_cast<std::size_t>(item_id)]) {
+            throw std::runtime_error("backtracking failed");
+        }
+        sol.multiplicity_by_id[static_cast<std::size_t>(item_id)]++;
+        sol.weight += item_weight_by_id[static_cast<std::size_t>(item_id)];
+        index = state.predecessor;
+      }
+    };
+    add_trace(first_index);
+    add_trace(second_index);
+
     result.solution = std::move(sol);
+    reconstruction_phase.stop();
+    publish_dp_telemetry();
+    const std::size_t active_count = active_items.size();
+    UKP_BASIC_STATS(
+        result.stats.estimated_state_bytes =
+            static_cast<long long>(sequence.estimated_bytes());
+        result.stats.active_items_final = static_cast<long long>(active_count);
+        result.stats.dp_stop_reason = closed_by_bound ? "bound_closed" :
+            (active_count == 1 ? "single_active_item" : "half_capacity_cut");
+        result.stats.stop_reason = closed_by_bound ? "dp_bound_closed" :
+            (active_count == 1 ? "single_item" : "half_capacity");
+    );
     return result;
 }
+
+#undef UKP_FULL_STATS
+#undef UKP_BASIC_STATS
 
 }  // namespace ukp::optimized

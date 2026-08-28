@@ -58,10 +58,16 @@ add_library(ukp_faithful_none ${UKP_FAITHFUL_SOURCES})
 target_compile_definitions(ukp_faithful_none PUBLIC UKP_STATS_MODE=0)
 target_link_libraries(ukp_faithful_none PUBLIC ukp_common)
 
-add_library(ukp_optimized
+set(UKP_OPTIMIZED_SOURCES
   src/optimized/optimized_solver.cpp
-  src/optimized/core_branch_and_bound.cpp
+  src/optimized/critical_sequence.cpp
+  src/optimized/incumbent.cpp
+  src/optimized/preprocessing.cpp
+  src/optimized/eduk2_bounds.cpp
 )
+
+add_library(ukp_optimized ${UKP_OPTIMIZED_SOURCES})
+target_compile_definitions(ukp_optimized PRIVATE UKP_STATS_MODE=2)
 target_link_libraries(ukp_optimized PUBLIC ukp_common)
 
 function(add_ukp_solve_variant target faithful_target)

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ukp/bounds.hpp"
 #include "ukp/types.hpp"
 
 namespace ukp::optimized {

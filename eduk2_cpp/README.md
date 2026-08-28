@@ -3,7 +3,7 @@
 This repository contains two C++17 implementations for the Unbounded Knapsack Problem (UKP):
 
 - `faithful`: a conservative and basic implementation organized around the EDUK2 paper structure
-- `optimized`: an engineering-oriented implementation using contiguous arrays and item-major unbounded DP for better cache locality.
+- `optimized`: an isolated copy of the faithful implementation, intended as the starting point for future optimizations.
 
 The code is intended as a research scaffold for replication and engineering experiments. It preserves the exact UKP objective and uses the same families of bounds and dominance tests discussed in Poirriez, Yanev and Andonov's EDUK2 work. The `faithful` solver is deliberately written in a more explicit style to make comparisons against the OCaml modules easier.
 
@@ -92,13 +92,12 @@ Comments beginning with `#` are ignored.
 ```
 
 
-## Updated optimized solver behavior
+## Optimized solver baseline
 
-The `optimized` solver is now a hybrid/adaptive variant.  It runs a bounded
-core Branch-and-Bound phase before the cache-friendly dynamic program.  If the
-B&B incumbent reaches the global upper bound, the solver returns immediately.
-Otherwise it falls back to exact DP and uses adaptive bound sampling: frequent
-bound calls are kept only when they show useful pruning.
+The `optimized` solver currently reproduces the faithful implementation from
+its own source files and namespace.  The two targets do not share solver
+implementation files, so changes under `src/optimized` do not affect the
+faithful solver.
 
 Useful commands after building:
 
@@ -107,6 +106,3 @@ Useful commands after building:
 ./ukp_solve optimized ../data/example.ukp
 ./ukp_solve optimized ../data/ukp_bb_favorable_2000_1p2M.ukp
 ```
-
-For B&B-favorable instances, expect `bb_nodes > 0` and sometimes
-`states_scanned = 0` if the B&B closes the upper bound before DP.
