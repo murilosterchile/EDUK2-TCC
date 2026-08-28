@@ -44,6 +44,14 @@ TerminatingStepOff::TerminatingStepOff(TsoOptions options) : options_(options) {
 TsoResult TerminatingStepOff::solve(const Instance& instance) const {
     if (instance.capacity < 0) throw std::invalid_argument("negative capacity");
 
+    return solve_with_common_items(
+        instance, detail::common_preprocess_items(instance));
+}
+
+TsoResult TerminatingStepOff::solve_with_common_items(
+    const Instance& instance, std::vector<Item> items) const {
+    if (instance.capacity < 0) throw std::invalid_argument("negative capacity");
+
     TsoResult result;
     result.telemetry.original_items = static_cast<long long>(instance.items.size());
     result.telemetry.capacity = instance.capacity;
@@ -52,7 +60,6 @@ TsoResult TerminatingStepOff::solve(const Instance& instance) const {
 
     // This is intentionally the only preprocessing shared with EDUK2: it
     // merely removes nonpositive and individually infeasible items.
-    std::vector<Item> items = detail::common_preprocess_items(instance);
     result.telemetry.after_common_preprocessing_items =
         static_cast<long long>(items.size());
     if (instance.capacity == 0 || items.empty()) {

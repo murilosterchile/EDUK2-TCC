@@ -62,6 +62,7 @@ set(UKP_OPTIMIZED_SOURCES
   src/optimized/optimized_solver.cpp
   src/optimized/terminating_step_off.cpp
   src/optimized/instance_features.cpp
+  src/optimized/kernel_dispatcher.cpp
   src/optimized/critical_sequence.cpp
   src/optimized/incumbent.cpp
   src/optimized/preprocessing.cpp
@@ -97,7 +98,7 @@ add_executable(ukp_bench src/tools/ukp_bench.cpp)
 target_link_libraries(ukp_bench PRIVATE ukp_faithful ukp_optimized ukp_common)
 
 add_executable(ukp_kernel_bench src/tools/ukp_kernel_bench.cpp)
-target_link_libraries(ukp_kernel_bench PRIVATE ukp_optimized ukp_common)
+target_link_libraries(ukp_kernel_bench PRIVATE ukp_optimized_none ukp_common)
 
 add_executable(ukp_tests tests/test_main.cpp)
 target_link_libraries(ukp_tests PRIVATE ukp_faithful ukp_common)

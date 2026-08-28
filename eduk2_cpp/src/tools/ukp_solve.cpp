@@ -320,7 +320,7 @@ int main(int argc, char** argv) {
                " [--no-cheap-incumbent] [--cheap-incumbent-top-k=N]"
                " [--bb-strong-only|--bb-fractional] [--bb-u3]"
                " [--bb-work-budget=N]"
-               " [--kernel eduk2|tso]"
+               " [--kernel auto|eduk2|tso]"
                " [--verbose]\n";
         return 2;
     }
@@ -329,13 +329,13 @@ int main(int argc, char** argv) {
     const Instance inst = read_instance_file(argv[2]);
     SolverOptions options;
     bool verbose = false;
-    std::string kernel = "eduk2";
+    std::string kernel = solver == "optimized" ? "auto" : "eduk2";
 
     for (int i = 3; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--kernel") {
             if (++i >= argc) {
-                std::cerr << "--kernel requires eduk2 or tso\n";
+                std::cerr << "--kernel requires auto, eduk2 or tso\n";
                 return 2;
             }
             kernel = argv[i];
@@ -423,10 +423,15 @@ int main(int argc, char** argv) {
                   << "state_bytes_approx " << tso.telemetry.estimated_dp_bytes << '\n';
         return 0;
     }
-    if (kernel != "eduk2") {
+    if (kernel != "auto" && kernel != "eduk2") {
         std::cerr << "unknown kernel: " << kernel << '\n';
         return 2;
     }
+    if (solver == "faithful" && kernel == "auto") {
+        std::cerr << "--kernel auto is only available for optimized\n";
+        return 2;
+    }
+    if (kernel == "eduk2") options.use_kernel_dispatcher = false;
     SolverResult result;
     if (solver == "faithful") {
         result = faithful::Solver(options).solve(inst);

@@ -30,7 +30,21 @@ checked for representability, vector limits, and a configurable memory budget
 error.
 
 Manual execution is `ukp_solve optimized FILE --kernel eduk2` or `--kernel tso`.
-There is no automatic selection. `ukp_kernel_bench FILE...` emits the structural
-features, timings, ratio, classification, and equality flag requested for a
-later dispatcher study. `test_tso` contains 5,000 dense-oracle cases, exact
-reconstruction checks, and TSO-versus-faithful corpus checks.
+The default, `--kernel auto`, runs common preprocessing once and applies a
+conservative structural dispatcher.  It selects TSO only when its table fits
+the configured memory budget and all of these calibrated conditions hold:
+
+- at most 5,000 items remain after common preprocessing;
+- every remaining item is within 1% of the best efficiency;
+- `capacity / min_weight <= 50`;
+- `capacity * min(n_after_common, capacity / min_weight + 1) <= 25,000,000`.
+
+Every other instance uses EDUK2.  TSO returning `kernel_not_applicable` also
+falls back to EDUK2, so dispatch is never part of the optimality argument.
+
+`ukp_kernel_bench FILE...` emits the complete cheap feature row, both isolated
+kernel timings, their ratio, classification, and equality flag.  Evaluate its
+CSV with `scripts/analyze_dispatcher.py`; the report includes both always-kernel
+baselines, oracle regret, confusion counts, regressions, and family slices.
+`test_tso` contains 5,000 dense-oracle cases, exact reconstruction checks, and
+TSO-versus-faithful corpus checks.

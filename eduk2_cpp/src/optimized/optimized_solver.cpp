@@ -5,6 +5,8 @@
 #include "preprocessing.hpp"
 #include "incumbent.hpp"
 #include "instance_features.hpp"
+#include "kernel_dispatcher.hpp"
+#include "ukp/terminating_step_off.hpp"
 #include <algorithm>
 #include <array>
 #include <cassert>
@@ -787,7 +789,8 @@ SolverResult Solver::solve(const Instance& inst) {
     UKP_BASIC_STATS(
         result.stats.original_items = static_cast<long long>(inst.items.size());
         result.stats.selected_kernel = "eduk2";
-        result.stats.dispatch_reason = "dispatcher_not_enabled";
+        result.stats.dispatch_reason = options_.use_kernel_dispatcher
+            ? "pending_features" : "dispatcher_disabled";
     );
     UKP_FULL_STATS(
         result.stats.backfill_attempts_by_item.assign(inst.items.size(), -1);
@@ -808,11 +811,12 @@ SolverResult Solver::solve(const Instance& inst) {
         PhaseTimer<kFullStats> phase(result.stats.phase_common_preprocessing_ns);
         common_items = detail::common_preprocess_items(inst);
     }
-    if constexpr (kFullStats) {
-        PhaseTimer<true> phase(result.stats.phase_feature_extraction_ns);
-        result.stats.instance_features =
-            detail::extract_instance_features(inst, common_items);
+    InstanceFeatures instance_features;
+    if (options_.use_kernel_dispatcher || kFullStats) {
+        PhaseTimer<kFullStats> phase(result.stats.phase_feature_extraction_ns);
+        instance_features = detail::extract_instance_features(inst, common_items);
     }
+    UKP_FULL_STATS(result.stats.instance_features = instance_features;);
     if (common_items.empty()) {
         result.solution.multiplicity_by_id.assign(inst.items.size(), 0);
         result.solution.optimal = true;
@@ -823,6 +827,38 @@ SolverResult Solver::solve(const Instance& inst) {
             result.stats.dp_stop_reason = "not_started";
         );
         return result;
+    }
+
+    if (options_.use_kernel_dispatcher) {
+        TsoOptions tso_options;
+        tso_options.max_dp_bytes = options_.tso_max_dp_bytes;
+        const detail::DispatchDecision decision =
+            detail::dispatch_kernel(instance_features, tso_options);
+        UKP_BASIC_STATS(result.stats.dispatch_reason = decision.reason;);
+        if (decision.kernel == detail::KernelChoice::Tso) {
+            TsoResult tso = TerminatingStepOff(tso_options).solve_with_common_items(
+                inst, std::move(common_items));
+            if (tso.status == TsoStatus::ProvedOptimal) {
+                result.solution = std::move(tso.solution);
+                result.solution.solver_name = "optimized";
+                UKP_BASIC_STATS(
+                    result.stats.selected_kernel = "tso";
+                    result.stats.after_preprocess_items =
+                        tso.telemetry.after_common_preprocessing_items;
+                    result.stats.states_scanned = tso.telemetry.states_scanned;
+                    result.stats.stop_reason = "tso_proved_optimal";
+                    result.stats.dp_stop_reason = tso.telemetry.terminated_early
+                        ? "tso_periodicity" : "tso_capacity";
+                    result.stats.estimated_state_bytes = static_cast<long long>(
+                        tso.telemetry.estimated_dp_bytes);
+                );
+                return result;
+            }
+            UKP_BASIC_STATS(
+                result.stats.dispatch_reason = "tso_not_applicable_fallback";
+            );
+            common_items = detail::common_preprocess_items(inst);
+        }
     }
 
     detail::PreprocessResult preprocessing;

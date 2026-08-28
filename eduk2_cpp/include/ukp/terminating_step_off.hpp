@@ -7,6 +7,8 @@
 
 namespace ukp::optimized {
 
+class Solver;
+
 enum class TsoStatus {
     ProvedOptimal,
     KernelNotApplicable
@@ -47,6 +49,9 @@ public:
     TsoResult solve(const Instance& instance) const;
 
 private:
+    friend class Solver;
+    TsoResult solve_with_common_items(
+        const Instance& instance, std::vector<Item> common_items) const;
     TsoOptions options_;
 };
 

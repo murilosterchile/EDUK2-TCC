@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstddef>
 #include <limits>
 #include <map>
 #include <stdexcept>
@@ -83,6 +84,7 @@ struct InstanceFeatures {
     int best_item_id = -1;
     Weight best_item_weight = 0;
     Profit best_item_profit = 0;
+    double best_item_efficiency = 0.0;
     double capacity_over_best_weight = 0.0;
     double capacity_over_min_weight = 0.0;
     Weight weight_gcd = 0;
@@ -234,6 +236,10 @@ struct Stats {
 };
 
 struct SolverOptions {
+    // Optimized-only exact-kernel dispatcher.  Disabling it forces EDUK2 and
+    // is useful for controlled kernel benchmarks.
+    bool use_kernel_dispatcher = true;
+    std::size_t tso_max_dp_bytes = 512ULL * 1024ULL * 1024ULL;
     bool paper_faithful_mode = true;
     bool use_simple_dominance = false;
     bool use_core_remainder_ordering = false;

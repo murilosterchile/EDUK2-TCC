@@ -38,6 +38,7 @@ InstanceFeatures extract_instance_features(
     f.best_item_id = best->id;
     f.best_item_weight = best->w;
     f.best_item_profit = best->p;
+    f.best_item_efficiency = static_cast<double>(best->p) / best->w;
     f.capacity_over_best_weight = static_cast<double>(original.capacity) / best->w;
     f.capacity_over_min_weight = static_cast<double>(original.capacity) / f.min_weight;
     f.mean_weight = static_cast<double>(weight_sum / common_items.size());
