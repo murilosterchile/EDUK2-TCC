@@ -795,7 +795,7 @@ SolverResult Solver::solve(const Instance& inst) {
     UKP_FULL_STATS(
         result.stats.backfill_attempts_by_item.assign(inst.items.size(), -1);
     );
-    if (inst.items.empty() || inst.capacity == 0) {
+    if (inst.items.empty()) {
         result.solution.multiplicity_by_id.assign(inst.items.size(), 0);
         result.solution.optimal = true;
         result.solution.solver_name = "optimized";

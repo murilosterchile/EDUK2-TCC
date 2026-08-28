@@ -47,8 +47,11 @@ InstanceFeatures extract_instance_features(
     for (const Item& item : common_items) {
         const long double delta = static_cast<long double>(item.w) - f.mean_weight;
         squared_deviation_sum += delta * delta;
-        const long double efficiency = static_cast<long double>(item.p) / item.w;
-        if (efficiency >= best_efficiency * 0.99L) ++f.near_best_efficiency_items;
+        const __int128 near_best_lhs =
+            static_cast<__int128>(100) * item.p * best->w;
+        const __int128 near_best_rhs =
+            static_cast<__int128>(99) * best->p * item.w;
+        if (near_best_lhs >= near_best_rhs) ++f.near_best_efficiency_items;
     }
     f.weight_variance = static_cast<double>(squared_deviation_sum / common_items.size());
     if (second != nullptr) {

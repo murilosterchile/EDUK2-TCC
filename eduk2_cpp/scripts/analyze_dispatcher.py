@@ -19,12 +19,17 @@ def family(name):
 def selects_tso(row):
     n = int(row["n_after_common"])
     capacity = int(row["C"])
-    c_over_min = float(row["C_over_min_weight"])
-    estimated_work = capacity * min(n, c_over_min + 1.0)
-    memory_safe = row["tso_us"] != "NA"
+    min_weight = int(row["min_weight"])
+    if n <= 0 or min_weight <= 0:
+        return False
+    if n * min_weight <= capacity + min_weight:
+        work_safe = capacity * n <= 25_000_000
+    else:
+        work_safe = capacity * (capacity + min_weight) <= 25_000_000 * min_weight
+    memory_safe = row["median_tso_ns"] != "NA"
     return (memory_safe and n <= 5000 and
             int(row["near_best_efficiency_items"]) == n and
-            c_over_min <= 50.0 and estimated_work <= 25_000_000.0)
+            capacity <= 50 * min_weight and work_safe)
 
 
 def geomean(values):
@@ -39,27 +44,31 @@ def percentile(values, quantile):
 
 
 def summarize(rows):
-    applicable = [row for row in rows if row["tso_us"] != "NA"]
+    applicable = [row for row in rows if row["median_tso_ns"] != "NA"]
     selected = [row for row in rows if selects_tso(row)]
     false_tso = [row for row in selected
-                 if float(row["tso_us"]) >= float(row["eduk2_us"])]
+                 if float(row["median_tso_ns"]) >= float(row["median_eduk2_ns"])]
     false_eduk2 = [row for row in applicable if not selects_tso(row)
-                   and float(row["tso_us"]) < float(row["eduk2_us"])]
+                   and float(row["median_tso_ns"]) < float(row["median_eduk2_ns"])]
     correct = len(applicable) - len(false_tso) - len(false_eduk2)
-    dispatch_times = [float(row["tso_us"] if selects_tso(row) else row["eduk2_us"])
-                      for row in rows]
-    eduk2_times = [float(row["eduk2_us"]) for row in rows]
-    regressions = [dispatch / eduk2 for dispatch, eduk2
-                   in zip(dispatch_times, eduk2_times)]
+    synthetic_times = [float(row["median_tso_ns"] if selects_tso(row)
+                             else row["median_eduk2_ns"]) for row in rows]
+    auto_times = [float(row["median_auto_ns"]) for row in rows]
+    eduk2_times = [float(row["median_eduk2_ns"]) for row in rows]
+    regressions = [automatic / eduk2 for automatic, eduk2
+                   in zip(auto_times, eduk2_times)]
+    overheads = [automatic / synthetic for automatic, synthetic
+                 in zip(auto_times, synthetic_times)]
     regrets = []
-    for row, dispatch in zip(rows, dispatch_times):
-        oracle = float(row["eduk2_us"])
-        if row["tso_us"] != "NA":
-            oracle = min(oracle, float(row["tso_us"]))
-        regrets.append(dispatch / oracle)
+    for row, automatic in zip(rows, auto_times):
+        oracle = float(row["median_eduk2_ns"])
+        if row["median_tso_ns"] != "NA":
+            oracle = min(oracle, float(row["median_tso_ns"]))
+        regrets.append(automatic / oracle)
     tso_speedup = None
     if applicable:
-        tso_speedup = geomean(float(row["tso_us"]) / float(row["eduk2_us"])
+        tso_speedup = geomean(float(row["median_tso_ns"]) /
+                              float(row["median_eduk2_ns"])
                               for row in applicable)
     return {
         "instances": len(rows),
@@ -68,8 +77,12 @@ def summarize(rows):
         "accuracy": correct / len(applicable) if applicable else 1.0,
         "false_tso": len(false_tso),
         "false_eduk2": len(false_eduk2),
-        "speedup_vs_eduk2": geomean(eduk2 / dispatch for eduk2, dispatch
-                                     in zip(eduk2_times, dispatch_times)),
+        "speedup_vs_eduk2": geomean(eduk2 / automatic for eduk2, automatic
+                                     in zip(eduk2_times, auto_times)),
+        "synthetic_speedup_vs_eduk2": geomean(
+            eduk2 / synthetic for eduk2, synthetic
+            in zip(eduk2_times, synthetic_times)),
+        "dispatcher_overhead": geomean(overheads),
         "always_tso_slowdown_vs_eduk2": tso_speedup,
         "regret": geomean(regrets),
         "worst_regret": max(regrets),
@@ -86,7 +99,8 @@ def main():
         rows = list(csv.DictReader(source))
     total = summarize(rows)
     print("scope,instances,tso_applicable,tso_selected,accuracy,false_tso,"
-          "false_eduk2,speedup_vs_eduk2,always_tso_slowdown,regret,"
+          "false_eduk2,real_auto_speedup_vs_eduk2,synthetic_speedup_vs_eduk2,"
+          "real_dispatcher_overhead,always_tso_slowdown,regret,"
           "worst_regret,worst_regression,p95_regression")
     grouped = defaultdict(list)
     for row in rows:
@@ -97,6 +111,8 @@ def main():
               f"{metric['selected']},{metric['accuracy']:.6f},"
               f"{metric['false_tso']},{metric['false_eduk2']},"
               f"{metric['speedup_vs_eduk2']:.6f},"
+              f"{metric['synthetic_speedup_vs_eduk2']:.6f},"
+              f"{metric['dispatcher_overhead']:.6f},"
               f"{metric['always_tso_slowdown_vs_eduk2'] or 0:.6f},"
               f"{metric['regret']:.6f},{metric['worst_regret']:.6f},"
               f"{metric['worst_regression']:.6f},"

@@ -7,6 +7,10 @@
 namespace ukp::optimized::detail {
 namespace {
 
+constexpr long long kMaxItems = 5000;
+constexpr long long kMaxCapacityOverMinWeight = 50;
+constexpr long long kMaxEstimatedWork = 25'000'000;
+
 bool estimate_tso_memory(Weight capacity, std::size_t limit, std::size_t& bytes) {
     if (capacity < 0) return false;
     const auto unsigned_capacity = static_cast<unsigned long long>(capacity);
@@ -16,6 +20,20 @@ bool estimate_tso_memory(Weight capacity, std::size_t limit, std::size_t& bytes)
     if (states > std::numeric_limits<std::size_t>::max() / bytes_per_state) return false;
     bytes = states * bytes_per_state;
     return bytes <= limit;
+}
+
+bool estimated_work_within_limit(const InstanceFeatures& features) {
+    const __int128 capacity = features.capacity;
+    const __int128 min_weight = features.min_weight;
+    const __int128 item_count = features.after_common_preprocessing_items;
+    const __int128 limit = kMaxEstimatedWork;
+
+    // Exact comparison for C * min(n, C / w_min + 1) <= limit. The second
+    // branch compares the rational expression by cross multiplication.
+    if (item_count * min_weight <= capacity + min_weight) {
+        return capacity * item_count <= limit;
+    }
+    return capacity * (capacity + min_weight) <= limit * min_weight;
 }
 
 }  // namespace
@@ -42,16 +60,14 @@ DispatchDecision dispatch_kernel(
     // Conservative region learned from family-separated benchmark data.  A
     // wrong choice cannot affect correctness, but TSO false positives are far
     // more expensive, so every condition must hold and EDUK2 is the default.
-    constexpr long long kMaxItems = 5000;
-    constexpr double kMaxCapacityOverMinWeight = 50.0;
-    constexpr long double kMaxEstimatedWork = 25'000'000.0L;
     const bool uniformly_near_best =
         features.near_best_efficiency_items ==
         features.after_common_preprocessing_items;
     if (features.after_common_preprocessing_items <= kMaxItems &&
         uniformly_near_best &&
-        features.capacity_over_min_weight <= kMaxCapacityOverMinWeight &&
-        decision.estimated_tso_work <= kMaxEstimatedWork) {
+        static_cast<__int128>(features.capacity) <=
+            static_cast<__int128>(kMaxCapacityOverMinWeight) * features.min_weight &&
+        estimated_work_within_limit(features)) {
         decision.kernel = KernelChoice::Tso;
         decision.reason = "small_uniform_efficiency_region";
     }

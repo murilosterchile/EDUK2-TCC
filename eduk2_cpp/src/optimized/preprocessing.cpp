@@ -2,13 +2,26 @@
 
 #include "ukp/dominance.hpp"
 
+#include <stdexcept>
+
 namespace ukp::optimized::detail {
 
 std::vector<Item> common_preprocess_items(const Instance& instance) {
     std::vector<Item> items;
     items.reserve(instance.items.size());
     for (const Item& item : instance.items) {
-        if (item.w > 0 && item.p > 0 && item.w <= instance.capacity) items.push_back(item);
+        if (item.w < 0) {
+            throw std::invalid_argument("negative item weight");
+        }
+        if (item.w == 0) {
+            if (item.p > 0) {
+                throw std::invalid_argument(
+                    "unbounded UKP: positive-profit item has zero weight");
+            }
+            continue;
+        }
+        if (item.p <= 0 || item.w > instance.capacity) continue;
+        items.push_back(item);
     }
     return items;
 }
