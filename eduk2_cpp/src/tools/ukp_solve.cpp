@@ -330,6 +330,7 @@ int main(int argc, char** argv) {
     SolverOptions options;
     bool verbose = false;
     std::string kernel = solver == "optimized" ? "auto" : "eduk2";
+    optimized::TsoOptions tso_options;
 
     for (int i = 3; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -341,6 +342,10 @@ int main(int argc, char** argv) {
             kernel = argv[i];
         } else if (arg.rfind("--kernel=", 0) == 0) {
             kernel = arg.substr(9);
+        } else if (arg == "--no-tso-gcd-scaling") {
+            tso_options.use_gcd_scaling = false;
+        } else if (arg == "--tso-multiple-dominance") {
+            tso_options.use_multiple_dominance = true;
         } else if (arg == "--paper-faithful") options.paper_faithful_mode = true;
         else if (arg == "--no-paper-faithful") options.paper_faithful_mode = false;
         else if (arg == "--simple-dominance") options.use_simple_dominance = true;
@@ -398,7 +403,8 @@ int main(int argc, char** argv) {
 
     const auto start = std::chrono::steady_clock::now();
     if (solver == "optimized" && kernel == "tso") {
-        const optimized::TsoResult tso = optimized::TerminatingStepOff().solve(inst);
+        const optimized::TsoResult tso =
+            optimized::TerminatingStepOff(tso_options).solve(inst);
         const auto finish = std::chrono::steady_clock::now();
         std::cout << "kernel tso\nstatus " << tso.status_message << '\n';
         if (tso.status == optimized::TsoStatus::KernelNotApplicable) return 3;
@@ -410,17 +416,26 @@ int main(int argc, char** argv) {
         std::cout << "items_original " << tso.telemetry.original_items << '\n'
                   << "items_after_common_preprocess "
                   << tso.telemetry.after_common_preprocessing_items << '\n'
+                  << "items_after_tso_preprocess "
+                  << tso.telemetry.after_tso_preprocessing_items << '\n'
                   << "best_item_weight " << tso.telemetry.best_item_weight << '\n'
                   << "capacity_over_best_weight "
                   << (tso.telemetry.best_item_weight == 0 ? 0 :
                       inst.capacity / tso.telemetry.best_item_weight) << '\n'
                   << "weight_gcd " << tso.telemetry.weight_gcd << '\n'
+                  << "original_capacity " << tso.telemetry.original_capacity << '\n'
+                  << "scaled_capacity " << tso.telemetry.scaled_capacity << '\n'
+                  << "gcd_scale_factor " << tso.telemetry.gcd_scale_factor << '\n'
                   << "states_scanned " << tso.telemetry.states_scanned << '\n'
                   << "transitions_considered "
                   << tso.telemetry.transitions_considered << '\n'
                   << "termination_level " << tso.telemetry.termination_level << '\n'
                   << "terminated_early " << (tso.telemetry.terminated_early ? 1 : 0) << '\n'
                   << "state_bytes_approx " << tso.telemetry.estimated_dp_bytes << '\n';
+        std::cout << "estimated_dp_bytes_before_scaling "
+                  << tso.telemetry.estimated_dp_bytes_before_scaling << '\n'
+                  << "estimated_dp_bytes_after_scaling "
+                  << tso.telemetry.estimated_dp_bytes_after_scaling << '\n';
         return 0;
     }
     if (kernel != "auto" && kernel != "eduk2") {

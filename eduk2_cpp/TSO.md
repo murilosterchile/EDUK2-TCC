@@ -1,9 +1,15 @@
 # Terminating Step-Off kernel
 
 `TerminatingStepOff` is an independent exact kernel. It receives the original
-`Instance` and uses only `common_preprocess_items`, whose transformation removes
-items with nonpositive weight/profit or weight above the capacity. It never sees
-EDUK2's multiple-dominance, bound-reduced, core, or residual item lists.
+`Instance` and uses a dedicated `tso_preprocess_items` path. Its optional
+kernel-independent multiple dominance by the best item is kept separate from
+EDUK2 preprocessing and is disabled by default. TSO never sees EDUK2's
+bound-reduced, critical-sequence, contextual-dominance, core, or residual lists.
+
+The DP divides every working weight and the capacity by the working weights'
+GCD (the capacity uses integer floor). Profits and multiplicities are unchanged,
+and reconstruction totals are computed exclusively from the original instance.
+Consequently scaled weights never cross the public solution boundary.
 
 The items are ordered by nondecreasing profit/weight without floating point;
 cross-products use `__int128`. Equal ratios put the lighter item later. For each
@@ -24,10 +30,13 @@ The kernel stops exactly there and reconstructs those copies plus the stored
 predecessor chain. Arithmetic on profits and reconstructed totals uses the
 repository's checked integer helpers.
 
-Before allocating the two `C + 1` arrays, their count and byte product are
+Before allocating the two `floor(C/g) + 1` arrays, their count and byte product are
 checked for representability, vector limits, and a configurable memory budget
 (512 MiB by default). Failure returns `kernel_not_applicable`, not a solver
 error.
+
+For isolated T0--T3 experiments, direct TSO execution accepts
+`--no-tso-gcd-scaling` and `--tso-multiple-dominance`.
 
 Manual execution is `ukp_solve optimized FILE --kernel eduk2` or `--kernel tso`.
 The default, `--kernel auto`, runs common preprocessing once and applies a

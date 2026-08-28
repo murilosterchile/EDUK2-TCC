@@ -17,7 +17,11 @@ enum class TsoStatus {
 struct TsoTelemetry {
     long long original_items = 0;
     long long after_common_preprocessing_items = 0;
+    long long after_tso_preprocessing_items = 0;
     Weight capacity = 0;
+    Weight original_capacity = 0;
+    Weight scaled_capacity = 0;
+    Weight gcd_scale_factor = 1;
     Weight last_capacity_scanned = 0;
     Weight termination_level = 0;
     Weight best_item_weight = 0;
@@ -27,6 +31,8 @@ struct TsoTelemetry {
     long long transitions_improved = 0;
     long long ties_reassigned = 0;
     std::size_t estimated_dp_bytes = 0;
+    std::size_t estimated_dp_bytes_before_scaling = 0;
+    std::size_t estimated_dp_bytes_after_scaling = 0;
     bool terminated_early = false;
 };
 
@@ -34,6 +40,8 @@ struct TsoOptions {
     // A caller may deliberately raise this for controlled experiments.  The
     // default prevents an accidental multi-gigabyte capacity-indexed DP.
     std::size_t max_dp_bytes = 512ULL * 1024ULL * 1024ULL;
+    bool use_gcd_scaling = true;
+    bool use_multiple_dominance = false;
 };
 
 struct TsoResult {

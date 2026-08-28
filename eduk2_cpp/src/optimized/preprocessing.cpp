@@ -26,6 +26,16 @@ std::vector<Item> common_preprocess_items(const Instance& instance) {
     return items;
 }
 
+std::vector<Item> tso_preprocess_items(
+    std::vector<Item> common_items, bool use_multiple_dominance) {
+    if (!use_multiple_dominance || common_items.empty()) return common_items;
+
+    const Item best = *std::max_element(
+        common_items.begin(), common_items.end(),
+        [](const Item& a, const Item& b) { return better_ratio(b, a); });
+    return remove_multiple_dominated_by_best(std::move(common_items), best);
+}
+
 PreprocessResult preprocess_items_for_eduk2(
     const std::vector<Item>& common_items, bool use_simple_dominance) {
     PreprocessResult result;

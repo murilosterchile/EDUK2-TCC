@@ -55,12 +55,17 @@ TsoResult TerminatingStepOff::solve_with_common_items(
     TsoResult result;
     result.telemetry.original_items = static_cast<long long>(instance.items.size());
     result.telemetry.capacity = instance.capacity;
+    result.telemetry.original_capacity = instance.capacity;
     result.solution.solver_name = "optimized_tso";
     result.solution.multiplicity_by_id.assign(instance.items.size(), 0);
 
     // This is intentionally the only preprocessing shared with EDUK2: it
     // merely removes nonpositive and individually infeasible items.
     result.telemetry.after_common_preprocessing_items =
+        static_cast<long long>(items.size());
+    items = detail::tso_preprocess_items(
+        std::move(items), options_.use_multiple_dominance);
+    result.telemetry.after_tso_preprocessing_items =
         static_cast<long long>(items.size());
     if (instance.capacity == 0 || items.empty()) {
         result.solution.optimal = true;
@@ -73,23 +78,40 @@ TsoResult TerminatingStepOff::solve_with_common_items(
         return result;
     }
 
+    std::sort(items.begin(), items.end(), step_off_order);
+    result.telemetry.best_item_weight = items.back().w;
+    Weight gcd = 0;
+    for (const Item& item : items) gcd = std::gcd(gcd, item.w);
+    result.telemetry.weight_gcd = gcd;
+    const Weight scale = options_.use_gcd_scaling && gcd > 1 ? gcd : 1;
+    const Weight capacity = instance.capacity / scale;
+    result.telemetry.gcd_scale_factor = scale;
+    result.telemetry.scaled_capacity = capacity;
+
+    std::size_t ignored_count = 0;
+    std::size_t before_bytes = 0;
+    checked_table_size(instance.capacity, std::numeric_limits<std::size_t>::max(),
+                       ignored_count, before_bytes);
+    result.telemetry.estimated_dp_bytes_before_scaling = before_bytes;
+
+    if (scale > 1) {
+        for (Item& item : items) item.w /= scale;
+    }
+
     std::size_t state_count = 0;
     std::size_t estimated_bytes = 0;
-    if (!checked_table_size(instance.capacity, options_.max_dp_bytes,
+    if (!checked_table_size(capacity, options_.max_dp_bytes,
                             state_count, estimated_bytes)) {
+        result.telemetry.estimated_dp_bytes_after_scaling = estimated_bytes;
         result.status_message = "kernel_not_applicable_memory_budget";
         return result;
     }
     result.telemetry.estimated_dp_bytes = estimated_bytes;
+    result.telemetry.estimated_dp_bytes_after_scaling = estimated_bytes;
 
-    std::sort(items.begin(), items.end(), step_off_order);
     const std::int32_t n = static_cast<std::int32_t>(items.size());
     const std::int32_t copied = n;
     const Item& best = items.back();
-    result.telemetry.best_item_weight = best.w;
-    Weight gcd = 0;
-    for (const Item& item : items) gcd = std::gcd(gcd, item.w);
-    result.telemetry.weight_gcd = gcd;
 
     std::vector<Weight> suffix_max_weight(items.size());
     suffix_max_weight.back() = items.back().w;
@@ -119,7 +141,7 @@ TsoResult TerminatingStepOff::solve_with_common_items(
         const std::int32_t first = predecessor[static_cast<std::size_t>(y)];
         for (std::int32_t j = first; j < n; ++j) {
             const Item& item = items[static_cast<std::size_t>(j)];
-            if (item.w > instance.capacity - y) continue;
+            if (item.w > capacity - y) continue;
             ++result.telemetry.transitions_considered;
             const Weight destination = y + item.w;
             const Profit candidate = safe_add(value[static_cast<std::size_t>(y)], item.p);
@@ -140,7 +162,7 @@ TsoResult TerminatingStepOff::solve_with_common_items(
 
         const __int128 termination =
             static_cast<__int128>(x_star) + static_cast<__int128>(lambda);
-        if (y >= instance.capacity || static_cast<__int128>(y) >= termination) break;
+        if (y >= capacity || static_cast<__int128>(y) >= termination) break;
         ++y;
         const std::size_t yi = static_cast<std::size_t>(y);
         if (value[yi] > value[yi - 1]) {
@@ -157,15 +179,15 @@ TsoResult TerminatingStepOff::solve_with_common_items(
     result.telemetry.last_capacity_scanned = y;
     const __int128 termination =
         static_cast<__int128>(x_star) + static_cast<__int128>(lambda);
-    result.telemetry.termination_level = termination > instance.capacity
-        ? instance.capacity : static_cast<Weight>(termination);
-    result.telemetry.terminated_early = y < instance.capacity;
+    result.telemetry.termination_level = termination > capacity
+        ? capacity : static_cast<Weight>(termination);
+    result.telemetry.terminated_early = y < capacity;
 
     Weight reconstruction_weight = y;
     if (result.telemetry.terminated_early) {
-        const long long best_count = (instance.capacity - y) / best.w + 1;
+        const long long best_count = (capacity - y) / best.w + 1;
         result.solution.multiplicity_by_id[static_cast<std::size_t>(best.id)] = best_count;
-        reconstruction_weight = instance.capacity - safe_mul(best_count, best.w);
+        reconstruction_weight = capacity - safe_mul(best_count, best.w);
     }
     while (reconstruction_weight > 0 &&
            predecessor[static_cast<std::size_t>(reconstruction_weight)] == copied) {
