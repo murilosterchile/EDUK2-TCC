@@ -129,6 +129,10 @@ struct Stats {
     long long bb_u3_prunes = 0;
     long long bb_strong_bound_calls = 0;
     long long bb_strong_bound_prunes = 0;
+    Profit incumbent_before_cheap_heuristic = 0;
+    Profit incumbent_after_cheap_heuristic = 0;
+    long long cheap_incumbent_candidates_tested = 0;
+    long long bb_work_stops = 0;
     long long core_node_limit = 0;
     long long items_removed_simple = 0;
     long long items_removed_multiple = 0;
@@ -203,6 +207,7 @@ struct Stats {
     long long phase_global_bounds_ns = 0;
     long long phase_context_maintenance_ns = 0;
     long long phase_core_bb_ns = 0;
+    long long phase_cheap_incumbent_ns = 0;
     long long phase_dp_ns = 0;
     long long phase_reconstruction_ns = 0;
     long long estimated_state_bytes = 0;
@@ -249,6 +254,15 @@ struct SolverOptions {
     // Experimental-only.  In paper_faithful_mode B&B always uses 10,000
     // nodes and this value is ignored.
     long long bb_node_limit = 10000;
+    // Optimized-only B&B experiments.  The fractional level is cheap enough
+    // to be the default; U3 and work-aware stopping require explicit opt-in.
+    bool use_cheap_incumbent = true;
+    int cheap_incumbent_top_k = 8;
+    bool use_bb_fractional_bound = true;
+    bool use_bb_u3_bound = false;
+    // Zero disables work-aware stopping.  A non-zero value is an experimental
+    // branch-evaluation budget, not an optimality condition.
+    long long bb_work_budget = 0;
     // Zero uses PYAsUKP's executable default max(100, lightest weight).
     Weight slice_height = 0;
 };

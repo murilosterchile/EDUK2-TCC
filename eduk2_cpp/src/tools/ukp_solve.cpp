@@ -39,6 +39,20 @@ void print_basic_stats(const Instance& inst, const SolverResult& res,
     std::cout << "states_fathomed " << res.stats.states_fathomed << '\n';
     std::cout << "bound_calls " << res.stats.bound_calls << '\n';
     std::cout << "bb_nodes " << res.stats.bb_nodes << '\n';
+    std::cout << "bb_branch_evaluations " << res.stats.bb_branch_evaluations << '\n';
+    std::cout << "bb_fractional_bound_calls " << res.stats.bb_fractional_bound_calls << '\n';
+    std::cout << "bb_fractional_bound_prunes " << res.stats.bb_fractional_bound_prunes << '\n';
+    std::cout << "bb_u3_calls " << res.stats.bb_u3_calls << '\n';
+    std::cout << "bb_u3_prunes " << res.stats.bb_u3_prunes << '\n';
+    std::cout << "bb_strong_bound_calls " << res.stats.bb_strong_bound_calls << '\n';
+    std::cout << "bb_strong_bound_prunes " << res.stats.bb_strong_bound_prunes << '\n';
+    std::cout << "bb_work_stops " << res.stats.bb_work_stops << '\n';
+    std::cout << "incumbent_before_cheap_heuristic "
+              << res.stats.incumbent_before_cheap_heuristic << '\n';
+    std::cout << "incumbent_after_cheap_heuristic "
+              << res.stats.incumbent_after_cheap_heuristic << '\n';
+    std::cout << "cheap_incumbent_candidates_tested "
+              << res.stats.cheap_incumbent_candidates_tested << '\n';
     std::cout << "points_generated " << res.stats.points_generated << '\n';
     std::cout << "points_kept " << res.stats.states_kept << '\n';
     std::cout << "state_bytes_approx " << res.stats.estimated_state_bytes << '\n';
@@ -120,6 +134,8 @@ void print_full_stats(const SolverResult& res, bool verbose) {
               << res.stats.phase_context_maintenance_ns << '\n';
     std::cout << "phase_core_bb_ns "
               << res.stats.phase_core_bb_ns << '\n';
+    std::cout << "phase_cheap_incumbent_ns "
+              << res.stats.phase_cheap_incumbent_ns << '\n';
     std::cout << "phase_dp_ns " << res.stats.phase_dp_ns << '\n';
     std::cout << "phase_reconstruction_ns "
               << res.stats.phase_reconstruction_ns << '\n';
@@ -298,6 +314,9 @@ int main(int argc, char** argv) {
                " [--modular-dominance] [--core-multiple-dominance]"
                " [--bound-policy=u3|v|tau-star|best-item-star|best-certified|pyasukp-faithful]"
                " [--bound-completion=greedy|pyasukp]"
+               " [--no-cheap-incumbent] [--cheap-incumbent-top-k=N]"
+               " [--bb-strong-only|--bb-fractional] [--bb-u3]"
+               " [--bb-work-budget=N]"
                " [--verbose]\n";
         return 2;
     }
@@ -320,6 +339,19 @@ int main(int argc, char** argv) {
             options.use_core_multiple_dominance = true;
         } else if (arg == "--verbose") {
             verbose = true;
+        } else if (arg == "--no-cheap-incumbent") {
+            options.use_cheap_incumbent = false;
+        } else if (arg.rfind("--cheap-incumbent-top-k=", 0) == 0) {
+            options.cheap_incumbent_top_k = std::stoi(arg.substr(24));
+        } else if (arg == "--bb-strong-only") {
+            options.use_bb_fractional_bound = false;
+            options.use_bb_u3_bound = false;
+        } else if (arg == "--bb-fractional") {
+            options.use_bb_fractional_bound = true;
+        } else if (arg == "--bb-u3") {
+            options.use_bb_u3_bound = true;
+        } else if (arg.rfind("--bb-work-budget=", 0) == 0) {
+            options.bb_work_budget = std::stoll(arg.substr(17));
         } else if (arg.rfind("--bound-policy=", 0) == 0) {
             const std::string value = arg.substr(15);
             if (value == "u3") options.bound_policy = BoundPolicy::U3;

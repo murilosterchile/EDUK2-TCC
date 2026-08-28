@@ -244,10 +244,14 @@ struct CoreSearchResult {
     long long branch_evaluations = 0;
     long long incumbent_improvements = 0;
     long long last_incumbent_improvement_node = 0;
+    long long last_incumbent_improvement_work = 0;
     long long fractional_bound_calls = 0;
     long long fractional_bound_prunes = 0;
     long long u3_calls = 0;
     long long u3_prunes = 0;
+    long long strong_calls = 0;
+    long long strong_prunes = 0;
+    bool stopped_for_work = false;
     bool closed = false;
     long long multiple_removed = 0;
     long long modular_removed = 0;
@@ -325,15 +329,39 @@ struct CoreTraversal {
     Weight capacity;
     Profit global_upper;
     long long limit;
+    bool use_fractional_bound;
+    bool use_u3_bound;
+    long long work_budget;
     CoreSearchResult result;
     std::unordered_map<Weight, Profit> best_profit_at_weight;
     std::vector<Weight> min_remaining_weight;
+    std::vector<std::size_t> suffix_best_ratio;
     // PYAsUKP's default bandbukp2 path has bbnewv=false and therefore does
     // not use the Dynefflist state table.  Keep the memoization available for
     // experimental modes only; keying solely by used_weight is not a valid
     // equivalence relation across different B&B levels.
     bool use_state_memo = true;
 };
+
+std::vector<std::size_t> suffix_best_ratio(const std::vector<Item>& items) {
+    std::vector<std::size_t> result(items.size(), 0);
+    if (items.empty()) return result;
+    result.back() = items.size() - 1;
+    for (std::size_t i = items.size() - 1; i > 0; --i) {
+        const std::size_t next = result[i];
+        result[i - 1] = better_ratio(items[i - 1], items[next]) ? i - 1 : next;
+    }
+    return result;
+}
+
+bool work_budget_exceeded(const CoreTraversal& search) {
+    if (search.work_budget <= 0 ||
+        search.result.branch_evaluations < search.work_budget) return false;
+    const long long since_improvement = search.result.branch_evaluations -
+        search.result.last_incumbent_improvement_work;
+    return since_improvement >= std::max<long long>(1, search.work_budget / 4) &&
+           search.result.strong_calls >= std::max<long long>(1, search.work_budget / 8);
+}
 
 std::vector<Weight> lightest_worse(const std::vector<Item>& items) {
     std::vector<Weight> minweights(items.size(), 0);
@@ -356,10 +384,10 @@ bool remember_core_state(CoreTraversal& search, Weight used_weight, Profit used_
 void record_core_solution(CoreTraversal& search, Profit profit,
                           const std::vector<long long>& multiplicity) {
     if (profit > search.result.profit) {
-        if constexpr (kBasicStats) {
-            ++search.result.incumbent_improvements;
-            search.result.last_incumbent_improvement_node = search.result.nodes;
-        }
+        ++search.result.incumbent_improvements;
+        search.result.last_incumbent_improvement_node = search.result.nodes;
+        search.result.last_incumbent_improvement_work =
+            search.result.branch_evaluations;
         search.result.profit = profit;
         search.result.multiplicity = multiplicity;
     }
@@ -368,7 +396,8 @@ void record_core_solution(CoreTraversal& search, Profit profit,
 
 void complete(CoreTraversal& search, std::size_t item_index, Weight used_weight,
               Profit used_profit, std::vector<long long>& multiplicity) {
-    if (search.result.closed || search.result.nodes >= search.limit) return;
+    if (search.result.closed || search.result.stopped_for_work ||
+        search.result.nodes >= search.limit) return;
     ++search.result.nodes;
     if (!remember_core_state(search, used_weight, used_profit)) return;
     record_core_solution(search, used_profit, multiplicity);
@@ -382,23 +411,52 @@ void complete(CoreTraversal& search, std::size_t item_index, Weight used_weight,
 
     const Item& item = search.items[item_index];
     for (long long count = remaining / item.w; count >= 0; --count) {
-        if constexpr (kBasicStats) ++search.result.branch_evaluations;
+        ++search.result.branch_evaluations;
+        if (work_budget_exceeded(search)) {
+            search.result.stopped_for_work = true;
+            return;
+        }
         const Weight next_weight = used_weight + safe_mul(count, item.w);
         const Profit next_profit = safe_add(used_profit, safe_mul(count, item.p));
-        const Profit residual_upper = compute_bound(search.bounds, search.capacity - next_weight, search.policy).upper;
-        if constexpr (kBasicStats) {
-            ++search.result.fractional_bound_calls;
-            if (search.policy == BoundPolicy::U3) ++search.result.u3_calls;
+        const Weight residual_capacity = search.capacity - next_weight;
+        bool pruned = false;
+        if (search.use_fractional_bound) {
+            if constexpr (kBasicStats) ++search.result.fractional_bound_calls;
+            Profit residual_upper = 0;
+            if (item_index + 1 < search.items.size()) {
+                const Item& best = search.items[search.suffix_best_ratio[item_index + 1]];
+                residual_upper = floor_mul_div(residual_capacity, best.p, best.w);
+            }
+            if (safe_add(next_profit, residual_upper) <= search.result.profit) {
+                if constexpr (kBasicStats) ++search.result.fractional_bound_prunes;
+                pruned = true;
+            }
         }
-        if (safe_add(next_profit, residual_upper) > search.result.profit) {
+        if (!pruned && search.use_u3_bound) {
+            if constexpr (kBasicStats) ++search.result.u3_calls;
+            const Profit upper = compute_bound(
+                search.bounds, residual_capacity, BoundPolicy::U3).upper;
+            if (safe_add(next_profit, upper) <= search.result.profit) {
+                if constexpr (kBasicStats) ++search.result.u3_prunes;
+                pruned = true;
+            }
+        }
+        if (!pruned) {
+            ++search.result.strong_calls;
+            const Profit upper = compute_bound(
+                search.bounds, residual_capacity, search.policy).upper;
+            if (safe_add(next_profit, upper) <= search.result.profit) {
+                if constexpr (kBasicStats) ++search.result.strong_prunes;
+                pruned = true;
+            }
+        }
+        if (!pruned) {
             multiplicity[static_cast<std::size_t>(item.id)] = count;
             complete(search, item_index + 1, next_weight, next_profit, multiplicity);
             multiplicity[static_cast<std::size_t>(item.id)] = 0;
-        } else if constexpr (kBasicStats) {
-            ++search.result.fractional_bound_prunes;
-            if (search.policy == BoundPolicy::U3) ++search.result.u3_prunes;
         }
-        if (count == 0 || search.result.closed || search.result.nodes >= search.limit) break;
+        if (count == 0 || search.result.closed || search.result.stopped_for_work ||
+            search.result.nodes >= search.limit) break;
     }
 }
 
@@ -428,8 +486,12 @@ void backtrack(CoreTraversal& search, std::vector<long long>& multiplicity) {
 CoreSearchResult traverse_core(const std::vector<Item>& dp_items, const BoundContext& bounds, BoundPolicy policy,
                                Weight capacity, Profit global_upper, int requested_core,
                                long long limit, std::size_t original_count,
+                               Profit initial_incumbent,
+                               const std::vector<long long>& initial_multiplicity,
                                const EffectiveOptions& effective, bool paper_faithful_mode,
                                BoundContextTelemetry* context_telemetry,
+                               bool use_fractional_bound, bool use_u3_bound,
+                               long long work_budget,
                                std::vector<int>* selected_core_ids = nullptr) {
     std::vector<Item> core_items;
     if (paper_faithful_mode) {
@@ -509,11 +571,16 @@ CoreSearchResult traverse_core(const std::vector<Item>& dp_items, const BoundCon
     BoundContext core_bounds = make_bound_context(
         filtered, context_telemetry, include_optional_bounds);
     CoreTraversal search{filtered, core_bounds, policy, capacity, global_upper,
-                         std::max<long long>(0, limit), {}, {},
-                         lightest_worse(filtered), !paper_faithful_mode};
+                         std::max<long long>(0, limit), use_fractional_bound,
+                         use_u3_bound, work_budget, {}, {}, lightest_worse(filtered),
+                         suffix_best_ratio(filtered), !paper_faithful_mode};
     search.result.multiple_removed = core_multiple_removed;
     search.result.modular_removed = core_modular_removed;
-    search.result.multiplicity.assign(original_count, 0);
+    search.result.profit = initial_incumbent;
+    search.result.multiplicity = initial_multiplicity;
+    if (search.result.multiplicity.size() != original_count) {
+        search.result.multiplicity.assign(original_count, 0);
+    }
     std::vector<long long> multiplicity(original_count, 0);
     greedy_fill(search, multiplicity);
     backtrack(search, multiplicity);
@@ -657,6 +724,56 @@ Solution solution_from_best_item(const Instance& inst, const Item& best, long lo
         sol.multiplicity_by_id[static_cast<std::size_t>(best.id)] = count;
     }
     return sol;
+}
+
+struct CheapIncumbentResult {
+    Profit profit = 0;
+    Weight weight = 0;
+    std::vector<long long> multiplicity;
+    long long candidates_tested = 0;
+};
+
+CheapIncumbentResult cheap_incumbent(const std::vector<Item>& ratio_ordered_items,
+                                     Weight capacity, std::size_t original_count,
+                                     int requested_top_k) {
+    CheapIncumbentResult best;
+    best.multiplicity.assign(original_count, 0);
+    if (ratio_ordered_items.empty() || requested_top_k <= 0) return best;
+    const std::size_t top_k = std::min<std::size_t>(
+        ratio_ordered_items.size(), static_cast<std::size_t>(requested_top_k));
+
+    auto consider = [&](const Item* seeded_item, long long seeded_count,
+                        const Item& fill_item) {
+        Weight weight = seeded_item == nullptr ? 0 : safe_mul(seeded_count, seeded_item->w);
+        Profit profit = seeded_item == nullptr ? 0 : safe_mul(seeded_count, seeded_item->p);
+        if (weight > capacity) return;
+        const long long fill_count = (capacity - weight) / fill_item.w;
+        weight = safe_add(weight, safe_mul(fill_count, fill_item.w));
+        profit = safe_add(profit, safe_mul(fill_count, fill_item.p));
+        ++best.candidates_tested;
+        if (profit <= best.profit) return;
+        std::fill(best.multiplicity.begin(), best.multiplicity.end(), 0);
+        if (seeded_item != nullptr) {
+            best.multiplicity[static_cast<std::size_t>(seeded_item->id)] += seeded_count;
+        }
+        best.multiplicity[static_cast<std::size_t>(fill_item.id)] += fill_count;
+        best.profit = profit;
+        best.weight = weight;
+    };
+
+    for (std::size_t fill = 0; fill < top_k; ++fill) {
+        consider(nullptr, 0, ratio_ordered_items[fill]);
+    }
+    for (std::size_t seed = 1; seed < top_k; ++seed) {
+        const Item& seeded_item = ratio_ordered_items[seed];
+        const long long max_seed = std::min<long long>(4, capacity / seeded_item.w);
+        for (long long count = 1; count <= max_seed; ++count) {
+            for (std::size_t fill = 0; fill < top_k; ++fill) {
+                consider(&seeded_item, count, ratio_ordered_items[fill]);
+            }
+        }
+    }
+    return best;
 }
 
 }  // namespace
@@ -905,6 +1022,33 @@ SolverResult Solver::solve(const Instance& inst) {
     }
     global_bounds_phase.stop();
 
+    UKP_BASIC_STATS(result.stats.incumbent_before_cheap_heuristic = incumbent;);
+    if (options_.use_cheap_incumbent) {
+        PhaseTimer<kFullStats> cheap_phase(result.stats.phase_cheap_incumbent_ns);
+        CheapIncumbentResult cheap = cheap_incumbent(
+            items, inst.capacity, inst.items.size(),
+            std::max(0, std::min(16, options_.cheap_incumbent_top_k)));
+        UKP_BASIC_STATS(
+            result.stats.cheap_incumbent_candidates_tested = cheap.candidates_tested;
+        );
+        if (cheap.profit > incumbent) {
+            incumbent = cheap.profit;
+            incumbent_solution.consider(cheap.profit, cheap.weight,
+                                         std::move(cheap.multiplicity));
+        }
+    }
+    UKP_BASIC_STATS(result.stats.incumbent_after_cheap_heuristic = incumbent;);
+    if (options_.use_bounds && incumbent >= global_bound.upper) {
+        result.solution = incumbent_solution.solution("optimized");
+        UKP_BASIC_STATS(
+            result.stats.active_items_final = static_cast<long long>(items.size());
+            result.stats.stop_reason = "cheap_incumbent_bound";
+            result.stats.dp_stop_reason = "not_started";
+        );
+        publish_context_telemetry();
+        return result;
+    }
+
     // This is the global post-reduction list used by the DP.  The core B&B
     // only receives a const view and performs every experimental reduction on
     // its own local copy.
@@ -941,8 +1085,12 @@ SolverResult Solver::solve(const Instance& inst) {
         UKP_BASIC_STATS(result.stats.bb_initial_incumbent = incumbent;);
         CoreSearchResult core = traverse_core(dp_items, ctx, effective_bound_policy, inst.capacity,
                                                global_bound.upper, options_.core_size,
-                                               core_node_limit, inst.items.size(), effective,
+                                               core_node_limit, inst.items.size(), incumbent,
+                                               incumbent_solution.multiplicity_by_id, effective,
                                                options_.paper_faithful_mode, context_telemetry_ptr,
+                                               options_.use_bb_fractional_bound,
+                                               options_.use_bb_u3_bound,
+                                               options_.bb_work_budget,
                                                selected_core_ids);
         incumbent = std::max(incumbent, core.profit);
         UKP_BASIC_STATS(
@@ -966,6 +1114,9 @@ SolverResult Solver::solve(const Instance& inst) {
             result.stats.bb_fractional_bound_prunes += core.fractional_bound_prunes;
             result.stats.bb_u3_calls += core.u3_calls;
             result.stats.bb_u3_prunes += core.u3_prunes;
+            result.stats.bb_strong_bound_calls += core.strong_calls;
+            result.stats.bb_strong_bound_prunes += core.strong_prunes;
+            if (core.stopped_for_work) ++result.stats.bb_work_stops;
             result.stats.items_removed_core_multiple += core.multiple_removed;
             result.stats.items_removed_modular += core.modular_removed;
         );
