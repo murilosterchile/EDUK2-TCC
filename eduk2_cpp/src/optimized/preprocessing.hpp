@@ -11,17 +11,22 @@ struct PreprocessResult {
     long long multiple_removed = 0;
 };
 
-// UKP maximizes profit with nonnegative multiplicities. Negative weights are
-// invalid, while a zero-weight positive-profit item makes the optimum
-// unbounded and is rejected because the public API has no infinity result.
-// Zero-weight nonpositive-profit, positive-weight nonpositive-profit, and
-// individually capacity-infeasible items cannot improve a finite optimum and
-// are discarded.
+// Kernel-independent feasibility filtering shared by direct/forced TSO and
+// full-telemetry paths.
 std::vector<Item> common_preprocess_items(const Instance& instance);
 std::vector<Item> tso_preprocess_items(
     std::vector<Item> common_items, bool use_multiple_dominance);
+
+// Existing path for callers that already own a common-preprocessed vector.
 PreprocessResult preprocess_items_for_eduk2(
-    const std::vector<Item>& common_items, bool use_simple_dominance);
+    std::vector<Item>& common_items, bool use_simple_dominance);
+
+// Fast AUTO/EDUK2 fallback path.  It constructs the EDUK2 working vector
+// directly from Instance, avoiding a separate common_items allocation/copy on
+// every instance that the dispatcher leaves on EDUK2.
+PreprocessResult preprocess_items_for_eduk2(
+    const Instance& instance, bool use_simple_dominance);
+
 std::vector<Item> reduce_variables_by_bound(
     const std::vector<Item>& items,
     const BoundContext& context,

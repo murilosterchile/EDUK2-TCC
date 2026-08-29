@@ -127,9 +127,27 @@ TsoResult TerminatingStepOff::solve_with_common_items(
 
     std::vector<Profit> value;
     std::vector<std::int32_t> predecessor;
+    const bool bounded_speculation = options_.max_transitions > 0;
     try {
-        value.assign(state_count, 0);
-        predecessor.assign(state_count, copied);
+        if (!bounded_speculation) {
+            // Preserve the historical forced/unlimited TSO path exactly: one
+            // full allocation and no growth checks on transition writes.
+            value.assign(state_count, 0);
+            predecessor.assign(state_count, copied);
+        } else {
+            // A bounded AUTO attempt should not zero C+1 states before it has
+            // executed its first transition. Reserve the already memory-checked
+            // address space, but construct only the range needed by the first
+            // step-off wave. Growth below is geometric and preserves the same
+            // zero/copy initialization semantics as the full table.
+            value.reserve(state_count);
+            predecessor.reserve(state_count);
+            const std::size_t initial_states = std::min(
+                state_count,
+                static_cast<std::size_t>(suffix_max_weight.front()) + 1);
+            value.resize(std::max<std::size_t>(initial_states, 1), 0);
+            predecessor.resize(std::max<std::size_t>(initial_states, 1), copied);
+        }
     } catch (const std::bad_alloc&) {
         result.status_message = "kernel_not_applicable_allocation_failed";
         return result;
@@ -139,10 +157,40 @@ TsoResult TerminatingStepOff::solve_with_common_items(
     }
     predecessor[0] = 0;
 
+    const auto ensure_bounded_state = [&](std::size_t index) -> bool {
+        if (!bounded_speculation || index < value.size()) return true;
+        std::size_t target = value.size();
+        if (target == 0) target = 1;
+        while (target <= index) {
+            const std::size_t doubled =
+                target > state_count / 2 ? state_count : target * 2;
+            if (doubled <= target) {
+                target = state_count;
+                break;
+            }
+            target = doubled;
+        }
+        if (target <= index) return false;
+        try {
+            value.resize(target, 0);
+            predecessor.resize(target, copied);
+        } catch (const std::bad_alloc&) {
+            return false;
+        } catch (const std::length_error&) {
+            return false;
+        }
+        return true;
+    };
+
     Weight y = 0;
     Weight x_star = 0;
     Weight lambda = suffix_max_weight.front();
     while (true) {
+        if (bounded_speculation &&
+            !ensure_bounded_state(static_cast<std::size_t>(y))) {
+            result.status_message = "kernel_not_applicable_allocation_failed";
+            return result;
+        }
         ++result.telemetry.states_scanned;
         const std::int32_t first = predecessor[static_cast<std::size_t>(y)];
         for (std::int32_t j = first; j < n; ++j) {
@@ -160,6 +208,11 @@ TsoResult TerminatingStepOff::solve_with_common_items(
             }
             ++result.telemetry.transitions_considered;
             const Weight destination = y + item.w;
+            if (bounded_speculation &&
+                !ensure_bounded_state(static_cast<std::size_t>(destination))) {
+                result.status_message = "kernel_not_applicable_allocation_failed";
+                return result;
+            }
             const Profit candidate = safe_add(value[static_cast<std::size_t>(y)], item.p);
             Profit& current = value[static_cast<std::size_t>(destination)];
             std::int32_t& current_predecessor =
@@ -180,6 +233,11 @@ TsoResult TerminatingStepOff::solve_with_common_items(
             static_cast<__int128>(x_star) + static_cast<__int128>(lambda);
         if (y >= capacity || static_cast<__int128>(y) >= termination) break;
         ++y;
+        if (bounded_speculation &&
+            !ensure_bounded_state(static_cast<std::size_t>(y))) {
+            result.status_message = "kernel_not_applicable_allocation_failed";
+            return result;
+        }
         const std::size_t yi = static_cast<std::size_t>(y);
         if (value[yi] > value[yi - 1]) {
             if (predecessor[yi] < n - 1) {

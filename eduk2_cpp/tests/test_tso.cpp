@@ -1,6 +1,7 @@
 #include "ukp/faithful_solver.hpp"
 #include "ukp/generator.hpp"
 #include "ukp/io.hpp"
+#include "ukp/optimized_solver.hpp"
 #include "ukp/terminating_step_off.hpp"
 #include "ukp/verify.hpp"
 
