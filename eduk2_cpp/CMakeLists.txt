@@ -118,3 +118,8 @@ target_link_libraries(ukp_tso_tests PRIVATE ukp_faithful ukp_optimized ukp_commo
 target_compile_definitions(
   ukp_tso_tests PRIVATE UKP_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
 add_test(NAME tso_correctness COMMAND ukp_tso_tests)
+
+add_executable(ukp_kernel_dispatcher_tests tests/test_kernel_dispatcher.cpp)
+target_link_libraries(
+  ukp_kernel_dispatcher_tests PRIVATE ukp_optimized ukp_common)
+add_test(NAME kernel_dispatcher COMMAND ukp_kernel_dispatcher_tests)

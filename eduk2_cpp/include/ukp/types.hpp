@@ -212,6 +212,12 @@ struct Stats {
     long long phase_cheap_incumbent_ns = 0;
     long long phase_dp_ns = 0;
     long long phase_reconstruction_ns = 0;
+    long long phase_tso_speculation_ns = 0;
+    long long tso_attempted = 0;
+    long long tso_work_budget = 0;
+    long long tso_work_consumed = 0;
+    long long tso_budget_exhausted = 0;
+    long long tso_fallback_to_eduk2 = 0;
     long long estimated_state_bytes = 0;
     std::string bound_winner = "none";
     std::string global_bound_used = "none";
@@ -240,6 +246,9 @@ struct SolverOptions {
     // is useful for controlled kernel benchmarks.
     bool use_kernel_dispatcher = true;
     std::size_t tso_max_dp_bytes = 512ULL * 1024ULL * 1024ULL;
+    // Zero keeps the historical unlimited behavior. A guarded default must
+    // only be selected after corpus calibration demonstrates robust bounds.
+    long long tso_max_transitions = 0;
     bool paper_faithful_mode = true;
     bool use_simple_dominance = false;
     bool use_core_remainder_ordering = false;
@@ -260,11 +269,13 @@ struct SolverOptions {
     // Experimental-only.  In paper_faithful_mode B&B always uses 10,000
     // nodes and this value is ignored.
     long long bb_node_limit = 10000;
-    // Optimized-only B&B experiments.  The fractional level is cheap enough
-    // to be the default; U3 and work-aware stopping require explicit opt-in.
-    bool use_cheap_incumbent = true;
+    // Optimized-only B&B experiments. Keep the production path aligned with
+    // faithful; corpus results show that their fixed overhead can dominate on
+    // otherwise short instances. They remain available through explicit CLI
+    // options for controlled experiments.
+    bool use_cheap_incumbent = false;
     int cheap_incumbent_top_k = 8;
-    bool use_bb_fractional_bound = true;
+    bool use_bb_fractional_bound = false;
     bool use_bb_u3_bound = false;
     // Zero disables work-aware stopping.  A non-zero value is an experimental
     // branch-evaluation budget, not an optimality condition.

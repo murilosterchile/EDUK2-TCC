@@ -1,5 +1,7 @@
 #include "instance_features.hpp"
 
+#include "kernel_dispatcher.hpp"
+
 #include <cmath>
 #include <numeric>
 
@@ -59,6 +61,44 @@ InstanceFeatures extract_instance_features(
             best_efficiency - static_cast<long double>(second->p) / second->w);
     }
     return f;
+}
+
+InstanceFeatures extract_dispatch_features(
+    const Instance& original, const std::vector<Item>& common_items) {
+    InstanceFeatures features;
+    features.original_items = static_cast<long long>(original.items.size());
+    features.capacity = original.capacity;
+    features.after_common_preprocessing_items =
+        static_cast<long long>(common_items.size());
+    if (!original.items.empty()) {
+        features.common_reduction_ratio = static_cast<double>(common_items.size()) /
+                                          original.items.size();
+    }
+    if (common_items.empty()) return features;
+
+    features.min_weight = common_items.front().w;
+    for (const Item& item : common_items) {
+        features.min_weight = std::min(features.min_weight, item.w);
+    }
+    features.capacity_over_min_weight =
+        static_cast<double>(original.capacity) / features.min_weight;
+
+    const __int128 capacity = original.capacity;
+    const __int128 min_weight = features.min_weight;
+    const __int128 item_count = features.after_common_preprocessing_items;
+    const __int128 work_limit = kDispatcherMaxEstimatedWork;
+    const bool item_count_safe = item_count <= kDispatcherMaxItems;
+    const bool capacity_ratio_safe =
+        capacity <= static_cast<__int128>(kDispatcherMaxCapacityOverMinWeight) *
+                        min_weight;
+    const bool work_safe = item_count * min_weight <= capacity + min_weight
+        ? capacity * item_count <= work_limit
+        : capacity * (capacity + min_weight) <= work_limit * min_weight;
+
+    if (!item_count_safe || !capacity_ratio_safe || !work_safe) {
+        return features;
+    }
+    return extract_instance_features(original, common_items);
 }
 
 }  // namespace ukp::optimized::detail

@@ -45,6 +45,7 @@ const char* classification(double ratio) {
 
 struct Arguments {
     int repetitions = 15;
+    long long max_transitions = 0;
     std::vector<std::string> instances;
 };
 
@@ -57,6 +58,14 @@ Arguments parse_arguments(int argc, char** argv) {
             arguments.repetitions = std::stoi(argv[i]);
             if (arguments.repetitions <= 0) {
                 throw std::invalid_argument("--repetitions must be positive");
+            }
+        } else if (argument == "--tso-max-transitions") {
+            if (++i >= argc) {
+                throw std::invalid_argument("--tso-max-transitions requires N");
+            }
+            arguments.max_transitions = std::stoll(argv[i]);
+            if (arguments.max_transitions < 0) {
+                throw std::invalid_argument("--tso-max-transitions must be nonnegative");
             }
         } else {
             arguments.instances.push_back(argument);
@@ -78,13 +87,19 @@ int main(int argc, char** argv) {
                      "C_over_min_weight,gcd,best_second_efficiency_gap,"
                      "near_best_efficiency_items,mean_weight,weight_variance,"
                      "median_eduk2_ns,median_tso_ns,median_auto_ns,speedup_tso,"
-                     "speedup_auto,classification,profit_equal\n";
+                     "speedup_auto,classification,profit_equal,tso_status,"
+                     "tso_work_consumed,tso_attempted,tso_budget_exhausted,"
+                     "tso_fallback_to_eduk2,phase_tso_speculation_ns\n";
 
         SolverOptions eduk2_options;
         eduk2_options.use_kernel_dispatcher = false;
         optimized::Solver eduk2_solver(eduk2_options);
-        optimized::Solver auto_solver;
-        const optimized::TerminatingStepOff tso_solver;
+        SolverOptions auto_options;
+        auto_options.tso_max_transitions = arguments.max_transitions;
+        optimized::Solver auto_solver(auto_options);
+        optimized::TsoOptions tso_options;
+        tso_options.max_transitions = arguments.max_transitions;
+        const optimized::TerminatingStepOff tso_solver(tso_options);
 
         for (const std::string& filename : arguments.instances) {
             const Instance instance = read_instance_file(filename);
@@ -136,7 +151,9 @@ int main(int argc, char** argv) {
             const long long median_auto = median_ns(auto_times);
             const bool tso_applicable =
                 tso.status == optimized::TsoStatus::ProvedOptimal;
-            const long long median_tso = tso_applicable ? median_ns(tso_times) : 0;
+            // Keep aborted speculation time: it quantifies work wasted before
+            // the exact EDUK2 fallback during budget calibration.
+            const long long median_tso = median_ns(tso_times);
             const double speedup_auto = median_auto == 0 ? 0.0 :
                 static_cast<double>(median_eduk2) / median_auto;
 
@@ -152,19 +169,30 @@ int main(int argc, char** argv) {
                       << features.near_best_efficiency_items << ',' << features.mean_weight << ','
                       << features.weight_variance << ',' << median_eduk2 << ',';
             if (!tso_applicable) {
-                std::cout << "NA," << median_auto << ",NA," << speedup_auto
-                          << ",kernel_not_applicable,1\n";
+                std::cout << median_tso << ',' << median_auto << ",NA," << speedup_auto
+                          << ",kernel_not_applicable,1," << tso.status_message << ','
+                          << tso.telemetry.transitions_considered << ','
+                          << automatic.stats.tso_attempted << ','
+                          << automatic.stats.tso_budget_exhausted << ','
+                          << automatic.stats.tso_fallback_to_eduk2 << ','
+                          << automatic.stats.phase_tso_speculation_ns << '\n';
                 continue;
             }
             const double speedup_tso = median_tso == 0 ? 0.0 :
                 static_cast<double>(median_eduk2) / median_tso;
             std::cout << median_tso << ',' << median_auto << ',' << speedup_tso << ','
-                      << speedup_auto << ',' << classification(speedup_tso) << ",1\n";
+                      << speedup_auto << ',' << classification(speedup_tso) << ",1,"
+                      << tso.status_message << ',' << tso.telemetry.transitions_considered << ','
+                      << automatic.stats.tso_attempted << ','
+                      << automatic.stats.tso_budget_exhausted << ','
+                      << automatic.stats.tso_fallback_to_eduk2 << ','
+                      << automatic.stats.phase_tso_speculation_ns << '\n';
         }
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "ukp_kernel_bench: " << error.what() << '\n';
-        std::cerr << "usage: ukp_kernel_bench [--repetitions N] <instance.ukp>...\n";
+        std::cerr << "usage: ukp_kernel_bench [--repetitions N] "
+                     "[--tso-max-transitions N] <instance.ukp>...\n";
         return 2;
     }
 }

@@ -23,13 +23,13 @@ def selects_tso(row):
     if n <= 0 or min_weight <= 0:
         return False
     if n * min_weight <= capacity + min_weight:
-        work_safe = capacity * n <= 25_000_000
+        work_safe = capacity * n <= 10_000_000
     else:
-        work_safe = capacity * (capacity + min_weight) <= 25_000_000 * min_weight
+        work_safe = capacity * (capacity + min_weight) <= 10_000_000 * min_weight
     memory_safe = row["median_tso_ns"] != "NA"
     return (memory_safe and n <= 5000 and
             int(row["near_best_efficiency_items"]) == n and
-            capacity <= 50 * min_weight and work_safe)
+            capacity <= 15 * min_weight and work_safe)
 
 
 def geomean(values):

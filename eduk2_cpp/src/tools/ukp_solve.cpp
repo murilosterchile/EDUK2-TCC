@@ -26,6 +26,11 @@ void print_basic_stats(const Instance& inst, const SolverResult& res,
     std::cout << "items_original " << res.stats.original_items << '\n';
     std::cout << "kernel " << res.stats.selected_kernel << '\n';
     std::cout << "dispatch_reason " << res.stats.dispatch_reason << '\n';
+    std::cout << "tso_attempted " << res.stats.tso_attempted << '\n';
+    std::cout << "tso_work_budget " << res.stats.tso_work_budget << '\n';
+    std::cout << "tso_work_consumed " << res.stats.tso_work_consumed << '\n';
+    std::cout << "tso_budget_exhausted " << res.stats.tso_budget_exhausted << '\n';
+    std::cout << "tso_fallback_to_eduk2 " << res.stats.tso_fallback_to_eduk2 << '\n';
     std::cout << "items_after_preprocess " << res.stats.after_preprocess_items << '\n';
     std::cout << "states_scanned " << res.stats.states_scanned << '\n';
     std::cout << "states_expanded " << res.stats.states_expanded << '\n';
@@ -142,6 +147,8 @@ void print_full_stats(const SolverResult& res, bool verbose) {
     std::cout << "phase_dp_ns " << res.stats.phase_dp_ns << '\n';
     std::cout << "phase_reconstruction_ns "
               << res.stats.phase_reconstruction_ns << '\n';
+    std::cout << "phase_tso_speculation_ns "
+              << res.stats.phase_tso_speculation_ns << '\n';
 
     std::cout << "historical_states_avoided "
               << res.stats.historical_states_avoided << '\n';
@@ -320,6 +327,7 @@ int main(int argc, char** argv) {
                " [--no-cheap-incumbent] [--cheap-incumbent-top-k=N]"
                " [--bb-strong-only|--bb-fractional] [--bb-u3]"
                " [--bb-work-budget=N]"
+               " [--tso-max-transitions=N]"
                " [--kernel auto|eduk2|tso]"
                " [--verbose]\n";
         return 2;
@@ -346,6 +354,14 @@ int main(int argc, char** argv) {
             tso_options.use_gcd_scaling = false;
         } else if (arg == "--tso-multiple-dominance") {
             tso_options.use_multiple_dominance = true;
+        } else if (arg.rfind("--tso-max-transitions=", 0) == 0) {
+            const long long budget = std::stoll(arg.substr(22));
+            if (budget < 0) {
+                std::cerr << "--tso-max-transitions must be nonnegative\n";
+                return 2;
+            }
+            tso_options.max_transitions = budget;
+            options.tso_max_transitions = budget;
         } else if (arg == "--paper-faithful") options.paper_faithful_mode = true;
         else if (arg == "--no-paper-faithful") options.paper_faithful_mode = false;
         else if (arg == "--simple-dominance") options.use_simple_dominance = true;
@@ -357,6 +373,8 @@ int main(int argc, char** argv) {
             options.use_core_multiple_dominance = true;
         } else if (arg == "--verbose") {
             verbose = true;
+        } else if (arg == "--cheap-incumbent") {
+            options.use_cheap_incumbent = true;
         } else if (arg == "--no-cheap-incumbent") {
             options.use_cheap_incumbent = false;
         } else if (arg.rfind("--cheap-incumbent-top-k=", 0) == 0) {
@@ -407,7 +425,7 @@ int main(int argc, char** argv) {
             optimized::TerminatingStepOff(tso_options).solve(inst);
         const auto finish = std::chrono::steady_clock::now();
         std::cout << "kernel tso\nstatus " << tso.status_message << '\n';
-        if (tso.status == optimized::TsoStatus::KernelNotApplicable) return 3;
+        if (tso.status != optimized::TsoStatus::ProvedOptimal) return 3;
         write_solution(std::cout, tso.solution);
         std::cout << "verified " << (verify_solution(inst, tso.solution) ? 1 : 0) << '\n';
         std::cout << "time_us "

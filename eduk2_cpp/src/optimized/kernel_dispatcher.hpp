@@ -8,6 +8,10 @@
 
 namespace ukp::optimized::detail {
 
+inline constexpr long long kDispatcherMaxItems = 5000;
+inline constexpr long long kDispatcherMaxCapacityOverMinWeight = 15;
+inline constexpr long long kDispatcherMaxEstimatedWork = 10'000'000;
+
 enum class KernelChoice { Eduk2, Tso };
 
 struct DispatchDecision {

@@ -814,7 +814,11 @@ SolverResult Solver::solve(const Instance& inst) {
     InstanceFeatures instance_features;
     if (options_.use_kernel_dispatcher || kFullStats) {
         PhaseTimer<kFullStats> phase(result.stats.phase_feature_extraction_ns);
-        instance_features = detail::extract_instance_features(inst, common_items);
+        if constexpr (kFullStats) {
+            instance_features = detail::extract_instance_features(inst, common_items);
+        } else {
+            instance_features = detail::extract_dispatch_features(inst, common_items);
+        }
     }
     UKP_FULL_STATS(result.stats.instance_features = instance_features;);
     if (common_items.empty()) {
@@ -832,12 +836,26 @@ SolverResult Solver::solve(const Instance& inst) {
     if (options_.use_kernel_dispatcher) {
         TsoOptions tso_options;
         tso_options.max_dp_bytes = options_.tso_max_dp_bytes;
+        tso_options.max_transitions = options_.tso_max_transitions;
         const detail::DispatchDecision decision =
             detail::dispatch_kernel(instance_features, tso_options);
         UKP_BASIC_STATS(result.stats.dispatch_reason = decision.reason;);
         if (decision.kernel == detail::KernelChoice::Tso) {
-            TsoResult tso = TerminatingStepOff(tso_options).solve_with_common_items(
-                inst, std::move(common_items));
+            // TSO mutates its private item list. Preserve the already computed
+            // common preprocessing result for a preprocessing-free fallback.
+            TsoResult tso;
+            {
+                PhaseTimer<kFullStats> phase(result.stats.phase_tso_speculation_ns);
+                tso = TerminatingStepOff(tso_options).solve_with_common_items(
+                    inst, common_items);
+            }
+            UKP_BASIC_STATS(
+                result.stats.tso_attempted = 1;
+                result.stats.tso_work_budget = tso_options.max_transitions;
+                result.stats.tso_work_consumed = tso.telemetry.transitions_considered;
+                result.stats.tso_budget_exhausted =
+                    tso.status == TsoStatus::WorkBudgetExceeded ? 1 : 0;
+            );
             if (tso.status == TsoStatus::ProvedOptimal) {
                 result.solution = std::move(tso.solution);
                 result.solution.solver_name = "optimized";
@@ -855,9 +873,11 @@ SolverResult Solver::solve(const Instance& inst) {
                 return result;
             }
             UKP_BASIC_STATS(
-                result.stats.dispatch_reason = "tso_not_applicable_fallback";
+                result.stats.tso_fallback_to_eduk2 = 1;
+                result.stats.dispatch_reason = tso.status == TsoStatus::WorkBudgetExceeded
+                    ? "tso_work_budget_exceeded_fallback"
+                    : "tso_not_applicable_fallback";
             );
-            common_items = detail::common_preprocess_items(inst);
         }
     }
 

@@ -43,6 +43,9 @@ TerminatingStepOff::TerminatingStepOff(TsoOptions options) : options_(options) {
 
 TsoResult TerminatingStepOff::solve(const Instance& instance) const {
     if (instance.capacity < 0) throw std::invalid_argument("negative capacity");
+    if (options_.max_transitions < 0) {
+        throw std::invalid_argument("negative TSO transition budget");
+    }
 
     return solve_with_common_items(
         instance, detail::common_preprocess_items(instance));
@@ -51,6 +54,9 @@ TsoResult TerminatingStepOff::solve(const Instance& instance) const {
 TsoResult TerminatingStepOff::solve_with_common_items(
     const Instance& instance, std::vector<Item> items) const {
     if (instance.capacity < 0) throw std::invalid_argument("negative capacity");
+    if (options_.max_transitions < 0) {
+        throw std::invalid_argument("negative TSO transition budget");
+    }
 
     TsoResult result;
     result.telemetry.original_items = static_cast<long long>(instance.items.size());
@@ -142,6 +148,16 @@ TsoResult TerminatingStepOff::solve_with_common_items(
         for (std::int32_t j = first; j < n; ++j) {
             const Item& item = items[static_cast<std::size_t>(j)];
             if (item.w > capacity - y) continue;
+            // Check before starting the next transition. This admits a proof
+            // that uses exactly max_transitions, but never executes transition
+            // max_transitions + 1. The counter is hardware-independent.
+            if (options_.max_transitions > 0 &&
+                result.telemetry.transitions_considered >= options_.max_transitions) {
+                result.status = TsoStatus::WorkBudgetExceeded;
+                result.status_message = "work_budget_exceeded";
+                result.solution.optimal = false;
+                return result;
+            }
             ++result.telemetry.transitions_considered;
             const Weight destination = y + item.w;
             const Profit candidate = safe_add(value[static_cast<std::size_t>(y)], item.p);

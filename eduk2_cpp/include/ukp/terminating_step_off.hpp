@@ -11,7 +11,8 @@ class Solver;
 
 enum class TsoStatus {
     ProvedOptimal,
-    KernelNotApplicable
+    KernelNotApplicable,
+    WorkBudgetExceeded
 };
 
 struct TsoTelemetry {
@@ -40,6 +41,9 @@ struct TsoOptions {
     // A caller may deliberately raise this for controlled experiments.  The
     // default prevents an accidental multi-gigabyte capacity-indexed DP.
     std::size_t max_dp_bytes = 512ULL * 1024ULL * 1024ULL;
+    // Maximum number of step-off transitions. Zero means unlimited, which is
+    // appropriate for forced TSO runs and controlled experiments.
+    long long max_transitions = 0;
     bool use_gcd_scaling = true;
     bool use_multiple_dominance = false;
 };
