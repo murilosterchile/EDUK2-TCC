@@ -9,3 +9,4 @@ benchmarks/pyasukp_paper/run_benchmark.sh
 benchmarks/pyasukp_paper/run_ss_benchmark.sh
 benchmarks/pyasukp_paper/README.md
 eduk2_cpp/CMakeLists.txt
+optimized_vs_faithful_v3.csv
